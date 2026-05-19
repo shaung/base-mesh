@@ -1,27 +1,17 @@
+import { logger } from './log.js';
+// Operator — Feishu IM interaction. Receives user messages via WebSocket,
+// writes Turns, delivers replies to IM. Does NOT handle executor coordination.
+
+import { spawn } from 'node:child_process';
 import { Client, WSClient, EventDispatcher } from '@larksuiteoapi/node-sdk';
-import { Config, BitableRecord } from './types.js';
+import { Config, BitableRecord, CompletenessCheckResult } from './types.js';
 import { BitableClient } from './bitable.js';
-import { Session } from './protocol.js';
+import { Session, extractText, extractUserIds } from './protocol.js';
 import { getDomainConfig } from './domain.js';
+import { formatMessage } from './messages.js';
 
 const DEFAULT_EMOJI = 'OnIt';
-const CLARIFY_THRESHOLD = 15; // messages shorter than this trigger clarification
-
-const CLARIFY_QUESTION =
-  '请问可以详细描述您遇到的问题吗？如果有相关的订单号、错误信息，也请一并提供，我会帮您排查。';
-
-// ---------------------------------------------------------------------------
-// Operator — coordinator with Feishu WebSocket event subscription.
-//
-// Handles the pre-consultation phase:
-//   1. Receives user DMs, creates tickets + turns
-//   2. Assesses clarity; asks follow-up questions when needed
-//   3. Holds a lease on tickets in clarification so the executor won't
-//      pick them up prematurely
-//   4. Releases to awaiting_agent once enough context is gathered
-//
-// Never runs Claude or answers questions — that's the executor's job.
-// ---------------------------------------------------------------------------
+const COMPLETENESS_PROMPT = 'Analyze the support ticket below. Determine if enough info is provided.\nRespond in JSON: {"isComplete":true/false,"summary":"...","missingFields":[...],"forRoles":[...]}';
 
 export class Operator {
   private wsClient: WSClient | null = null;
@@ -29,35 +19,30 @@ export class Operator {
   private session: Session;
   private client: Client;
   private running = true;
-
-  /** Set of ticket record_ids currently in clarification (lease held). */
-  private clarifying = new Set<string>();
+  private draftCleanupTimer: ReturnType<typeof setInterval> | null = null;
+  private deliveredTurnIds = new Set<string>();
 
   constructor(private cfg: Config) {
     this.bitable = new BitableClient(cfg);
-    this.session = new Session(cfg.identity, cfg.nickname, cfg, this.bitable);
+    this.session = new Session(cfg.clientId || cfg.identity, cfg.nickname, cfg, this.bitable);
     const dc = getDomainConfig(cfg.openApiDomain);
-    this.client = new Client({
-      appId: cfg.appId,
-      appSecret: cfg.appSecret || 'unused',
-      domain: dc.sdkBaseUrl,
-    });
+    this.client = new Client({ appId: cfg.appId, appSecret: cfg.appSecret || 'unused', domain: dc.sdkBaseUrl });
   }
 
   async run(): Promise<void> {
-    process.on('SIGTERM', () => this.stop());
-    process.on('SIGINT', () => this.stop());
-
-    await this.session.register();
-    console.log(`[operator] started identity=${this.cfg.identity} nickname=${this.cfg.nickname}`);
+    process.on('SIGTERM', () => { this.stop(); process.exit(0); });
+    process.on('SIGINT', () => { this.stop(); process.exit(0); });
+    console.log(`[operator] started identity=${this.cfg.clientId || this.cfg.identity}`);
 
     await this.connectWebSocket();
 
-    while (this.running) {
-      await sleep(60_000);
-      try { await this.session.heartbeat(); } catch { /* ignore */ }
-    }
+    const ttlMs = (this.cfg.operator?.draftTTLMinutes ?? 60) * 60 * 1000;
+    this.draftCleanupTimer = setInterval(() => this.cleanupStaleDrafts(ttlMs), ttlMs);
 
+    while (this.running) {
+      await sleep((this.cfg.operator?.pollIntervalSeconds ?? 3) * 1000);
+      try { await this.deliverTurns(); } catch { /* */ }
+    }
     this.cleanup();
     console.log('[operator] stopped');
     process.exit(0);
@@ -65,270 +50,227 @@ export class Operator {
 
   stop(): void {
     this.running = false;
-    if (this.wsClient) {
-      try { this.wsClient.close({ force: true }); } catch { /* ignore */ }
-      this.wsClient = null;
-    }
+    if (this.draftCleanupTimer) clearInterval(this.draftCleanupTimer);
+    if (this.wsClient) { try { this.wsClient.close({ force: true }); } catch { /* */ } }
   }
 
-  // -----------------------------------------------------------------------
-  // WebSocket
-  // -----------------------------------------------------------------------
-
+  // -- WebSocket -----------------------------------------------------------
   private async connectWebSocket(): Promise<void> {
-    if (!this.cfg.appSecret) {
-      console.log('[operator] appSecret required for WebSocket event subscription.');
-      return;
-    }
-
+    if (!this.cfg.appSecret) { console.log('[operator] appSecret required for IM'); return; }
     try {
       const dc = getDomainConfig(this.cfg.openApiDomain);
       this.wsClient = new WSClient({
-        appId: this.cfg.appId,
-        appSecret: this.cfg.appSecret,
-        domain: dc.sdkBaseUrl,
-        autoReconnect: true,
+        appId: this.cfg.appId, appSecret: this.cfg.appSecret, domain: dc.sdkBaseUrl, autoReconnect: true,
         onReady: () => console.log('[operator] WS connected'),
-        onError: (err) => console.error(`[operator] WS error: ${err.message}`),
-        onReconnecting: () => console.log('[operator] WS reconnecting...'),
-        onReconnected: () => console.log('[operator] WS reconnected'),
+        onError: (err: any) => logger.error(`[operator] WS error: ${err.message}`),
       });
-
       const dispatcher = new EventDispatcher({});
-
-      dispatcher.register({
-        'im.message.receive_v1': async (data) => { await this.onBotMessage(data); },
-      });
-
+      dispatcher.register({ 'im.message.receive_v1': async (data: any) => { await this.onBotMessage(data); } });
       await this.wsClient.start({ eventDispatcher: dispatcher });
-    } catch (err: any) {
-      console.warn(`[operator] WS init failed: ${err.message}`);
-    }
+    } catch (err: any) { console.warn(`[operator] WS init failed: ${err.message}`); }
   }
 
-  // -----------------------------------------------------------------------
-  // Handler
-  // -----------------------------------------------------------------------
-
+  // -- Message handler -----------------------------------------------------
   private async onBotMessage(raw: any): Promise<void> {
     const data = raw.event ?? raw;
-    console.log(`[operator] im.message event: type=${data.message?.message_type} chat=${data.message?.chat_type}`);
-
     const msg = data.message;
-    if (!msg) return;
+    if (!msg || data.sender?.sender_type !== 'user') return;
+    if (msg.chat_type === 'group' && (!msg.mentions || msg.mentions.length === 0)) return;
+    if (msg.chat_type !== 'p2p' && msg.chat_type !== 'group') return;
 
-    // Only p2p text from real users
-    if (msg.chat_type !== 'p2p') return;
-    if (data.sender?.sender_type !== 'user') return;
-    if (msg.message_type !== 'text') return;
-
-    // Parse text
     let content: string;
-    try { content = JSON.parse(msg.content).text ?? msg.content; } catch { content = msg.content; }
+    if (msg.message_type === 'text') {
+      try { content = JSON.parse(msg.content).text ?? msg.content; } catch { content = msg.content; }
+      content = content.replace(/@_user_\d+/g, '').trim();
+    } else { return; }
     if (!content) return;
 
-    const messageId = msg.message_id;
-    if (!messageId) return;
-
+    const messageId = msg.message_id; if (!messageId) return;
     const senderId = data.sender.sender_id?.open_id ?? 'unknown';
     const chatId = msg.chat_id;
     const rootId = msg.root_id;
 
-    console.log(`[operator] DM from ${senderId}: ${content.slice(0, 80)}`);
-
-    // React with processing emoji
-    try { await this.react(messageId, DEFAULT_EMOJI); } catch { /* best effort */ }
+    // Acknowledge
+    const mode = this.cfg.operator?.reactionMode ?? 'emoji';
+    const ackMsg = this.cfg.messages?.ackReceived || '✅ Received';
+    if (mode !== 'card') { try { await this.react(messageId, DEFAULT_EMOJI); } catch { if (mode === 'both') await this.reply(messageId, ackMsg, false); } }
+    if (mode === 'card') { try { await this.reply(messageId, ackMsg, false); } catch { /* */ } }
 
     // Dedup
     try {
       const existing = await this.bitable.searchRecords(this.cfg.turnsTableId, {
-        conjunction: 'and',
-        conditions: [
-          { field_name: this.cfg.fields.turn.dedupKey, operator: 'is', value: [messageId] },
-        ],
+        conjunction: 'and', conditions: [{ field_name: this.cfg.fields.turn.dedupKey, operator: 'is', value: [messageId] }],
       });
-      if (existing.length > 0) {
-        console.log(`[operator] message ${messageId.slice(0, 12)} already processed`);
-        return;
-      }
-    } catch { /* best effort */ }
-
-    // --- Thread reply ────────────────────────────────────────────────
+      if (existing.length > 0) return;
+    } catch { /* */ }
 
     if (rootId) {
       const ticket = await this.session.findByThreadRoot(rootId);
-      if (!ticket || !ticket.record_id) {
-        console.log('[operator] thread root not found, creating new ticket');
-      } else {
-        console.log(`[operator] thread reply → ticket ${ticket.record_id.slice(0, 12)}`);
-
-        // Append the user's turn
-        await this.bitable.createRecord(this.cfg.turnsTableId, {
-          [this.cfg.fields.turn.ticketRecordId]: ticket.record_id,
-          [this.cfg.fields.turn.role]: 'user',
-          [this.cfg.fields.turn.content]: content,
-          [this.cfg.fields.turn.dedupKey]: messageId,
-          [this.cfg.fields.turn.agentIdentity]: senderId,
-          [this.cfg.fields.turn.createdAt]: Date.now(),
-          [this.cfg.fields.turn.status]: 'awaiting_agent',
-        });
-
-        // If we were waiting for clarification, release the lease now
-        if (this.clarifying.has(ticket.record_id)) {
-          this.clarifying.delete(ticket.record_id);
-          await this.releaseLease(ticket.record_id, content);
-        } else {
-          // Just re-open for executor
-          await this.bitable.updateRecord(this.cfg.ticketsTableId, ticket.record_id, {
-            [this.cfg.fields.ticket.status]: this.cfg.statuses.pending,
-            [this.cfg.fields.ticket.summary]: content.slice(0, 200),
-          });
-        }
-        return;
-      }
+      if (ticket?.record_id) { await this.handleThreadReply(ticket, content, messageId, senderId); return; }
     }
 
-    // --- New conversation ────────────────────────────────────────────
-
+    await this.ensureHumanRoster(senderId);
+    const { capability, cleanedContent } = await this.classifyRoles(content);
     try {
-      const ticket = await this.session.createTicket(content, {
-        rootMsgId: messageId,
-        chatId,
-        senderId,
-      });
-
+      const ticket = await this.session.createTicket(cleanedContent || content, { rootMsgId: messageId, chatId, senderId });
+      (ticket as any).__capability = capability;
       await this.bitable.createRecord(this.cfg.turnsTableId, {
-        [this.cfg.fields.turn.ticketRecordId]: ticket.record_id,
-        [this.cfg.fields.turn.role]: 'user',
-        [this.cfg.fields.turn.content]: content,
-        [this.cfg.fields.turn.dedupKey]: messageId,
-        [this.cfg.fields.turn.agentIdentity]: senderId,
+        [this.cfg.fields.turn.ticketRecordId]: ticket.record_id, [this.cfg.fields.turn.rootMsgId]: messageId,
+        [this.cfg.fields.turn.role]: 'user', [this.cfg.fields.turn.content]: content,
+        [this.cfg.fields.turn.dedupKey]: messageId, [this.cfg.fields.turn.agentIdentity]: senderId,
         [this.cfg.fields.turn.createdAt]: Date.now(),
-        [this.cfg.fields.turn.status]: 'awaiting_agent',
       });
-
-      if (needsClarification(content)) {
-        // Hold lease so executor doesn't pick it up
-        await this.holdLease(ticket, content);
-        this.clarifying.add(ticket.record_id);
-        // Send clarification question in thread
-        await this.sendMessage(chatId, CLARIFY_QUESTION, messageId);
-        console.log(`[operator] clarification asked for ${ticket.record_id.slice(0, 12)}`);
-      } else {
-        // Clear enough — release immediately for executor
-        await this.sendMessage(
-          chatId,
-          `收到，正在查看您的问题，稍后回复。（${this.cfg.nickname}）`,
-          messageId,
-        );
-        console.log(`[operator] ticket ready: ${ticket.record_id.slice(0, 12)}`);
-        // Leave as awaiting_agent for executor to pick up
-      }
-    } catch (err) {
-      console.error('[operator] failed to create ticket:', err);
-    }
+      await this.processDraft(ticket, content, messageId, chatId);
+    } catch (err) { logger.error('[operator] failed to create ticket:', err); }
   }
 
-  // -----------------------------------------------------------------------
-  // Lease management
-  // -----------------------------------------------------------------------
-
-  /** Claim a ticket to prevent the executor from picking it up. */
-  private async holdLease(ticket: BitableRecord, _reason: string): Promise<void> {
-    // Use claim() to write owner + lease, then let it stay in awaiting_agent
+  // -- Thread / Draft / Delivery -------------------------------------------
+  private async handleThreadReply(ticket: BitableRecord, content: string, messageId: string, senderId: string) {
     const recordId = ticket.record_id!;
-    const ownerValue = `${this.cfg.nickname}#${this.cfg.identity}`;
-    const leaseMs = Date.now() + this.cfg.leaseDuration * 1000;
-
-    try {
-      await this.bitable.updateRecord(this.cfg.ticketsTableId, recordId, {
-        [this.cfg.fields.ticket.owner]: ownerValue,
-        [this.cfg.fields.ticket.ownerLeaseAt]: leaseMs,
-        // Keep status awaiting_agent so the ticket is still visible
-      });
-    } catch (err) {
-      console.warn(`[operator] holdLease failed:`, err);
-    }
-  }
-
-  /** Release the lease so the executor can pick up the ticket. */
-  private async releaseLease(recordId: string, _updatedSummary: string): Promise<void> {
-    // Owner guard
-    const rec = await this.bitable.getRecord(this.cfg.ticketsTableId, recordId);
-    if (!rec) return;
-    const currentOwner = String(rec.fields[this.cfg.fields.ticket.owner] ?? '');
-    if (currentOwner && !currentOwner.endsWith(`#${this.cfg.identity}`)) {
-      console.log(`[operator] releaseLease: owner changed, skip ${recordId.slice(0, 12)}`);
-      return;
-    }
-
-    try {
-      await this.bitable.updateRecord(this.cfg.ticketsTableId, recordId, {
-        [this.cfg.fields.ticket.owner]: '',
-        [this.cfg.fields.ticket.ownerLeaseAt]: 0,
-        [this.cfg.fields.ticket.status]: this.cfg.statuses.pending,
-      });
-      console.log(`[operator] released ${recordId.slice(0, 12)} to pending`);
-    } catch (err) {
-      console.error(`[operator] releaseLease failed ${recordId.slice(0, 12)}:`, err);
-    }
-  }
-
-  // -----------------------------------------------------------------------
-  // IM helpers
-  // -----------------------------------------------------------------------
-
-  private async react(messageId: string, emojiType: string): Promise<void> {
-    await this.client.im.v1.messageReaction.create({
-      path: { message_id: messageId },
-      data: { reaction_type: { emoji_type: emojiType } },
+    const status = String(ticket.fields[this.cfg.fields.ticket.status] ?? '');
+    const rootMsgId = extractText(ticket.fields[this.cfg.fields.ticket.rootMsgId]);
+    await this.bitable.createRecord(this.cfg.turnsTableId, {
+      [this.cfg.fields.turn.ticketRecordId]: recordId, [this.cfg.fields.turn.rootMsgId]: rootMsgId,
+      [this.cfg.fields.turn.role]: 'user', [this.cfg.fields.turn.content]: content,
+      [this.cfg.fields.turn.dedupKey]: messageId, [this.cfg.fields.turn.agentIdentity]: senderId,
+      [this.cfg.fields.turn.createdAt]: Date.now(),
     });
-  }
-
-  private async sendMessage(chatId: string, text: string, rootId?: string): Promise<void> {
-    const data: Record<string, any> = {
-      receive_id: chatId,
-      msg_type: 'text',
-      content: JSON.stringify({ text }),
-    };
-    if (rootId) data.root_id = rootId;
-
-    await this.client.im.v1.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: data as any,
-    });
-  }
-
-  private cleanup(): void {
-    if (this.wsClient) {
-      try { this.wsClient.close({ force: true }); } catch { /* ignore */ }
-      this.wsClient = null;
+    if (status === this.cfg.statuses.draft) { await this.processDraft(ticket, content, messageId, String(ticket.fields[this.cfg.fields.ticket.chatId])); }
+    else if (status === this.cfg.statuses.done) { await this.session.promoteToPending(recordId, content); }
+    else if (status === this.cfg.statuses.failed) {
+      await this.bitable.updateRecord(this.cfg.ticketsTableId, recordId, {
+        [this.cfg.fields.ticket.status]: this.cfg.statuses.pending, [this.cfg.fields.ticket.retryCount]: 0,
+        [this.cfg.fields.ticket.owner]: '', [this.cfg.fields.ticket.ownerLeaseAt]: 0,
+      });
+      await this.reply(messageId, this.cfg.messages?.ticketReactivated || 'Ticket reactivated, queued for processing', true);
     }
   }
+
+  private async processDraft(ticket: BitableRecord, content: string, messageId: string, _chatId: string) {
+    const classifiedCap = (ticket as any).__capability as string | undefined;
+    if (this.cfg.operator?.useLLM) {
+      const result = await this.checkCompleteness(ticket);
+      if (result?.isComplete) {
+        const caps = [...(classifiedCap ? [classifiedCap] : []), ...(result.forRoles || [])];
+        await this.session.promoteToPending(ticket.record_id!, result.summary || content, caps.length > 0 ? caps : undefined);
+        console.log(`[operator] ticket ${ticket.record_id!.slice(0, 12)} promoted to pending`);
+      } else { await this.reply(messageId, this.cfg.messages?.clarifyQuestion || 'Could you please describe the issue in more detail? If you have any relevant order numbers or error messages, please also provide them, and I\'ll help investigate.', true); }
+    } else {
+      const caps = classifiedCap ? [classifiedCap] : undefined;
+      await this.session.promoteToPending(ticket.record_id!, content, caps);
+      console.log(`[operator] ticket ${ticket.record_id!.slice(0, 12)} promoted to pending`);
+    }
+  }
+
+  private async deliverTurns() {
+    try {
+      const turns = await this.session.searchNotifiableTurns();
+      for (const turn of turns) {
+        if (!turn.record_id || this.deliveredTurnIds.has(turn.record_id)) continue;
+        const claimed = await this.session.claimTurnDelivery(turn.record_id);
+        if (!claimed) continue;
+        const content = extractText(turn.fields[this.cfg.fields.turn.content]);
+        const rootMsgId = extractText(turn.fields[this.cfg.fields.turn.rootMsgId]);
+        if (!content || !rootMsgId) continue;
+        const human = extractUserIds(turn.fields[this.cfg.fields.turn.human]);
+        let finalContent = content;
+        if (human) {
+          const parts = human.split(',').filter(Boolean);
+          const mentions = parts.map(p => p.startsWith('ou_') ? `<at id=${p}></at>` : p).join(' ');
+          finalContent = formatMessage(this.cfg.messages?.ccFormat || '{content}\n\ncc {mentions}', { content, mentions });
+        }
+        try { await this.reply(rootMsgId, finalContent, true); this.deliveredTurnIds.add(turn.record_id); await this.session.markTurnNotified(turn.record_id); } catch { /* */ }
+      }
+    } catch { /* */ }
+    if (this.deliveredTurnIds.size > 10_000) this.deliveredTurnIds.clear();
+  }
+
+  private async cleanupStaleDrafts(maxAgeMs: number) {
+    try {
+      const drafts = await this.bitable.searchRecords(this.cfg.ticketsTableId, {
+        conjunction: 'and', conditions: [{ field_name: this.cfg.fields.ticket.status, operator: 'is', value: [this.cfg.statuses.draft] }],
+      });
+      const cutoff = Date.now() - maxAgeMs;
+      for (const d of drafts) {
+        const createdAt = Number(d.fields[this.cfg.fields.ticket.createdAt] ?? 0) || Date.now();
+        if (createdAt < cutoff) { await this.bitable.updateRecord(this.cfg.ticketsTableId, d.record_id!, { [this.cfg.fields.ticket.status]: this.cfg.statuses.closed }); }
+      }
+    } catch { /* */ }
+  }
+
+  // -- Classify / Completeness / HumanRoster -------------------------------
+  private async classifyRoles(content: string): Promise<{ capability?: string; cleanedContent: string }> {
+    const method = this.cfg.operator?.rolesMapping ?? 'keyword';
+    const cmdMatch = content.match(/^\/([a-z][a-z0-9_]*)\s*(.*)/s);
+    if (cmdMatch) return { capability: cmdMatch[1], cleanedContent: cmdMatch[2] || content };
+    if (method === 'keyword' && this.cfg.rolesWhitelistTableId) {
+      try {
+        const whitelist = await this.bitable.searchRecords(this.cfg.rolesWhitelistTableId, {
+          conjunction: 'and', conditions: [{ field_name: 'enabled', operator: 'is', value: [true] }],
+        });
+        const lower = content.toLowerCase(); let bestScore = 0; let bestCap: string | undefined;
+        for (const row of whitelist) {
+          const cap = extractText(row.fields['role']); const keywords = extractText(row.fields['keywords'] ?? '');
+          if (!cap) continue;
+          const score = keywords.split(/[,，]/).filter(Boolean).filter(k => lower.includes(k.trim().toLowerCase())).length;
+          if (score > bestScore) { bestScore = score; bestCap = cap; }
+        }
+        if (bestCap) return { capability: bestCap, cleanedContent: content };
+        if (whitelist.find(r => extractText(r.fields['role']) === 'general')) return { capability: 'general', cleanedContent: content };
+      } catch { /* */ }
+    }
+    return { cleanedContent: content };
+  }
+
+  private async checkCompleteness(ticket: BitableRecord): Promise<CompletenessCheckResult | null> {
+    try {
+      const turns = await this.session.getTurns(ticket.record_id!);
+      const prompt = [COMPLETENESS_PROMPT, '', `Summary: ${String(ticket.fields[this.cfg.fields.ticket.summary] ?? '')}`,
+        'Conversation:', ...turns.map(t => `[${t.fields[this.cfg.fields.turn.role]}]\n${t.fields[this.cfg.fields.turn.content]}`)].join('\n');
+      const args = this.cfg.operator?.llmArgs ?? this.cfg.claudeArgs;
+      return new Promise((resolve) => {
+        const proc = spawn(this.cfg.aiCommand, [this.cfg.aiPromptFlag, prompt, ...args], { stdio: ['pipe', 'pipe', 'pipe'], timeout: 60_000 });
+        let stdout = '';
+        proc.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+        proc.on('close', (code) => {
+          if (code !== 0) { resolve(null); return; }
+          try { const r = JSON.parse(stdout.trim()); resolve({ isComplete: Boolean(r.isComplete), summary: String(r.summary ?? ''), missingFields: Array.isArray(r.missingFields) ? r.missingFields : [], forRoles: Array.isArray(r.forRoles) ? r.forRoles : [] }); } catch { resolve(null); }
+        });
+        proc.on('error', () => resolve(null));
+      });
+    } catch { return null; }
+  }
+
+  private async ensureHumanRoster(senderId: string) {
+    try {
+      const existing = await this.bitable.searchRecords(this.cfg.rosterTableId, {
+        conjunction: 'and', conditions: [{ field_name: this.cfg.fields.roster.kind, operator: 'is', value: ['human'] }],
+      });
+      if (existing.find(r => extractUserIds(r.fields[this.cfg.fields.roster.human]).includes(senderId))) return;
+    } catch { /* */ }
+    try {
+      await this.bitable.createRecord(this.cfg.rosterTableId, {
+        [this.cfg.fields.roster.identity]: `human_${senderId}`, [this.cfg.fields.roster.nickname]: `user_${senderId.slice(0, 8)}`,
+        [this.cfg.fields.roster.kind]: 'human', [this.cfg.fields.roster.human]: [{ id: senderId }], [this.cfg.fields.roster.enabled]: true,
+      });
+    } catch { /* */ }
+  }
+
+  // -- IM helpers -----------------------------------------------------------
+  private async react(messageId: string, emojiType: string) {
+    await this.client.im.v1.messageReaction.create({ path: { message_id: messageId }, data: { reaction_type: { emoji_type: emojiType } } });
+  }
+
+  private async reply(messageId: string, text: string, replyInThread?: boolean) {
+    if (!text.trim()) return;
+    const card = { schema: '2.0', body: { elements: [{ tag: 'markdown', content: text }] } };
+    await this.client.im.v1.message.reply({ path: { message_id: messageId }, data: { msg_type: 'interactive', content: JSON.stringify(card), reply_in_thread: replyInThread } as any });
+  }
+
+  private cleanup() {
+    if (this.draftCleanupTimer) clearInterval(this.draftCleanupTimer);
+    if (this.wsClient) { try { this.wsClient.close({ force: true }); } catch { /* */ } }
+  }
 }
 
-// ---------------------------------------------------------------------------
-// Clarity heuristics
-// ---------------------------------------------------------------------------
-
-/** Returns `true` when the user's message is too vague and needs follow-up. */
-function needsClarification(text: string): boolean {
-  const t = text.trim();
-
-  // Very short messages are likely too vague
-  if (t.length < CLARIFY_THRESHOLD) return true;
-
-  // Pure greetings / chitchat
-  const greetings = /^(你好|您好|hi|hello|hey|在吗|在不在|help|请问|你好吗)/i;
-  if (greetings.test(t) && t.length < 40) return true;
-
-  return false;
-}
-
-// ---------------------------------------------------------------------------
-// Utilities
-// ---------------------------------------------------------------------------
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
+function sleep(ms: number): Promise<void> { return new Promise(r => setTimeout(r, ms)); }

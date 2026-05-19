@@ -1,3 +1,4 @@
+import { logger } from './log.js';
 import { spawn } from 'node:child_process';
 import { Client, WSClient, EventDispatcher } from '@larksuiteoapi/node-sdk';
 import { Config } from './types.js';
@@ -67,7 +68,7 @@ export class DirectMode {
         domain: dc.sdkBaseUrl,
         autoReconnect: true,
         onReady: () => console.log('[direct] WS connected'),
-        onError: (err) => console.error(`[direct] WS error: ${err.message}`),
+        onError: (err) => logger.error(`[direct] WS error: ${err.message}`),
         onReconnecting: () => console.log('[direct] WS reconnecting...'),
         onReconnected: () => console.log('[direct] WS reconnected'),
       });
@@ -120,7 +121,7 @@ export class DirectMode {
       await this.sendMessage(chatId, answer, messageId);
       console.log(`[direct] replied to ${messageId.slice(0, 12)}`);
     } catch (err) {
-      console.error(`[direct] reply failed:`, err);
+      logger.error(`[direct] reply failed:`, err);
     }
   }
 
@@ -143,7 +144,7 @@ export class DirectMode {
 
       proc.on('close', (code) => {
         if (code !== 0) {
-          console.error(`[direct] claude exited ${code}: ${stderr.slice(0, 200)}`);
+          logger.error(`[direct] claude exited ${code}: ${stderr.slice(0, 200)}`);
           resolve(null);
           return;
         }
@@ -151,7 +152,7 @@ export class DirectMode {
       });
 
       proc.on('error', (err) => {
-        console.error(`[direct] spawn failed: ${err.message}`);
+        logger.error(`[direct] spawn failed: ${err.message}`);
         resolve(null);
       });
     });

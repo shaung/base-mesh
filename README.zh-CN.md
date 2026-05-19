@@ -16,22 +16,24 @@
     ▼
 ┌──────────┐  draft → pending    ┌──────────┐
 │ Channel  │ ──────────────────▶ │ Bitable  │ ◀── poll / claim / write
-│          │ ◀──── deliver ───── │ (tables) │
+│          │ ◀──── deliver ───── │ (表格)   │
 └──────────┘                     └──────────┘
-                                      ▲
-                                      │
-                                 ┌──────────┐
-                                 │ Executor │ (多个实例)
-                                 └──────────┘
+    │                                  ▲
+    │ ws:// (push)                     │
+    ▼                                  │
+┌──────────┐                           │
+│ Executor │ ─── push 回传结果 ────────┘
+└──────────┘
 ```
 
 | 角色 | CLI 命令 | 职责 |
 |:---|:---|:---|
-| **Channel** | `channel` | 监听飞书 IM，创建工单，可选 LLM 完整性检查，投递回复 |
-| **Executor** | `join` | 轮询 pending 工单，软抢占认领，调用 Claude 处理，写回结果 |
+| **Channel** | `channel` | 监听飞书 IM WebSocket，创建工单，可选 LLM 完整性检查，投递回复。同时运行 push executor WebSocket 服务器并路由任务。 |
+| **Channel Lite** | `channel --lite` | 仅 IM 模式：监听消息、创建工单、投递回复，不启动 push 服务器。 |
+| **Executor** | `join` | Pull 模式：轮询 Bitable pending 工单，软抢占认领，调用 Claude 处理，写回结果。Push 模式：通过 WebSocket 连接 Channel，实时接收任务。 |
 | **Direct** | `direct` | 无状态模式：消息直达 Claude → 回复，不写表 |
 
-Channel 和 Executor 可在同一或不同机器运行，只需都能访问飞书 API。
+Channel 和 Executor 可在同一或不同机器运行，任何网络环境 — 只需能访问飞书 API。
 
 ---
 
@@ -49,10 +51,11 @@ npm install -g @typooo/bitable-mesh
 
 ### 1. 创建飞书应用
 
-在[飞书开发者后台](https://open.feishu.cn/app)创建**企业自建应用**：
+在[飞书开发者后台](https://open.feishu.cn/app)或 [Lark Developer Console](https://open.larksuite.com/app) 创建**企业自建应用**：
 
 - 添加能力：**多维表格**（权限：`bitable:app`）
 - 如需 IM 功能，添加**机器人**能力，权限含 `im:message`、`im:message:send_as_bot`，订阅 `im.message.receive_v1` 事件
+- 如需 Bitable 事件驱动更新，添加**云文档**权限 `drive:drive`，订阅 `drive.file.bitable_record_changed_v1` 事件
 
 ### 2. 初始化配置
 
@@ -60,7 +63,7 @@ npm install -g @typooo/bitable-mesh
 bitable-mesh setup
 ```
 
-交互引导：选服务器 → 填 appId（必填）/ appSecret（Channel 才需要）→ 自动建表或关联已有表格 → 授予编辑权限 → 保存为 profile。
+交互引导：选服务器 → 填 appId（必填）/ appSecret（Channel 需要）→ 自动建表或关联已有表格 → 授予编辑权限 → 保存为 profile。
 
 配置存于 `~/.bitable-mesh/profiles/default.toml`。
 
@@ -78,111 +81,68 @@ OAuth PKCE 授权，浏览器确认后自动收集你的飞书身份并写入配
 # Executor（处理工单）
 bitable-mesh join
 
-# Channel（IM 机器人，需要 appSecret）
+# Channel（IM 机器人 + push executor 服务器）
 bitable-mesh channel
+
+# Channel Lite（仅 IM，无 push 服务器）
+bitable-mesh channel --lite
 ```
 
 ---
 
-## 工作流程
-
-1. 用户飞书私聊 Bot
-2. **Channel** 创建 draft 工单，写入用户消息
-3. `useLLM=true` 时 Channel 调 Claude 检查信息完整度，不足则追问
-4. 信息就绪 → 提升为 `pending`
-5. **Executor** 轮询到 pending 工单，软抢占认领
-6. 可选**执行前审批**：需负责人通过多维表自动化确认
-7. Executor 调 Claude Code 处理
-8. 可选**回答后审核**：审核人确认后投递
-9. 结果写回表格，Channel 投递到 IM
-
----
-
-## 任务分配（Capabilities）
-
-多个 Executor 可按领域分工。
-
-### Executor 配置
-
-```toml
-[executor]
-capabilities = ["tech_support", "hr"]
-```
-
-仅认领 `required_capabilities` 匹配的工单（无则认领所有）。
-
-### 能力分类
-
-Channel 在创建工单时自动分类用户消息，写入 `required_capabilities`。两种方式：
-
-| 方式 | 配置 | 说明 |
-|:---|:---|:---|
-| 关键词 | `capabilitiesMapping = "keyword"` | 在 Capabilities 表中配置关键词，Channel 匹配 |
-| 斜杠命令 | `capabilitiesMapping = "command"` | 用户 `/tech_support 我的问题` 显式指定 |
-
-### Capabilities 表
-
-| 字段 | 类型 | 说明 |
-|:---|:---|:---|
-| capability | 文本 | 标识，如 `tech_support` |
-| display_name | 文本 | 展示名称 |
-| keywords | 文本 | 逗号分隔的关键词 |
-| prompt | 文本 | 该领域的专用提示词（可选） |
-| enabled | 复选框 | 是否启用 |
-
----
-
-## 人在回路
-
-### 执行前审批
-
-在 Roster 表中为 Executor 记录设置 `human` 字段（人员类型），Executor 认领工单后自动进入审批。未设置负责人则跳过。
-
-1. 状态 → `pending_approval`
-2. 通知负责人（依赖多维表自动化）
-3. 批准 → 继续；驳回 → 释放
-
-跳过：`bitable-mesh join --skip-approval`
-
-### 回答后审核
-
-```toml
-[executor]
-postReview = true
-```
-
-AI 回答写为 `pending_review`，审核人批准后 Channel 投递到 IM。
-
----
 
 ## 配置参考
 
 ```toml
 appId = "cli_xxx"
 openApiDomain = "open.feishu.cn"
+appSecret = "xxx"         # Channel 需要
 appToken = "QBX..."
 ticketsTableId = "tbl..."
 turnsTableId = "tbl..."
 rosterTableId = "tbl..."
-capabilitiesWhitelistTableId = "tbl..."
-
-[channel]
-enabled = true
-useLLM = false
-capabilitiesMapping = "keyword"
+rolesWhitelistTableId = "tbl..."
+clientId = "my-executor"  # executor 标识，默认 user@hostname
 
 [executor]
-capabilities = []
+roles = []
+mode = "push"             # "push" 或 "pull"
+auth = "user"             # "user" (OAuth PKCE) 或 "app" (app_secret)
+coordinator_url = "ws://localhost:12345"
+prompt = "你是一个技术支持 agent。"
+aiCommand = "claude"
+aiPromptFlag = "-p"
+claudeArgs = ["--dangerously-skip-permissions"]
+claudeTimeout = 600
+maxRetries = 3
+maxConcurrency = 5
 skipApproval = false
 approvalTimeoutMinutes = 30
 postReview = false
+selfCheck = true
+hitl = "off"
+hitlPolicy = "default"
 
-prompt = """
-系统提示词...
-"""
+[channel]
+useLLM = false
+draftTTLMinutes = 60
+pollIntervalSeconds = 30
+rolesMapping = "keyword"
+coordinatorPort = 12345
+
+[operator]
+useLLM = false
+draftTTLMinutes = 60
+pollIntervalSeconds = 30
+rolesMapping = "keyword"
+
+[coordinator]
+port = 12345
+heartbeatSeconds = 60
+globalPrompt = ""
 ```
 
-> 字段映射和状态名有默认值，通常无需额外配置。默认值见 `config.ts` 的 `DEFAULT_FIELDS` / `DEFAULT_STATUSES`。
+> 字段映射和状态名有默认值，通常无需额外配置。
 
 ---
 
@@ -197,8 +157,15 @@ bitable-mesh [options] <command>
 | `setup` | 交互式配置向导 |
 | `login` | OAuth PKCE 登录 |
 | `join` | 启动 Executor（自动 login） |
-| `channel` | 启动 Channel |
+| `channel [--lite]` | 启动 Channel（IM bot + coordinator；`--lite` 仅 IM） |
 | `direct` | 无状态模式 |
+| `produce <summary>` | 创建工单并设为 pending |
+| `claim <id>` | 认领 pending 工单 |
+| `complete <id>` | 写入结果并标记完成 |
+| `ticket create` | 创建 draft 工单 |
+| `ticket reassign` | 释放工单并设置 for_roles/for_kind |
+| `bitable new` | 创建新的 Bitable base |
+| `bitable grant` | 授予 Bitable base 编辑权限 |
 
 | 参数 | 说明 |
 |:---|:---|
@@ -212,19 +179,22 @@ bitable-mesh [options] <command>
 
 ```text
 src/
-├── cli.ts       CLI 入口
-├── channel.ts   Channel：WS、消息处理、turn 投递
-├── executor.ts  Executor：轮询、认领、Claude 处理
-├── protocol.ts  Session：Bitable CRUD、状态转换
-├── processor.ts Claude 子进程
-├── bitable.ts   飞书 API 客户端
-├── config.ts    配置加载（TOML）
-├── setup.ts     安装向导
-├── auth.ts      OAuth PKCE
-├── log.ts       日志
-└── types.ts     类型定义
-docs/
-└── internal-design.md   内部设计文档
+├── cli.ts        CLI 入口
+├── channel.ts    Channel：WS、消息处理、draft、投递、事件分发
+├── executor.ts   Executor：pull 轮询、push WebSocket 客户端、Claude 处理
+├── coordinator.ts Coordinator：push executor WS 服务器、任务路由、roster 写入
+├── scheduler.ts  Scheduler：push executor 管理（在 Channel 内运行）
+├── protocol.ts   Session：Bitable CRUD、状态转换、turn 投递
+├── processor.ts  Claude 子进程
+├── bitable.ts    飞书 API 客户端
+├── config.ts     配置加载（TOML）
+├── setup.ts      安装向导
+├── auth.ts       OAuth PKCE
+├── sessions.ts   Push session token 持久化
+├── messages.ts   多语言消息模板
+├── domain.ts     Lark/Feishu 域名解析
+├── log.ts        日志
+└── types.ts      类型定义
 ```
 
 ---
@@ -232,7 +202,7 @@ docs/
 ## 局限
 
 - 软抢占有竞争窗口
-- 轮询延迟受 `pollInterval` 影响
+- Pull 模式轮询延迟受 `pollInterval` 影响
 - Bitable 无 CAS，防脏写依赖客户端自律
 - 审批/审核通知依赖多维表自动化或外部编排
 

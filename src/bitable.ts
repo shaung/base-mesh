@@ -57,26 +57,30 @@ export class BitableClient {
   // -- CRUD ---------------------------------------------------------------
 
   async createRecord<T = Record<string, unknown>>(tableId: string, fields: T): Promise<BitableRecord<T>> {
-    logger.debug(`createRecord table=${tableId.slice(0, 12)} fields=${JSON.stringify(fields)}`);
+    console.log(`[bitable] createRecord table=${tableId.slice(0,12)} fields=${Object.keys(fields as any).join(',')}`);
     const resp = await this.client.bitable.appTableRecord.create({
       path: { app_token: this.cfg.appToken, table_id: tableId },
       data: { fields: fields as any },
     }, await this.authOptions());
     if (resp.code !== 0 || !resp.data?.record) {
+      logger.error(`[bitable] createRecord FAILED: ${JSON.stringify(resp)}`);
       throw new BitableError(`createRecord failed: ${JSON.stringify(resp)}`, resp.code ?? 0);
     }
+    console.log(`[bitable] createRecord OK record=${resp.data.record.record_id?.slice(0,12)}`);
     return { record_id: resp.data.record.record_id!, fields: resp.data.record.fields as unknown as T };
   }
 
   async updateRecord<T = Record<string, unknown>>(tableId: string, recordId: string, fields: Partial<T>): Promise<BitableRecord<T>> {
-    logger.debug(`updateRecord table=${tableId.slice(0, 12)} record=${recordId.slice(0, 12)} fields=${JSON.stringify(fields)}`);
+    console.log(`[bitable] updateRecord table=${tableId.slice(0,12)} record=${recordId.slice(0,12)} keys=${Object.keys(fields as any).join(',')}`);
     const resp = await this.client.bitable.appTableRecord.update({
       path: { app_token: this.cfg.appToken, table_id: tableId, record_id: recordId },
       data: { fields: fields as any },
     }, await this.authOptions());
     if (resp.code !== 0 || !resp.data?.record) {
+      logger.error(`[bitable] updateRecord FAILED: ${JSON.stringify(resp)}`);
       throw new BitableError(`updateRecord failed: ${JSON.stringify(resp)}`, resp.code ?? 0);
     }
+    console.log(`[bitable] updateRecord OK`);
     return { record_id: resp.data.record.record_id!, fields: resp.data.record.fields as unknown as T };
   }
 

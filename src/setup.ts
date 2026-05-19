@@ -1,9 +1,11 @@
+import { logger } from './log.js';
 import { Client } from '@larksuiteoapi/node-sdk';
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import * as readline from 'node:readline';
-import { stdin as input, stdout as output } from 'node:process';
+import { input, select, confirm } from '@inquirer/prompts';
+import chalk from 'chalk';
+import ora from 'ora';
 import { getDomainConfig } from './domain.js';
 import { UserTokenProvider, loadStoredTokens } from './auth.js';
 
@@ -15,7 +17,8 @@ const FT = {
   Text: 1,
   Number: 2,
   SingleSelect: 3,
-  Checkbox: 4,
+  MultiSelect: 4,
+  Checkbox: 7,
   Person: 11,
   CreatedTime: 1001,
   ModifiedTime: 1002,
@@ -33,7 +36,7 @@ export interface SetupResult {
   ticketsTableId: string;
   turnsTableId: string;
   rosterTableId: string;
-  capabilitiesWhitelistTableId?: string;
+  rolesWhitelistTableId?: string;
 }
 
 export interface SetupOptions {
@@ -43,29 +46,24 @@ export interface SetupOptions {
   appName?: string;
   /** Feishu open_id to grant edit permission and register as Roster.human. */
   ownerOpenId?: string;
+  /** If provided, skip base creation and use this existing token. */
+  existingAppToken?: string;
 }
 
 // ---------------------------------------------------------------------------
 // Interactive prompt helpers (zero dependencies)
 // ---------------------------------------------------------------------------
 
-function ask(query: string): Promise<string> {
-  const rl = readline.createInterface({ input, output });
-  return new Promise((resolve) => {
-    rl.question(query, (answer) => { rl.close(); resolve(answer); });
-  });
+async function promptInput(message: string, def?: string): Promise<string> {
+  return input({ message, default: def });
 }
 
-async function select(label: string, options: string[]): Promise<number> {
-  console.log(`\n${label}`);
-  for (let i = 0; i < options.length; i++) {
-    console.log(`  ${i + 1}) ${options[i]}`);
-  }
-  const raw = await ask('\nChoice: ');
-  const idx = parseInt(raw, 10);
-  if (idx >= 1 && idx <= options.length) return idx - 1;
-  console.log('  Invalid choice, defaulting to first option.');
-  return 0;
+async function promptList(message: string, choices: Array<{ name: string; value: any }>): Promise<any> {
+  return select({ message, choices } as any);
+}
+
+async function promptConfirm(message: string, def = true): Promise<boolean> {
+  return confirm({ message, default: def });
 }
 
 // ---------------------------------------------------------------------------
@@ -234,18 +232,26 @@ async function createTable(
 export async function createBitableMesh(opts: SetupOptions): Promise<SetupResult> {
   const client = createClient(opts);
 
-  const appName = opts.appName ?? 'bitable-mesh';
-  console.log(`  Creating bitable "${appName}"...`);
-  const appResp = await client.bitable.app.create({
-    data: { name: appName },
-  });
-  if (appResp.code !== 0 || !appResp.data?.app?.app_token) {
-    throw new Error(`Create bitable app failed: ${JSON.stringify(appResp)}`);
+  let appToken: string;
+  let appUrl: string | undefined;
+
+  if (opts.existingAppToken) {
+    appToken = opts.existingAppToken;
+    console.log(`  Using existing bitable: ${appToken}`);
+  } else {
+    const appName = opts.appName ?? 'bitable-mesh';
+    console.log(`  Creating bitable "${appName}"...`);
+    const appResp = await client.bitable.app.create({
+      data: { name: appName },
+    });
+    if (appResp.code !== 0 || !appResp.data?.app?.app_token) {
+      throw new Error(`Create bitable app failed: ${JSON.stringify(appResp)}`);
+    }
+    appToken = appResp.data.app.app_token;
+    appUrl = appResp.data.app.url;
+    console.log(`  ✓ app_token: ${appToken}`);
+    if (appUrl) console.log(`  ✓ url: ${appUrl}`);
   }
-  const appToken = appResp.data.app.app_token;
-  const appUrl = appResp.data.app.url;
-  console.log(`  ✓ app_token: ${appToken}`);
-  if (appUrl) console.log(`  ✓ url: ${appUrl}`);
 
   console.log('  Creating tables...');
   const ticketsTableId = await createTable(client, appToken, 'Tickets', [
@@ -266,9 +272,10 @@ export async function createBitableMesh(opts: SetupOptions): Promise<SetupResult
     { field_name: 'keyfacts', type: FT.Text },
     { field_name: 'chat_id', type: FT.Text },
     { field_name: 'sender_id', type: FT.Text },
-    { field_name: 'required_capabilities', type: FT.Text },
+    { field_name: 'for_roles', type: FT.MultiSelect, property: { options: [{ name: 'general', color: 0 }] } },
+    { field_name: 'for_kind', type: FT.SingleSelect, property: { options: [{ name: 'human', color: 0 }, { name: 'agent', color: 1 }] } },
     { field_name: 'result', type: FT.Text },
-    { field_name: 'conversation_id', type: FT.Text },
+    { field_name: 'metadata', type: FT.Text },
     { field_name: 'approvers', type: FT.Person, property: { multiple: true } },
     { field_name: 'created_at', type: FT.CreatedTime },
     { field_name: 'updated_at', type: FT.ModifiedTime },
@@ -295,6 +302,7 @@ export async function createBitableMesh(opts: SetupOptions): Promise<SetupResult
     { field_name: 'delivery_lease_at', type: FT.Number },
     { field_name: 'created_at', type: FT.CreatedTime },
     { field_name: 'notified', type: FT.Number },
+    { field_name: 'metadata', type: FT.Text },
     { field_name: 'updated_at', type: FT.ModifiedTime },
   ]);
   console.log(`  ✓ Turns: ${turnsTableId}`);
@@ -302,21 +310,26 @@ export async function createBitableMesh(opts: SetupOptions): Promise<SetupResult
   const rosterTableId = await createTable(client, appToken, 'Roster', [
     { field_name: 'identity', type: FT.Text },
     { field_name: 'nickname', type: FT.Text },
-    { field_name: 'role', type: FT.Text },
+    { field_name: 'kind', type: FT.SingleSelect, property: { options: [{ name: 'human', color: 0 }, { name: 'agent', color: 1 }, { name: 'system', color: 2 }] } },
+    { field_name: 'system_type', type: FT.Text },
     { field_name: 'channel_type', type: FT.Text },
     { field_name: 'hostname', type: FT.Text },
     { field_name: 'user', type: FT.Text },
     { field_name: 'pid', type: FT.Text },
+    { field_name: 'description', type: FT.Text },
     { field_name: 'last_seen_at', type: FT.Number },
     { field_name: 'registered_at', type: FT.Number },
-    { field_name: 'capabilities', type: FT.Text },
+    { field_name: 'roles', type: FT.MultiSelect, property: { options: [{ name: 'general', color: 0 }] } },
+    { field_name: 'enabled', type: FT.Checkbox },
+    { field_name: 'hitl', type: FT.SingleSelect, property: { options: [{ name: 'off', color: 0 }, { name: 'auto', color: 1 }, { name: 'always', color: 2 }] } },
+    { field_name: 'hitl_policy', type: FT.SingleSelect, property: { options: [{ name: 'default', color: 0 }, { name: 'off', color: 1 }, { name: 'auto', color: 2 }, { name: 'always', color: 3 }] } },
     { field_name: 'human', type: FT.Person, property: { multiple: true } },
     { field_name: 'created_at', type: FT.CreatedTime },
     { field_name: 'updated_at', type: FT.ModifiedTime },
   ]);
   console.log(`  ✓ Roster: ${rosterTableId}`);
 
-  const capabilitiesWhitelistTableId = await createTable(client, appToken, 'Capabilities', [
+  const rolesWhitelistTableId = await createTable(client, appToken, 'Roles', [
     { field_name: 'capability', type: FT.Text },
     { field_name: 'display_name', type: FT.Text },
     { field_name: 'description', type: FT.Text },
@@ -326,7 +339,7 @@ export async function createBitableMesh(opts: SetupOptions): Promise<SetupResult
     { field_name: 'created_at', type: FT.CreatedTime },
     { field_name: 'updated_at', type: FT.ModifiedTime },
   ]);
-  console.log(`  ✓ Capabilities: ${capabilitiesWhitelistTableId}`);
+  console.log(`  ✓ Roles: ${rolesWhitelistTableId}`);
 
   if (opts.ownerOpenId) {
     try {
@@ -346,7 +359,7 @@ export async function createBitableMesh(opts: SetupOptions): Promise<SetupResult
     }
   }
 
-  return { appToken, appUrl, ticketsTableId, turnsTableId, rosterTableId, capabilitiesWhitelistTableId };
+  return { appToken, appUrl, ticketsTableId, turnsTableId, rosterTableId, rolesWhitelistTableId };
 }
 
 // ---------------------------------------------------------------------------
@@ -354,21 +367,49 @@ export async function createBitableMesh(opts: SetupOptions): Promise<SetupResult
 // ---------------------------------------------------------------------------
 
 function buildConfig(
-  fields: { appId: string; openApiDomain?: string; ownerOpenId?: string },
+  fields: { appId: string; appSecret?: string; openApiDomain?: string; ownerOpenId?: string; execMode?: string; execAuth?: string },
   result: SetupResult,
 ): Record<string, unknown> {
   return {
     appId: fields.appId,
+    ...(fields.appSecret ? { appSecret: fields.appSecret } : {}),
     openApiDomain: fields.openApiDomain || 'open.larksuite.com',
     appToken: result.appToken,
     ticketsTableId: result.ticketsTableId,
     turnsTableId: result.turnsTableId,
     rosterTableId: result.rosterTableId,
     ...(fields.ownerOpenId ? { ownerOpenId: fields.ownerOpenId } : {}),
-    ...(result.capabilitiesWhitelistTableId ? { capabilitiesWhitelistTableId: result.capabilitiesWhitelistTableId } : {}),
-    channel: { enabled: true, useLLM: false, draftTTLMinutes: 60, pollIntervalSeconds: 3, capabilitiesMapping: 'keyword' },
-    executor: { capabilities: [], skipApproval: false, approvalTimeoutMinutes: 30, postReview: false },
+    ...(result.rolesWhitelistTableId ? { rolesWhitelistTableId: result.rolesWhitelistTableId } : {}),
+    channel: { useLLM: false, draftTTLMinutes: 60, pollIntervalSeconds: 3, rolesMapping: 'keyword' },
+    executor: {
+      roles: [], skipApproval: false, approvalTimeoutMinutes: 30, postReview: false,
+      ...(fields.execMode ? { mode: fields.execMode } : {}),
+      ...(fields.execAuth ? { auth: fields.execAuth } : {}),
+      hitl: 'off',
+      hitlPolicy: 'default',
+    },
     prompt: 'You are a technical support agent. Answer user questions professionally.',
+    messages: {
+      taskDone: '✅ Done processing',
+      taskAssigned: '🤖 {identity} started processing',
+      humanNotification: '📋 New task pending {mentions}\n{summary}',
+      ackReceived: '✅ Received',
+      clarifyQuestion: 'Could you please describe the issue in more detail? If you have any relevant order numbers or error messages, please also provide them, and I\'ll help investigate.',
+      ticketReactivated: 'Ticket reactivated, queued for processing',
+      ccFormat: '{content}\n\ncc {mentions}',
+      errorFallback: 'Analysis could not be completed ({reason}), handing off to human; ticket re-queued, another online agent may pick it up.',
+      retryFallback: 'Analysis could not be completed ({reason}), will auto-retry ({retryCount}/{maxRetries}).',
+      exhaustedFallback: 'Analysis could not be completed ({reason}), all retries exhausted. Reply to this message to reactivate the ticket.',
+      ackTemplate: 'Received, checking{ackHints}. Will reply shortly. ({nickname})',
+      approvalWait: '⏳ Awaiting approval from {mentions}',
+      approvalDenied: '⏳ Ticket not approved ({reason}), escalated to human processing',
+      reviewWait: '📋 Answer pending review, reviewers notified',
+      reviewRetry: '📋 Answer regenerated, pending re-review',
+      reviewTimeout: '⏳ Review timed out, escalated to human processing',
+      reviewRejected: '⏳ Review rejected again, escalated to human processing',
+      reassignFallback: 'Transferring...',
+      emptyAnswerFallback: '(no answer)',
+    },
   };
 }
 
@@ -376,79 +417,75 @@ function buildConfig(
 // Interactive setup wizard
 // ---------------------------------------------------------------------------
 
-export async function interactiveSetup(profile = 'default'): Promise<void> {
+export async function interactiveSetup(profile = 'default', scene: 'all' | 'channel' | 'executor' | 'operator' = 'all'): Promise<void> {
   console.log('');
   console.log('  ╔══════════════════════════════════════════════════════╗');
   console.log('  ║              bitable-mesh Setup Wizard               ║');
-  console.log('  ║                                                      ║');
-  console.log('  ║  This wizard will help you configure a Feishu        ║');
-  console.log('  ║  Bitable base for distributed agent collaboration.   ║');
+  const sceneLabel = scene === 'channel' ? 'Channel' : scene === 'executor' ? 'Executor' : scene === 'operator' ? 'Operator' : 'All';
+  console.log(`  ║              Scene: ${sceneLabel.padEnd(34)}║`);
   console.log('  ╚══════════════════════════════════════════════════════╝');
   console.log('');
+
+  // Load existing profile for defaults
+  const { readProfile: readExistingProfile } = await import('./config.js');
+  let existingProfile: Record<string, unknown> = {};
+  try { existingProfile = readExistingProfile(profile) || {}; } catch { /* ok */ }
+  const def = (key: string, fallback = ''): string =>
+    String(existingProfile[key] || '').trim() || fallback;
 
   // =========================================================================
   // Step 1: Server domain
   // =========================================================================
 
-  console.log('Step 1: Lark / Feishu Server');
-  console.log('  Which server does your account belong to?\n');
-  const domainChoices = [
-    { label: 'International — Lark (larksuite.com)', domain: 'open.larksuite.com' },
-    { label: 'Chinese — 飞书 (feishu.cn)', domain: 'open.feishu.cn' },
-    { label: 'Custom — specify manually', domain: '' },
-  ];
-  for (let i = 0; i < domainChoices.length; i++) {
-    console.log(`  ${i + 1}) ${domainChoices[i].label}`);
-  }
-  const domainRaw = await ask('\nChoice [1]: ');
-  const domainIdx = parseInt(domainRaw, 10) || 1;
-  let openApiDomain: string;
-  if (domainIdx === 2) {
-    openApiDomain = 'open.feishu.cn';
-  } else if (domainIdx === 3) {
-    openApiDomain = await ask('  Enter Open API domain (e.g., open.larksuite.com): ');
-    if (!openApiDomain) openApiDomain = 'open.larksuite.com';
-  } else {
-    openApiDomain = 'open.larksuite.com';
-  }
-  console.log(`  → Server: ${openApiDomain}`);
+  console.log(chalk.bold('\nStep 1: Lark / Feishu Server'));
+  const domainChoice = await promptList('Which server does your account belong to?', [
+    { name: 'International — Lark (larksuite.com)', value: 'open.larksuite.com' },
+    { name: 'Chinese — 飞书 (feishu.cn)', value: 'open.feishu.cn' },
+    { name: 'Custom — specify manually', value: 'custom' },
+  ]);
+  let openApiDomain = domainChoice === 'custom'
+    ? await promptInput('Enter Open API domain (e.g., open.larksuite.com)', 'open.larksuite.com')
+    : domainChoice;
+  console.log(chalk.cyan(`  → Server: ${openApiDomain}`));
 
   // =========================================================================
   // Step 2: Credentials
   // =========================================================================
 
-  console.log('\nStep 2: Feishu App Credentials');
-  console.log('  appId is required. appSecret is only needed for Channel (IM) mode.');
-  console.log('  For join (Executor) mode with OAuth PKCE, appSecret can be left empty.\n');
-  let appId = '';
-  let appSecret = process.env.BITABLE_APP_SECRET || '';
+  console.log(chalk.bold('\nStep 2: Feishu App Credentials'));
+  let appId = def('appId');
+  let appSecret = def('appSecret');
 
-  if (appSecret) {
-    console.log(`  Using appSecret from .env: ${maskMiddle(appSecret)}`);
-    const reuse = await ask('  Use this appSecret? [Y/n]: ');
-    if (reuse.toLowerCase() === 'n') appSecret = '';
+  if (appId) {
+    console.log(chalk.gray(`  Existing profile has appId: ${appId}`));
+    if (await promptConfirm('Create a NEW bot app instead?', false)) appId = '';
   }
 
-  appId = await ask('  appId (required): ');
   if (!appId) {
-    console.error('  Error: appId is required.');
-    return;
-  }
-
-  if (!appSecret) {
-    const input = await ask('  appSecret (optional, press Enter to skip): ');
-    if (input.trim()) appSecret = input.trim();
-  }
-
-  if (appSecret) {
-    const saveEnv = await ask('\n  Save appSecret to .env for future use? [Y/n]: ');
-    if (saveEnv.toLowerCase() !== 'n') {
-      const envPath = join(ROOT, '.env');
-      const line = `\nBITABLE_APP_SECRET="${appSecret}"\n`;
-      appendFileSync(envPath, line, 'utf-8');
-      console.log(`  ✓ Appended to ${envPath}`);
-      process.env.BITABLE_APP_SECRET = appSecret;
+    const spinner = ora('Waiting for QR authorization...').start();
+    try {
+      const { createAppViaQR } = await import('./device-auth.js');
+      const result = await createAppViaQR({ openApiDomain });
+      appId = result.appId;
+      appSecret = result.appSecret;
+      if (result.domain === 'lark') openApiDomain = 'open.larksuite.com';
+      spinner.succeed(chalk.green(`App created: ${appId}`));
+    } catch (err: any) {
+      spinner.warn(chalk.yellow(`QR failed: ${err.message}`));
+      appId = await promptInput('appId (required)');
+      if (!appId) { logger.error(chalk.red('Error: appId is required.')); return; }
     }
+  }
+
+  if (appSecret) console.log(chalk.gray(`  appSecret: ${maskMiddle(appSecret)}`));
+  if (scene === 'operator' || scene === 'channel' || scene === 'all') {
+    const input = await promptInput('appSecret', appSecret ? maskMiddle(appSecret) : undefined);
+    if (input && input !== maskMiddle(appSecret)) appSecret = input;
+  }
+
+  if (!appSecret && (scene === 'operator' || scene === 'channel' || scene === 'all')) {
+    const input = await promptInput('appSecret (optional, press Enter to skip)');
+    if (input.trim()) appSecret = input.trim();
   }
 
   // =========================================================================
@@ -466,7 +503,7 @@ export async function interactiveSetup(profile = 'default'): Promise<void> {
     ownerOpenId = existingTokens.userId;
     console.log(`  ✓ Already authorized as ${ownerOpenId}`);
   } else {
-    const doLogin = await ask('  Authorize via browser now? [Y/n]: ');
+    const doLogin = await promptInput('  Authorize via browser now? [Y/n]: ');
     if (doLogin.toLowerCase() !== 'n') {
       try {
         await UserTokenProvider.login(appId, openApiDomain);
@@ -486,23 +523,34 @@ export async function interactiveSetup(profile = 'default'): Promise<void> {
   // Step 4: Bitable mode
   // =========================================================================
 
-  console.log('\nStep 4: Bitable Configuration');
-  const modeIdx = await select(
-    '  How would you like to set up the bitable?',
-    ['Create a new Bitable base automatically', 'Use an existing Bitable base'],
-  );
-
   let result: SetupResult;
 
-  if (modeIdx === 0) {
+  if (scene === 'executor' && def('appToken') && def('ticketsTableId')) {
+    console.log('\nStep 4: Bitable Configuration (reusing existing)');
+    console.log(`  appToken: ${def('appToken')}`);
+    result = {
+      appToken: def('appToken'),
+      ticketsTableId: def('ticketsTableId'),
+      turnsTableId: def('turnsTableId'),
+      rosterTableId: def('rosterTableId'),
+      rolesWhitelistTableId: def('rolesWhitelistTableId') || undefined,
+    };
+  } else {
+    console.log('\nStep 4: Bitable Configuration');
+    const bitableMode = await promptList(
+      'How would you like to set up the bitable?',
+      [{ name: 'Create a new Bitable base automatically', value: 'new' }, { name: 'Use an existing Bitable base', value: 'existing' }],
+    );
+
+  if (bitableMode === 'new') {
     // -- Create new ---------------------------------------------------------
     if (!appSecret) {
-      console.error('\n  Error: appSecret is required to create a new Bitable base.');
-      console.error('  Please re-run setup and provide appSecret, or choose "Use an existing Bitable base".');
+      logger.error('\n  Error: appSecret is required to create a new Bitable base.');
+      logger.error('  Please re-run setup and provide appSecret, or choose "Use an existing Bitable base".');
       return;
     }
     console.log('');
-    const meshName = await ask('  Name for the new base [bitable-mesh]: ');
+    const meshName = await promptInput('  Name for the new base [bitable-mesh]: ');
     result = await createBitableMesh({
       appId, appSecret, openApiDomain, appName: meshName || 'bitable-mesh',
       ownerOpenId: ownerOpenId,
@@ -511,18 +559,18 @@ export async function interactiveSetup(profile = 'default'): Promise<void> {
   } else {
     // -- Use existing -------------------------------------------------------
     console.log('');
-    const url = await ask('  Paste your Bitable URL:\n  > ');
+    const url = await promptInput('  Paste your Bitable URL:\n  > ');
     const parsed = parseBitableUrl(url);
     if (!parsed) {
-      console.error('  Error: Could not parse URL. Expected format:');
-      console.error('    https://<org>.larksuite.com/base/<app_token>');
+      logger.error('  Error: Could not parse URL. Expected format:');
+      logger.error('    https://<org>.larksuite.com/base/<app_token>');
       return;
     }
 
     // Detect or confirm domain from URL
     if (parsed.openApiDomain && parsed.openApiDomain !== openApiDomain) {
       console.log(`\n  Note: URL suggests "${parsed.openApiDomain}" but you selected "${openApiDomain}".`);
-      const override = await ask(`  Use "${parsed.openApiDomain}" instead? [Y/n]: `);
+      const override = await promptInput(`  Use "${parsed.openApiDomain}" instead? [Y/n]: `);
       if (override.toLowerCase() !== 'n') openApiDomain = parsed.openApiDomain;
     }
     console.log(`  ✓ app_token: ${parsed.appToken}`);
@@ -535,30 +583,30 @@ export async function interactiveSetup(profile = 'default'): Promise<void> {
       try {
         tables = await listTables(client, parsed.appToken);
       } catch (err: any) {
-        console.error(`  Error: ${err.message}`);
-        console.error('  Make sure the app has access to this base and the URL is correct.');
+        logger.error(`  Error: ${err.message}`);
+        logger.error('  Make sure the app has access to this base and the URL is correct.');
         return;
       }
     } else {
       // No appSecret — use user token (OAuth PKCE)
       const provider = UserTokenProvider.fromStore(appId);
       if (!provider) {
-        console.error('  Error: No appSecret and no OAuth login found.');
-        console.error('  Please re-run setup and provide appSecret, or complete the authorization step.');
+        logger.error('  Error: No appSecret and no OAuth login found.');
+        logger.error('  Please re-run setup and provide appSecret, or complete the authorization step.');
         return;
       }
       try {
         tables = await listTablesWithUserToken(appId, parsed.appToken, openApiDomain);
       } catch (err: any) {
-        console.error(`  Error: ${err.message}`);
-        console.error('  Make sure you have access to this base. The user token from OAuth login');
-        console.error('  grants access to bases you can view in the Feishu/Lark client.');
+        logger.error(`  Error: ${err.message}`);
+        logger.error('  Make sure you have access to this base. The user token from OAuth login');
+        logger.error('  grants access to bases you can view in the Feishu/Lark client.');
         return;
       }
     }
 
     if (tables.length === 0) {
-      console.error('  Error: No tables found in this base.');
+      logger.error('  Error: No tables found in this base.');
       return;
     }
 
@@ -579,7 +627,7 @@ export async function interactiveSetup(profile = 'default'): Promise<void> {
         .map((t, i) => ({ ...t, i }))
         .filter((t) => !usedIndices.has(t.i));
       if (available.length === 0) {
-        console.error('  Error: Not enough tables to assign all roles.');
+        logger.error('  Error: Not enough tables to assign all roles.');
         return;
       }
 
@@ -589,7 +637,7 @@ export async function interactiveSetup(profile = 'default'): Promise<void> {
         const label = available[j].name ?? '(unnamed)';
         console.log(`    ${j + 1}) ${label}`);
       }
-      const pick = await ask(`  Choice [1]: `);
+      const pick = await promptInput(`  Choice [1]: `);
       const pickIdx = (parseInt(pick, 10) || 1) - 1;
       const clampedIdx = Math.max(0, Math.min(pickIdx, available.length - 1));
       const chosen = available[clampedIdx];
@@ -606,13 +654,43 @@ export async function interactiveSetup(profile = 'default'): Promise<void> {
       rosterTableId: roleMap.rosterTableId,
     };
   }
+  } // end of bitable else block
 
   // =========================================================================
-  // Step 5: Save profile
+  // Step 5: Channel / Executor config
   // =========================================================================
 
-  console.log('\nStep 5: Save Profile');
-  const config = buildConfig({ appId, openApiDomain, ownerOpenId }, result);
+  let execMode: string | undefined;
+  let execAuth: string | undefined;
+
+  if (scene === 'executor' || scene === 'all') {
+    console.log('\nStep 5: Executor Configuration');
+    console.log('  Push mode: executor connects to Channel via WebSocket (zero Bitable API).');
+    console.log('  Pull mode: executor polls Bitable directly.');
+    console.log('');
+    execMode = await promptList('Executor mode:', [
+      { name: 'push (default)', value: 'push' }, { name: 'pull', value: 'pull' },
+    ]);
+
+    if (execMode === 'push') {
+      execAuth = await promptList('Push auth method:', [
+        { name: 'user (OAuth PKCE)', value: 'user' }, { name: 'app (app secret)', value: 'app' },
+      ]);
+    }
+  }
+
+  if (scene === 'channel' || scene === 'all') {
+    console.log('\nStep 5b: Channel Configuration');
+    const pushPort = await promptInput(`  Push listen port [${def('coordinatorPort') || '0 (disabled)'}]: `);
+    if (pushPort.trim()) existingProfile['coordinatorPort'] = pushPort.trim();
+  }
+
+  // =========================================================================
+  // Step 6: Save profile
+  // =========================================================================
+
+  console.log('\nStep 6: Save Profile');
+  const config = { ...existingProfile, ...buildConfig({ appId, appSecret, openApiDomain, ownerOpenId, execMode, execAuth }, result) };
   const { saveProfile, profilePath } = await import('./config.js');
   saveProfile(profile, config);
   const savedPath = profilePath(profile);

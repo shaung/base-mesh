@@ -1,3 +1,4 @@
+import { logger } from './log.js';
 import { spawn } from 'node:child_process';
 import { Client, WSClient, EventDispatcher } from '@larksuiteoapi/node-sdk';
 import { Config, BitableRecord, CompletenessCheckResult } from './types.js';
@@ -5,11 +6,10 @@ import { BitableClient } from './bitable.js';
 import { Session, extractText, extractUserIds } from './protocol.js';
 import { ClaudeProcessor } from './processor.js';
 import { getDomainConfig } from './domain.js';
+import { formatMessage } from './messages.js';
+import { Coordinator } from './coordinator.js';
 
 const DEFAULT_EMOJI = 'OnIt';
-
-const CLARIFY_QUESTION =
-  '请问可以详细描述您遇到的问题吗？如果有相关的订单号、错误信息，也请一并提供，我会帮您排查。';
 
 const COMPLETENESS_PROMPT = `Analyze the support ticket and conversation below. Determine if the user has provided enough information for a technical support agent to investigate.
 
@@ -18,7 +18,7 @@ Respond in JSON only:
   "isComplete": true/false,
   "summary": "concise summary of the issue",
   "missingFields": ["list", "of", "missing", "info"],
-  "requiredCapabilities": ["capability1", "capability2"]
+  "forRoles": ["capability1", "capability2"]
 }`;
 
 // ---------------------------------------------------------------------------
@@ -42,13 +42,16 @@ export class Channel {
   private session: Session;
   private processor: ClaudeProcessor;
   private client: Client;
+  private coordinator: Coordinator | null = null;
   private running = true;
   private draftCleanupTimer: ReturnType<typeof setInterval> | null = null;
-  /** Delivered turn IDs (in-memory dedup to tolerate markTurnNotified() failures). */
   private deliveredTurnIds = new Set<string>();
-  constructor(private cfg: Config) {
+  private lite: boolean;
+
+  constructor(private cfg: Config, lite = false) {
+    this.lite = lite;
     this.bitable = new BitableClient(cfg);
-    this.session = new Session(cfg.identity, cfg.nickname, cfg, this.bitable);
+    this.session = new Session(cfg.clientId || cfg.identity, cfg.nickname, cfg, this.bitable);
     this.processor = new ClaudeProcessor(cfg);
     const dc = getDomainConfig(cfg.openApiDomain);
     this.client = new Client({
@@ -62,19 +65,25 @@ export class Channel {
     process.on('SIGTERM', () => { this.stop(); process.exit(0); });
     process.on('SIGINT', () => { this.stop(); process.exit(0); });
 
-    await this.session.register();
-    console.log(`[channel] started identity=${this.cfg.identity} nickname=${this.cfg.nickname}`);
+    const label = this.lite ? 'channel-lite' : 'channel';
+    console.log(`[${label}] started identity=${this.cfg.clientId || this.cfg.identity}`);
 
+    // Start coordinator (push executor WS server) unless in lite mode
+    if (!this.lite) {
+      this.coordinator = new Coordinator(this.cfg);
+      this.coordinator.start();
+    }
+
+    await this.subscribeBitableEvents();
     await this.connectWebSocket();
 
     // Draft TTL cleanup
-    const ttlMs = (this.cfg.channel?.draftTTLMinutes ?? 60) * 60 * 1000;
+    const ttlMs = (this.cfg.operator?.draftTTLMinutes ?? 60) * 60 * 1000;
     this.draftCleanupTimer = setInterval(() => this.cleanupStaleDrafts(ttlMs), ttlMs);
 
     while (this.running) {
-      await sleep((this.cfg.channel?.pollIntervalSeconds ?? 3) * 1000);
+      await sleep((this.cfg.operator?.pollIntervalSeconds ?? 3) * 1000);
       try {
-        await this.session.heartbeat();
         await this.deliverTurns();
       } catch { /* ignore */ }
     }
@@ -87,9 +96,113 @@ export class Channel {
   stop(): void {
     this.running = false;
     if (this.draftCleanupTimer) clearInterval(this.draftCleanupTimer);
+    if (this.coordinator) this.coordinator.stop();
     if (this.wsClient) {
       try { this.wsClient.close({ force: true }); } catch { /* ignore */ }
       this.wsClient = null;
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Bitable event handler — routes to coordinator for push assignment
+  // -----------------------------------------------------------------------
+
+  private recentEvents = new Set<string>();
+
+  private async onBitableEvent(data: any): Promise<void> {
+    const event = data.event ?? data;
+    const tableId = event.table_id;
+    // record_id is nested inside action_list
+    const action = event.action_list?.[0];
+    const recordId = action?.record_id;
+    if (!recordId || !tableId) return;
+
+    // Dedup: skip same record within 10s to prevent self-triggered loops
+    const key = `${tableId}:${recordId}`;
+    if (this.recentEvents.has(key)) return;
+    this.recentEvents.add(key);
+    setTimeout(() => this.recentEvents.delete(key), 10_000);
+    console.log(`[channel] bitable event: table=${tableId.slice(0,12)} record=${recordId.slice(0,12)} action=${action?.action}`);
+
+    // Dispatch by table
+    if (tableId === this.cfg.ticketsTableId) {
+      if (!this.coordinator) return;
+      try {
+        const ticket = await this.bitable.getRecord(this.cfg.ticketsTableId, recordId);
+        if (!ticket) return;
+        // Only route pending tickets — same logic as the old poll loop
+        const status = String(ticket.fields[this.cfg.fields.ticket.status] ?? '');
+        if (status === this.cfg.statuses.pending && this.session.isClaimable(ticket)) {
+          await this.coordinator.tryRoute(ticket);
+        }
+      } catch { /* */ }
+    } else if (tableId === this.cfg.turnsTableId) {
+      // Turn changed — deliver immediately if notifiable
+      try {
+        const turn = await this.bitable.getRecord(this.cfg.turnsTableId, recordId);
+        if (!turn) return;
+        const status = String(turn.fields[this.cfg.fields.turn.status] ?? '');
+        const notified = Number(turn.fields[this.cfg.fields.turn.notified] ?? 0);
+        const notifyStatuses = ['processing', 'answered', 'error', 'approved'];
+        if (notifyStatuses.includes(status) && notified === 0) {
+          await this.deliverTurn(turn);
+        }
+      } catch { /* */ }
+    }
+  }
+
+  /** Deliver a single turn to IM (extracted from deliverTurns batch logic). */
+  private async deliverTurn(turn: BitableRecord): Promise<void> {
+    const turnRecordId = turn.record_id;
+    if (!turnRecordId || this.deliveredTurnIds.has(turnRecordId)) return;
+    const claimed = await this.session.claimTurnDelivery(turnRecordId);
+    if (!claimed) return;
+    const content = extractText(turn.fields[this.cfg.fields.turn.content]);
+    const rootMsgId = extractText(turn.fields[this.cfg.fields.turn.rootMsgId]);
+    if (!content || !rootMsgId) return;
+    const human = extractUserIds(turn.fields[this.cfg.fields.turn.human]);
+    let finalContent = content;
+    if (human) {
+      const parts = human.split(',').filter(Boolean);
+      const mentions = parts.map(p => p.startsWith('ou_') ? `<at id=${p}></at>` : p).join(' ');
+      finalContent = formatMessage(this.cfg.messages?.ccFormat || '{content}\n\ncc {mentions}', { content, mentions });
+    }
+    try {
+      await this.reply(rootMsgId, finalContent, true);
+      this.deliveredTurnIds.add(turnRecordId);
+      await this.session.markTurnNotified(turnRecordId);
+    } catch { /* */ }
+  }
+
+  // -----------------------------------------------------------------------
+  // Event subscription
+  // -----------------------------------------------------------------------
+
+  private async subscribeBitableEvents(): Promise<void> {
+    if (!this.cfg.appSecret || !this.cfg.appToken) return;
+    try {
+      const dc = getDomainConfig(this.cfg.openApiDomain);
+      const tokenResp = await fetch(`https://${dc.open}/open-apis/auth/v3/app_access_token/internal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ app_id: this.cfg.appId, app_secret: this.cfg.appSecret }),
+      });
+      const tokenData = await tokenResp.json() as Record<string, unknown>;
+      const token = tokenData.app_access_token as string;
+      if (!token) { console.warn('[channel] no app token for event subscribe'); return; }
+
+      const qs = new URLSearchParams({ file_type: 'bitable' });
+      const resp = await fetch(`https://${dc.open}/open-apis/drive/v1/files/${this.cfg.appToken}/subscribe?${qs}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const rawBody = await resp.text();
+      let body: Record<string, unknown> = {};
+      try { body = JSON.parse(rawBody); } catch { /* not JSON */ }
+      if (body.code === 0) console.log('[channel] subscribed to bitable events');
+      else console.warn(`[channel] subscribe failed (HTTP ${resp.status}):`, rawBody.slice(0, 500));
+    } catch (err: any) {
+      console.warn(`[channel] subscribe failed: ${err.message}`);
     }
   }
 
@@ -111,14 +224,15 @@ export class Channel {
         domain: dc.sdkBaseUrl,
         autoReconnect: true,
         onReady: () => console.log('[channel] WS connected'),
-        onError: (err) => console.error(`[channel] WS error: ${err.message}`),
+        onError: (err) => logger.error(`[channel] WS error: ${err.message}`),
         onReconnecting: () => console.log('[channel] WS reconnecting...'),
         onReconnected: () => console.log('[channel] WS reconnected'),
       });
 
       const dispatcher = new EventDispatcher({});
       dispatcher.register({
-        'im.message.receive_v1': async (data) => { await this.onBotMessage(data); },
+        'im.message.receive_v1': async (data: any) => { await this.onBotMessage(data); },
+        'drive.file.bitable_record_changed_v1': async (data: any) => { await this.onBitableEvent(data); },
       });
 
       await this.wsClient.start({ eventDispatcher: dispatcher });
@@ -199,8 +313,17 @@ export class Channel {
 
     console.log(`[channel] DM from ${senderId}: ${content.slice(0, 80)}`);
 
-    // React with processing emoji
-    try { await this.react(messageId, DEFAULT_EMOJI); } catch { /* best effort */ }
+    // Acknowledge receipt
+    const mode = this.cfg.operator?.reactionMode ?? 'emoji';
+    const ackMsg = this.cfg.messages?.ackReceived || '✅ Received';
+    if (mode !== 'card') {
+      try { await this.react(messageId, DEFAULT_EMOJI); } catch {
+        if (mode === 'both') await this.reply(messageId, ackMsg, false);
+      }
+    }
+    if (mode === 'card') {
+      try { await this.reply(messageId, ackMsg, false); } catch { /* best effort */ }
+    }
 
     // Dedup
     try {
@@ -231,8 +354,11 @@ export class Channel {
 
     // --- New conversation ────────────────────────────────────────────
 
-    // Classify capabilities before creating ticket
-    const { capability, cleanedContent } = await this.classifyCapabilities(content);
+    // Ensure sender has a Roster record (human participant)
+    await this.ensureHumanRoster(senderId);
+
+    // Classify roles before creating ticket
+    const { capability, cleanedContent } = await this.classifyRoles(content);
 
     try {
       const ticket = await this.session.createTicket(cleanedContent || content, {
@@ -256,7 +382,7 @@ export class Channel {
 
       await this.processDraft(ticket, content, messageId, chatId);
     } catch (err) {
-      console.error('[channel] failed to create ticket:', err);
+      logger.error('[channel] failed to create ticket:', err);
     }
   }
 
@@ -311,7 +437,7 @@ export class Channel {
         [this.cfg.fields.ticket.owner]: '',
         [this.cfg.fields.ticket.ownerLeaseAt]: 0,
       });
-      await this.reply(messageId, `已重新激活工单，正在排队处理`, true);
+      await this.reply(messageId, this.cfg.messages?.ticketReactivated || 'Ticket reactivated, queued for processing', true);
       return;
     }
   }
@@ -325,14 +451,14 @@ export class Channel {
     // Collect classified capability from ticket metadata
     const classifiedCap: string | undefined = (ticket as any).__capability;
 
-    if (this.cfg.channel?.useLLM) {
+    if (this.cfg.operator?.useLLM) {
       // LLM-based completeness check
       const result = await this.checkCompleteness(ticket);
       if (result?.isComplete) {
         // Merge classified capability with LLM-identified capabilities
         const caps = [
           ...(classifiedCap ? [classifiedCap] : []),
-          ...(result.requiredCapabilities || []),
+          ...(result.forRoles || []),
         ];
         await this.session.promoteToPending(
           ticket.record_id!,
@@ -341,14 +467,20 @@ export class Channel {
         );
         console.log(`[channel] ticket ${ticket.record_id!.slice(0, 12)} promoted to pending`);
       } else {
-        await this.reply(messageId, CLARIFY_QUESTION, true);
+        await this.reply(messageId, this.cfg.messages?.clarifyQuestion || 'Could you please describe the issue in more detail? If you have any relevant order numbers or error messages, please also provide them, and I\'ll help investigate.', true);
         console.log(`[channel] clarification asked for ${ticket.record_id!.slice(0, 12)}`);
       }
     } else {
-      // No LLM — promote directly, classified capability as requiredCapabilities
+      // No LLM — promote directly, classified capability as forRoles
       const caps = classifiedCap ? [classifiedCap] : undefined;
       await this.session.promoteToPending(ticket.record_id!, content, caps);
       console.log(`[channel] ticket ${ticket.record_id!.slice(0, 12)} promoted to pending`);
+    }
+
+    // Try routing to push executor; if no match, leaves for pull executors
+    if (this.coordinator && ticket.record_id) {
+      const updated = await this.session.getTicket(ticket.record_id);
+      if (updated) await this.coordinator.tryRoute(updated);
     }
   }
 
@@ -371,7 +503,7 @@ export class Channel {
         ...turns.map((t) => `[${t.fields[this.cfg.fields.turn.role]}]\n${t.fields[this.cfg.fields.turn.content]}`),
       ].join('\n');
 
-      const args = this.cfg.channel?.llmArgs ?? this.cfg.claudeArgs;
+      const args = this.cfg.operator?.llmArgs ?? this.cfg.claudeArgs;
       const result = await this.runClaudeJSON(prompt, args);
       if (!result) return null;
 
@@ -379,10 +511,10 @@ export class Channel {
         isComplete: Boolean(result.isComplete),
         summary: String(result.summary ?? ''),
         missingFields: Array.isArray(result.missingFields) ? result.missingFields as string[] : [],
-        requiredCapabilities: Array.isArray(result.requiredCapabilities) ? result.requiredCapabilities as string[] : [],
+        forRoles: Array.isArray(result.forRoles) ? result.forRoles as string[] : [],
       };
     } catch (err) {
-      console.error(`[channel] checkCompleteness failed:`, err);
+      logger.error(`[channel] checkCompleteness failed:`, err);
       return null;
     }
   }
@@ -390,7 +522,7 @@ export class Channel {
   /** Run Claude and parse JSON output. */
   private runClaudeJSON(prompt: string, args: string[]): Promise<Record<string, unknown> | null> {
     return new Promise((resolve) => {
-      const proc = spawn('claude', ['-p', prompt, ...args], {
+      const proc = spawn(this.cfg.aiCommand, [this.cfg.aiPromptFlag, prompt, ...args], {
         stdio: ['pipe', 'pipe', 'pipe'],
         timeout: 60_000,
       });
@@ -403,7 +535,7 @@ export class Channel {
 
       proc.on('close', (code) => {
         if (code !== 0) {
-          console.error(`[channel] claude completeness exited ${code}: ${stderr.slice(0, 200)}`);
+          logger.error(`[channel] claude completeness exited ${code}: ${stderr.slice(0, 200)}`);
           resolve(null);
           return;
         }
@@ -421,7 +553,7 @@ export class Channel {
       });
 
       proc.on('error', (err) => {
-        console.error(`[channel] completeness spawn failed: ${err.message}`);
+        logger.error(`[channel] completeness spawn failed: ${err.message}`);
         resolve(null);
       });
     });
@@ -467,10 +599,10 @@ export class Channel {
         let finalContent = content;
         if (human) {
           const parts = human.split(',').map(s => s.trim()).filter(Boolean);
-          const ccParts = parts.map(p =>
+          const mentions = parts.map(p =>
             p.startsWith('ou_') ? `<at id=${p}></at>` : p,
-          );
-          finalContent = `${content}\n\ncc ${ccParts.join(' ')}`;
+          ).join(' ');
+          finalContent = formatMessage(this.cfg.messages?.ccFormat || '{content}\n\ncc {mentions}', { content, mentions });
         }
 
         try {
@@ -479,11 +611,11 @@ export class Channel {
           await this.session.markTurnNotified(turnRecordId);
           console.log(`[channel] delivered ${status} turn ${turnRecordId.slice(0, 12)}`);
         } catch (err) {
-          console.error(`[channel] deliver turn failed ${turnRecordId.slice(0, 12)}:`, err);
+          logger.error(`[channel] deliver turn failed ${turnRecordId.slice(0, 12)}:`, err);
         }
       }
     } catch (err) {
-      console.error('[channel] deliverTurns error:', err);
+      logger.error('[channel] deliverTurns error:', err);
     }
   }
 
@@ -522,7 +654,7 @@ export class Channel {
         console.log('[channel] cleared deliveredTurnIds set');
       }
     } catch (err) {
-      console.error('[channel] cleanupStaleDrafts error:', err);
+      logger.error('[channel] cleanupStaleDrafts error:', err);
     }
   }
 
@@ -539,11 +671,11 @@ export class Channel {
    *    keywords from each row's description field against the message.
    *
    *  Falls back to undefined if no match. */
-  private async classifyCapabilities(content: string): Promise<{
+  private async classifyRoles(content: string): Promise<{
     capability?: string;
     cleanedContent: string;
   }> {
-    const method = this.cfg.channel?.capabilitiesMapping ?? 'keyword';
+    const method = this.cfg.operator?.rolesMapping ?? 'keyword';
 
     // -- Method 1: slash command ───────────────────────────────────────
     const cmdMatch = content.match(/^\/([a-z][a-z0-9_]*)\s*(.*)/s);
@@ -557,9 +689,9 @@ export class Channel {
     }
 
     // -- Method 2: keyword matching ────────────────────────────────────
-    if (method === 'keyword' && this.cfg.capabilitiesWhitelistTableId) {
+    if (method === 'keyword' && this.cfg.rolesWhitelistTableId) {
       try {
-        const whitelist = await this.bitable.searchRecords(this.cfg.capabilitiesWhitelistTableId, {
+        const whitelist = await this.bitable.searchRecords(this.cfg.rolesWhitelistTableId, {
           conjunction: 'and',
           conditions: [
             { field_name: 'enabled', operator: 'is', value: [true] },
@@ -588,6 +720,116 @@ export class Channel {
     }
 
     return { cleanedContent: content };
+  }
+
+  // -----------------------------------------------------------------------
+  // Human participant management
+  // -----------------------------------------------------------------------
+
+  /** Ensure a human Roster record exists for the given sender_id (open_id).
+   *  Creates one with kind=human if not found. */
+  private async ensureHumanRoster(senderId: string): Promise<void> {
+    try {
+      // Search for existing human record — filter by kind and human field
+      const existing = await this.bitable.searchRecords(this.cfg.rosterTableId, {
+        conjunction: 'and',
+        conditions: [
+          { field_name: this.cfg.fields.roster.kind, operator: 'is', value: ['human'] },
+        ],
+      });
+      // The human field (Person type) stores [{id: "ou_xxx", ...}].
+      // We can't search Person fields with 'is' directly, so filter in code.
+      const found = existing.find((r) => {
+        const human = extractUserIds(r.fields[this.cfg.fields.roster.human]);
+        return human.includes(senderId);
+      });
+      if (found) return;
+    } catch { /* best effort */ }
+
+    // Create a new human Roster record
+    try {
+      const identity = `human_${senderId}`;
+      await this.bitable.createRecord(this.cfg.rosterTableId, {
+        [this.cfg.fields.roster.identity]: identity,
+        [this.cfg.fields.roster.nickname]: `user_${senderId.slice(0, 8)}`,
+        [this.cfg.fields.roster.kind]: 'human',
+        [this.cfg.fields.roster.human]: [{ id: senderId }],
+        [this.cfg.fields.roster.enabled]: true,
+      });
+      console.log(`[channel] created human roster: ${identity}`);
+    } catch (err) {
+      console.log('[channel] ensureHumanRoster failed:', err);
+    }
+  }
+
+  /** Notify humans when tickets with for_kind=human are pending.
+   *  Part of the Channel main loop (called alongside deliverTurns). */
+  private async notifyHumans(): Promise<void> {
+    try {
+      const tickets = await this.bitable.searchRecords(this.cfg.ticketsTableId, {
+        conjunction: 'and',
+        conditions: [
+          { field_name: this.cfg.fields.ticket.status, operator: 'is', value: [this.cfg.statuses.pending] },
+          { field_name: this.cfg.fields.ticket.forKind, operator: 'is', value: ['human'] },
+        ],
+      });
+
+      for (const ticket of tickets) {
+        if (!ticket.record_id) continue;
+
+        const forRolesRaw = ticket.fields[this.cfg.fields.ticket.forRoles];
+        const forRoles: string[] = Array.isArray(forRolesRaw) ? forRolesRaw as string[] : [];
+        const rootMsgId = extractText(ticket.fields[this.cfg.fields.ticket.rootMsgId]);
+        const senderId = extractText(ticket.fields[this.cfg.fields.ticket.senderId]);
+        const summary = extractText(ticket.fields[this.cfg.fields.ticket.summary]);
+
+        // Find matching humans from Roster
+        const roster = await this.bitable.searchRecords(this.cfg.rosterTableId, {
+          conjunction: 'and',
+          conditions: [
+            { field_name: this.cfg.fields.roster.kind, operator: 'is', value: ['human'] },
+            { field_name: this.cfg.fields.roster.enabled, operator: 'is', value: [true] },
+          ],
+        });
+
+        // Filter humans whose roles match the ticket's for_roles (intersection)
+        const matchedHumans = roster.filter((r) => {
+          const humanRolesRaw = r.fields[this.cfg.fields.roster.roles];
+          const humanRoles: string[] = Array.isArray(humanRolesRaw) ? humanRolesRaw as string[] : [];
+          if (forRoles.length === 0) return true; // no role requirement = all humans
+          return forRoles.some((role) => humanRoles.includes(role));
+        });
+
+        if (matchedHumans.length === 0) continue;
+
+        // Build @mention string
+        let atMentions = '';
+        if (senderId) {
+          atMentions = `<at id=${senderId}></at>`;
+        } else {
+          const ids: string[] = [];
+          for (const h of matchedHumans) {
+            const openIds = extractUserIds(h.fields[this.cfg.fields.roster.human]);
+            for (const id of openIds.split(',')) {
+              const trimmed = id.trim();
+              if (trimmed) ids.push(`<at id=${trimmed}></at>`);
+            }
+          }
+          atMentions = ids.join(' ');
+        }
+
+        const text = formatMessage(this.cfg.messages?.humanNotification || '📋 New task pending {mentions}\n{summary}', {
+          mentions: atMentions || '',
+          summary,
+        });
+        if (rootMsgId) {
+          await this.reply(rootMsgId, text, true);
+        }
+        console.log(`[channel] notified humans for ticket ${ticket.record_id.slice(0, 12)}`);
+      }
+    } catch (err) {
+      logger.error('[channel] notifyHumans error:', err);
+    }
   }
 
   // -----------------------------------------------------------------------

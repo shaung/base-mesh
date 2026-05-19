@@ -1,3 +1,4 @@
+import { logger } from './log.js';
 import { Config, BitableRecord, TokenProvider } from './types.js';
 import { BitableClient } from './bitable.js';
 import { Session, RETRY_OWNER_PREFIX } from './protocol.js';
@@ -21,7 +22,7 @@ export class Listener {
     if (!cfg.appSecret) {
       tokenProvider = UserTokenProvider.fromStore(cfg.appId) ?? undefined;
       if (!tokenProvider) {
-        console.error('No credentials found. Run `bitable-mesh login` to authorize, or set BITABLE_APP_SECRET in .env');
+        logger.error('No credentials found. Run `bitable-mesh login` to authorize, or set BITABLE_APP_SECRET in .env');
         process.exit(1);
       }
     }
@@ -59,12 +60,25 @@ export class Listener {
         console.log(`[listener] scan: ${tickets.length} awaiting_agent tickets`);
 
         const claimable = tickets.filter((t) => this.session.isClaimable(t) && !this.isOwnRetry(t));
-        // Random shuffle to distribute load
-        shuffleArray(claimable);
+
+        // Affinity sorting: tickets where lastOwner matches this executor go first
+        const affinity: BitableRecord[] = [];
+        const nonAffinity: BitableRecord[] = [];
+        for (const t of claimable) {
+          const lastOwner = String(t.fields[this.cfg.fields.ticket.lastOwner] ?? '');
+          if (lastOwner.endsWith(`#${this.cfg.identity}`)) {
+            affinity.push(t);
+          } else {
+            nonAffinity.push(t);
+          }
+        }
+        shuffleArray(affinity);
+        shuffleArray(nonAffinity);
+        const orderedClaimable = [...affinity, ...nonAffinity];
 
         let claimedAny = false;
 
-        for (const ticket of claimable) {
+        for (const ticket of orderedClaimable) {
           if (active.length >= this.cfg.maxConcurrency) break;
           if (!this.running) break;
 
@@ -88,7 +102,7 @@ export class Listener {
           await sleep(this.cfg.peakInterval);
         }
       } catch (err) {
-        console.error('[listener] main loop error:', err);
+        logger.error('[listener] main loop error:', err);
         await sleep(30_000);
       }
     }
@@ -123,7 +137,7 @@ export class Listener {
         await this.session.appendTurn(recordId, 'agent', ackText, `${claimId}_ack`);
         this.session.logToFile(`ticket=${recordId} wrote_ack`);
       } catch (err) {
-        console.error(`[ticket] write ack failed ${recordId.slice(0, 12)}:`, err);
+        logger.error(`[ticket] write ack failed ${recordId.slice(0, 12)}:`, err);
         this.session.logToFile(`ticket=${recordId} error:write_ack`);
       }
 
@@ -143,7 +157,7 @@ export class Listener {
         await this.session.appendTurn(recordId, 'agent', answer, claimId);
         this.session.logToFile(`ticket=${recordId} wrote_answer`);
       } catch (err) {
-        console.error(`[ticket] write answer failed ${recordId.slice(0, 12)}:`, err);
+        logger.error(`[ticket] write answer failed ${recordId.slice(0, 12)}:`, err);
         this.session.logToFile(`ticket=${recordId} error:write_answer`);
       }
 
@@ -155,13 +169,13 @@ export class Listener {
         });
         this.session.logToFile(`ticket=${recordId} finalized`);
       } catch (err) {
-        console.error(`[ticket] finalize failed ${recordId.slice(0, 12)}:`, err);
+        logger.error(`[ticket] finalize failed ${recordId.slice(0, 12)}:`, err);
         this.session.logToFile(`ticket=${recordId} error:finalize`);
       }
 
       console.log(`[ticket] completed ${recordId.slice(0, 12)}`);
     } catch (err) {
-      console.error(`[ticket] unhandled error ${recordId.slice(0, 12)}:`, err);
+      logger.error(`[ticket] unhandled error ${recordId.slice(0, 12)}:`, err);
       this.session.logToFile(`ticket=${recordId} error:unhandled`);
       await this.session.releaseWithRetry(recordId, 'unhandled', '未知错误');
     }

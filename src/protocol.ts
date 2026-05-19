@@ -4,6 +4,7 @@ import { hostname, homedir } from 'node:os';
 import { Config, BitableRecord } from './types.js';
 import { BitableClient } from './bitable.js';
 import { logger } from './log.js';
+import { formatMessage } from './messages.js';
 
 // Feishu Multiline text fields store values as { text, type } objects.
 // Normalise to a plain string for internal use.
@@ -61,16 +62,6 @@ export const RETRY_OWNER_PREFIX = 'RETRY:';
  *  before delivering via IM. If the channel crashes mid-delivery, the lease
  *  expires and another channel can reclaim the turn. */
 const TURN_DELIVERY_LEASE_SEC = 30;
-
-const ERROR_TURN_TEMPLATE =
-  '本轮分析未能完成（{reason}），需要人工介入；' +
-  '已自动转回排队，可能由其他在线 agent 接手。如长时间无回复请联系 cc 的同事。';
-
-const RETRY_TURN_TEMPLATE =
-  '本轮分析未能完成（{reason}），系统将自动重试（{retryCount}/{maxRetries}）。';
-
-const EXHAUSTED_TURN_TEMPLATE =
-  '本轮分析未能完成（{reason}），已多次重试仍未成功。请直接回复此消息以重新激活工单。';
 
 export class Session {
   nickname: string;
@@ -147,6 +138,10 @@ export class Session {
     } else {
       this.log(`register: new identity=${this.identity} nickname=${this.nickname}`);
       rosterFields[this.rf.identity] = this.identity;
+      rosterFields[this.rf.kind] = 'agent';
+      const roles = this.cfg.executor?.roles?.length ? this.cfg.executor.roles : ['general'];
+      rosterFields[this.rf.roles] = roles;
+      rosterFields[this.rf.enabled] = true;
       rosterFields[this.rf.hostname] = hostname();
       rosterFields[this.rf.user] = process.env.USER ?? 'unknown';
       rosterFields[this.rf.pid] = String(process.pid);
@@ -246,7 +241,7 @@ export class Session {
       [this.tf.summary]: summary,
     };
     if (capabilities && capabilities.length > 0) {
-      update[this.tf.requiredCapabilities] = JSON.stringify(capabilities);
+      update[this.tf.forRoles] = capabilities; // MultiSelect: array directly
     }
     await this.bitable.updateRecord(this.cfg.ticketsTableId, recordId, update);
   }
@@ -317,7 +312,10 @@ export class Session {
     return true;
   }
 
-  async release(ticketRecordId: string, status?: string): Promise<void> {
+  async release(ticketRecordId: string, status?: string, opts?: {
+    forRoles?: string[];
+    forKind?: string;
+  }): Promise<void> {
     const nextStatus = status ?? this.sv.pending;
 
     // Owner guard: only release if we still hold the lease
@@ -329,11 +327,16 @@ export class Session {
       return;
     }
 
-    await this.bitable.updateRecord(this.cfg.ticketsTableId, ticketRecordId, {
+    const update: Record<string, unknown> = {
       [this.tf.owner]: '',
       [this.tf.ownerLeaseAt]: 0,
       [this.tf.status]: nextStatus,
-    });
+    };
+    if (currentOwner) update[this.tf.lastOwner] = currentOwner;
+    if (opts?.forRoles?.length) update[this.tf.forRoles] = opts.forRoles; // MultiSelect: array directly
+    if (opts?.forKind) update[this.tf.forKind] = opts.forKind;
+
+    await this.bitable.updateRecord(this.cfg.ticketsTableId, ticketRecordId, update);
   }
 
   async finalize(
@@ -359,6 +362,7 @@ export class Session {
       [this.tf.ownerLeaseAt]: 0,
       [this.tf.status]: nextStatus,
     };
+    if (currentOwner) update[this.tf.lastOwner] = currentOwner;
     if (payload.newSummary) update[this.tf.summary] = payload.newSummary;
     if (payload.newKeyfacts) update[this.tf.keyfacts] = JSON.stringify(payload.newKeyfacts);
 
@@ -370,6 +374,7 @@ export class Session {
     recordId: string,
     result: string,
     summary?: string,
+    owner?: string,
   ): Promise<void> {
     const update: Record<string, unknown> = {
       [this.tf.result]: result,
@@ -378,6 +383,7 @@ export class Session {
       [this.tf.status]: this.sv.done,
     };
     if (summary) update[this.tf.summary] = summary;
+    if (owner) update[this.tf.lastOwner] = owner;
     await this.bitable.updateRecord(this.cfg.ticketsTableId, recordId, update);
   }
 
@@ -394,6 +400,7 @@ export class Session {
     await this.bitable.updateRecord(this.cfg.ticketsTableId, recordId, {
       [this.tf.owner]: '',
       [this.tf.ownerLeaseAt]: 0,
+      [this.tf.lastOwner]: currentOwner,
       [this.tf.status]: this.sv.failed,
     });
   }
@@ -522,14 +529,16 @@ export class Session {
       await this.bitable.updateRecord(this.cfg.ticketsTableId, recordId, {
         [this.tf.owner]: `${RETRY_OWNER_PREFIX}${this.nickname}#${this.identity}`,
         [this.tf.ownerLeaseAt]: 0,
+        [this.tf.lastOwner]: currentOwner,
         [this.tf.status]: this.sv.pending,
         [this.tf.retryCount]: nextRetryCount,
       });
 
-      const text = RETRY_TURN_TEMPLATE
-        .replace('{reason}', reasonText)
-        .replace('{retryCount}', String(nextRetryCount))
-        .replace('{maxRetries}', String(maxRetries));
+      const text = formatMessage(this.cfg.messages?.retryFallback || 'Analysis could not be completed ({reason}), will auto-retry ({retryCount}/{maxRetries}).', {
+        reason: reasonText,
+        retryCount: String(nextRetryCount),
+        maxRetries: String(maxRetries),
+      });
       const dedupKey = `${recordId}_err_${reasonKind}`;
       await this.appendTurn(recordId, 'agent', text, dedupKey, this.identity, 'error', rootMsgId);
     } else {
@@ -537,11 +546,12 @@ export class Session {
       await this.bitable.updateRecord(this.cfg.ticketsTableId, recordId, {
         [this.tf.owner]: '',
         [this.tf.ownerLeaseAt]: 0,
+        [this.tf.lastOwner]: currentOwner,
         [this.tf.status]: this.sv.failed,
         [this.tf.retryCount]: nextRetryCount,
       });
 
-      const text = EXHAUSTED_TURN_TEMPLATE.replace('{reason}', reasonText);
+      const text = formatMessage(this.cfg.messages?.exhaustedFallback || 'Analysis could not be completed ({reason}), all retries exhausted. Reply to this message to reactivate the ticket.', { reason: reasonText });
       const dedupKey = `${recordId}_err_${reasonKind}_final`;
       await this.appendTurn(recordId, 'agent', text, dedupKey, this.identity, 'error', rootMsgId);
     }
@@ -757,7 +767,7 @@ export class Session {
     reasonText: string,
     rootMsgId?: string,
   ): Promise<void> {
-    const text = ERROR_TURN_TEMPLATE.replace('{reason}', reasonText);
+    const text = formatMessage(this.cfg.messages?.errorFallback || 'Analysis could not be completed ({reason}), handing off to human; ticket re-queued, another online agent may pick it up.', { reason: reasonText });
     const dedupKey = `${ticketRecordId}_err_${reasonKind}`;
     try {
       await this.appendTurn(ticketRecordId, 'agent', text, dedupKey, this.identity, 'error', rootMsgId);
@@ -800,8 +810,11 @@ export class Session {
       hints.push(`trace_id=${m[1]}`);
     }
 
-    const base = '收到，正在查看' + (hints.length > 0 ? '：' + hints.join('、') : '您的问题');
-    return `${base}，稍后回复。（${this.nickname}）`;
+    const ackHints = hints.length > 0 ? ': ' + hints.join(', ') : ' your issue';
+    return formatMessage(this.cfg.messages?.ackTemplate || 'Received, checking{ackHints}. Will reply shortly. ({nickname})', {
+      ackHints,
+      nickname: this.nickname,
+    });
   }
 }
 

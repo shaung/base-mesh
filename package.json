@@ -1,6 +1,6 @@
 {
   "name": "@typooo/bitable-mesh",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Asynchronous human-AI collaboration on Lark Bitable",
   "type": "module",
   "main": "./dist/cli.js",
@@ -38,11 +38,19 @@
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "typescript": "^5.4.0"
+    "@types/qrcode-terminal": "^0.12.2",
+    "typescript": "^5.4.0",
+    "wrangler": "^4.90.0"
   },
   "license": "MIT",
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.62.1",
-    "smol-toml": "^1.6.1"
+    "@types/ws": "^8.18.1",
+    "chalk": "^5.6.2",
+    "inquirer": "^13.4.3",
+    "ora": "^9.4.0",
+    "qrcode-terminal": "^0.12.0",
+    "smol-toml": "^1.6.1",
+    "ws": "^8.20.0"
   }
 }

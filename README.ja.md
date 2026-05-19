@@ -11,27 +11,29 @@ Lark Bitable 上での非同期人間-AI コラボレーションシステム。
 ## アーキテクチャ
 
 ```
-Lark IM
+ユーザー (Lark IM)
     │
     ▼
 ┌──────────┐  draft → pending    ┌──────────┐
 │ Channel  │ ──────────────────▶ │ Bitable  │ ◀── poll / claim / write
-│          │ ◀──── deliver ───── │ (tables) │
+│          │ ◀──── deliver ───── │ (テーブル)│
 └──────────┘                     └──────────┘
-                                      ▲
-                                      │
-                                 ┌──────────┐
-                                 │ Executor │ (複数インスタンス)
-                                 └──────────┘
+    │                                  ▲
+    │ ws:// (push)                     │
+    ▼                                  │
+┌──────────┐                           │
+│ Executor │ ─── push 結果返送 ────────┘
+└──────────┘
 ```
 
 | ロール | CLI | 役割 |
 |:---|:---|:---|
-| **Channel** | `channel` | Lark IM を WebSocket でリッスン、チケット作成、オプションで LLM による完全性チェック、返信を配信 |
-| **Executor** | `join` | 保留中チケットをポーリング、ソフトプリエンプションで獲得、Claude を実行、結果を書き戻し |
+| **Channel** | `channel` | Lark IM を WebSocket でリッスン、チケット作成、オプションで LLM による完全性チェック、返信を配信。また push executor WebSocket サーバーを実行しタスクをルーティング。 |
+| **Channel Lite** | `channel --lite` | IM のみモード：メッセージ受信、チケット作成、返信配信。push サーバーなし。 |
+| **Executor** | `join` | Pull モード：Bitable の保留中チケットをポーリング、ソフトプリエンプションで獲得、Claude を実行、結果を書き戻し。Push モード：WebSocket で Channel に接続、リアルタイムでタスクを受信。 |
 | **Direct** | `direct` | ステートレスモード: IM → Claude → 返信、テーブル不使用 |
 
-Channel と Executor は同一マシンでも異なるマシンでも、どのネットワークでも実行可能——Lark API に到達できれば動作します。
+Channel と Executor は同一マシンでも異なるマシンでも、どのネットワークでも実行可能 — Lark API に到達できれば動作します。
 
 ---
 
@@ -49,10 +51,11 @@ Node.js >= 18 および [Claude Code](https://docs.anthropic.com/en/docs/claude-
 
 ### 1. Lark アプリの作成
 
-[Lark Developer Console](https://open.larksuite.com/app) で**カスタムアプリ**を作成:
+[Feishu Developer Console](https://open.feishu.cn/app) または [Lark Developer Console](https://open.larksuite.com/app) で**カスタムアプリ**を作成:
 
 - 機能を追加: **Bitable** (権限: `bitable:app`)
 - IM ボットの場合: **Bot** を追加、権限 `im:message` と `im:message:send_as_bot`、`im.message.receive_v1` イベントを購読
+- Bitable イベント駆動更新の場合: **Drive** 権限 `drive:drive` を追加、`drive.file.bitable_record_changed_v1` イベントを購読
 
 ### 2. セットアップ
 
@@ -64,7 +67,7 @@ bitable-mesh setup
 
 設定は `~/.bitable-mesh/profiles/default.toml` に保存されます。
 
-### 3. ログイン (Executor のみ)
+### 3. ログイン
 
 ```bash
 bitable-mesh login
@@ -78,106 +81,68 @@ OAuth PKCE フロー — ブラウザで確認するだけで Lark の ID が自
 # Executor (チケット処理)
 bitable-mesh join
 
-# Channel (IM ボット、appSecret が必要)
+# Channel (IM ボット + push executor サーバー)
 bitable-mesh channel
+
+# Channel Lite (IM のみ、push サーバーなし)
+bitable-mesh channel --lite
 ```
 
 ---
 
-## 動作の仕組み
-
-1. ユーザーが Lark ボットに DM を送信
-2. **Channel** が下書きチケットを作成し、ユーザーメッセージを追加
-3. `useLLM=true` の場合、Channel が Claude に情報の完全性を評価させ、不足があれば追加質問
-4. 準備が整うと、Channel が `pending` に昇格
-5. **Executor** が保留中チケットをポーリングし、ソフトプリエンプションで獲得
-6. オプションの**実行前承認** — 承認者（Bitable 自動化経由）の確認を待機
-7. Executor が Claude Code を実行
-8. オプションの**回答後レビュー** — レビュー担当者が回答を承認するまで待機
-9. 結果がテーブルに書き戻され、Channel が IM に配信
-
----
-
-## タスク割り当て (Capabilities)
-
-Executor は能力（capability）を宣言して専門化できます。Channel はユーザーメッセージを分類して適切な Executor に割り当てます。
-
-### Executor 設定
-
-```toml
-[executor]
-capabilities = ["tech_support", "hr"]
-```
-
-### 分類モード
-
-| モード | 設定 | 説明 |
-|:---|:---|:---|
-| キーワード | `capabilitiesMapping = "keyword"` | Capabilities テーブルのキーワードとマッチング |
-| スラッシュコマンド | `capabilitiesMapping = "command"` | ユーザーが `/tech_support 質問` と明示的に指定 |
-
-### Capabilities テーブル
-
-| フィールド | 型 | 説明 |
-|:---|:---|:---|
-| capability | テキスト | 識別子、例: `tech_support` |
-| display_name | テキスト | 表示名 |
-| keywords | テキスト | カンマ区切りのキーワード |
-| prompt | テキスト | ドメイン固有のシステムプロンプト (オプション) |
-| enabled | チェックボックス | 有効 |
-
----
-
-## Human-in-the-Loop
-
-### 実行前承認
-
-Executor の Roster レコードに `human` フィールド（Person 型）を設定します。チケット獲得後、Executor は承認フェーズに入ります。担当者が設定されていない場合はスキップされます。
-
-```
-獲得 → pending_approval → 承認 → Claude 実行 → 完了
-                        → 却下 → pending に戻る
-```
-
-スキップ: `bitable-mesh join --skip-approval`
-
-### 回答後レビュー
-
-```toml
-[executor]
-postReview = true
-```
-
-回答は `pending_review` として書き込まれます。レビュー担当者が `approved` にマークした場合のみ、Channel が IM に配信します。
-
----
 
 ## 設定リファレンス
 
 ```toml
 appId = "cli_xxx"
-openApiDomain = "open.larksuite.com"
+openApiDomain = "open.feishu.cn"
+appSecret = "xxx"         # Channel に必要
 appToken = "QBX..."
 ticketsTableId = "tbl..."
 turnsTableId = "tbl..."
 rosterTableId = "tbl..."
-capabilitiesWhitelistTableId = "tbl..."
-
-[channel]
-enabled = true
-useLLM = false
-capabilitiesMapping = "keyword"
+rolesWhitelistTableId = "tbl..."
+clientId = "my-executor"  # executor 識別子、デフォルトは user@hostname
 
 [executor]
-capabilities = []
+roles = []
+mode = "push"             # "push" または "pull"
+auth = "user"             # "user" (OAuth PKCE) または "app" (app_secret)
+coordinator_url = "ws://localhost:12345"
+prompt = "あなたはテクニカルサポート agent です。"
+aiCommand = "claude"
+aiPromptFlag = "-p"
+claudeArgs = ["--dangerously-skip-permissions"]
+claudeTimeout = 600
+maxRetries = 3
+maxConcurrency = 5
 skipApproval = false
 approvalTimeoutMinutes = 30
 postReview = false
+selfCheck = true
+hitl = "off"
+hitlPolicy = "default"
 
-prompt = """
-システムプロンプトをここに...
-"""
+[channel]
+useLLM = false
+draftTTLMinutes = 60
+pollIntervalSeconds = 30
+rolesMapping = "keyword"
+coordinatorPort = 12345
+
+[operator]
+useLLM = false
+draftTTLMinutes = 60
+pollIntervalSeconds = 30
+rolesMapping = "keyword"
+
+[coordinator]
+port = 12345
+heartbeatSeconds = 60
+globalPrompt = ""
 ```
+
+> フィールドマッピングとステータス名にはデフォルト値があります。通常は追加設定不要です。
 
 ---
 
@@ -192,8 +157,15 @@ bitable-mesh [options] <command>
 | `setup` | インタラクティブ設定ウィザード |
 | `login` | OAuth PKCE ログイン |
 | `join` | Executor を起動 (自動ログイン) |
-| `channel` | Channel を起動 (IM ボット) |
+| `channel [--lite]` | Channel を起動 (IM ボット + coordinator；`--lite` で IM のみ) |
 | `direct` | ステートレスモード |
+| `produce <summary>` | チケットを作成し pending に設定 |
+| `claim <id>` | pending チケットを獲得 |
+| `complete <id>` | 結果を書き込み完了にマーク |
+| `ticket create` | 下書きチケットを作成 |
+| `ticket reassign` | チケットを解放し for_roles/for_kind を設定 |
+| `bitable new` | 新しい Bitable base を作成 |
+| `bitable grant` | Bitable base に編集権限を付与 |
 
 | オプション | 説明 |
 |:---|:---|
@@ -207,17 +179,22 @@ bitable-mesh [options] <command>
 
 ```text
 src/
-├── cli.ts       エントリポイント
-├── channel.ts   Channel: WS、メッセージ、下書き、配信
-├── executor.ts  Executor: ポーリング、獲得、Claude 処理
-├── protocol.ts  Session: Bitable CRUD、状態遷移
-├── processor.ts Claude サブプロセス
-├── bitable.ts   Lark API クライアント
-├── config.ts    設定読み込み (TOML)
-├── setup.ts     セットアップウィザード
-├── auth.ts      OAuth PKCE
-├── log.ts       ロガー
-└── types.ts     型定義
+├── cli.ts        CLI エントリポイント
+├── channel.ts    Channel: WS、メッセージ、下書き、配信、イベント分配
+├── executor.ts   Executor: pull ポーリング、push WebSocket クライアント、Claude 処理
+├── coordinator.ts Coordinator: push executor WS サーバー、タスクルーティング、roster 書込
+├── scheduler.ts  Scheduler: push executor 管理（Channel 内で実行）
+├── protocol.ts   Session: Bitable CRUD、状態遷移、turn 配信
+├── processor.ts  Claude サブプロセス
+├── bitable.ts    Lark API クライアント
+├── config.ts     設定読み込み (TOML)
+├── setup.ts      セットアップウィザード
+├── auth.ts       OAuth PKCE
+├── sessions.ts   Push セッショントークン永続化
+├── messages.ts   多言語メッセージテンプレート
+├── domain.ts     Lark/Feishu ドメイン解決
+├── log.ts        ロガー
+└── types.ts      型定義
 ```
 
 ---
@@ -225,7 +202,7 @@ src/
 ## 制限事項
 
 - ソフトプリエンプションには競合ウィンドウがあります
-- ポーリング遅延は `pollInterval` に依存します
+- Pull モードのポーリング遅延は `pollInterval` に依存します
 - Bitable にサーバーサイド CAS はなく、クライアントの規律に依存します
 - 承認・レビュー通知は Bitable 自動化に依存します
 
