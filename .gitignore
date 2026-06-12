@@ -3,3 +3,8 @@ dist/
 .env
 config.json
 .DS_Store
+package-lock.json
+# scripts/ — allow scripts used by npm package
+.claude/
+scripts/
+coverage/

@@ -38,10 +38,17 @@ export class BitableClient {
     const dc = getDomainConfig(cfg.openApiDomain);
     // In PKCE mode the SDK needs a truthy appSecret placeholder. It's never
     // used because every request passes an override via withUserAccessToken.
+    // No-op logger to suppress the SDK's internal defaultLogger, which prints
+    // Axios error response bodies as unreadable character-indexed objects
+    // (Buffer → Object.assign({}, buffer) → {'0': '<', '1': '!', ...}).
+    // The SDK re-throws errors after logging them, so our own error handling
+    // (logger.error in callers, withRetry) still produces meaningful output.
+    const silentLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {}, trace: () => {} };
     this.client = new Client({
       appId: cfg.appId,
       appSecret: cfg.appSecret || 'unused',
       domain: dc.sdkBaseUrl,
+      logger: silentLogger,
     });
   }
 
@@ -54,45 +61,71 @@ export class BitableClient {
     return undefined;
   }
 
+  /** Wrap a Feishu API call with retry on transient failures.
+   *  Retries on: rate-limit (1663), server error (502), or SDK token fetch failure
+   *  (TypeError: destructure of undefined). Exponential backoff: 1s, 2s, 4s, 8s. */
+  private async withRetry<T>(fn: () => Promise<T>): Promise<T> {
+    const maxRetries = 4;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await fn();
+      } catch (err: unknown) {
+        const shouldRetry = attempt < maxRetries && (
+          (err instanceof BitableError && err.code === 1663) ||
+          (err instanceof TypeError && err.message?.includes('tenant_access_token'))
+        );
+        if (shouldRetry) {
+          const delay = Math.pow(2, attempt) * 1000;
+          console.log(`[bitable] retry ${attempt + 1}/${maxRetries} after ${delay}ms:`, (err as Error).message);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
+
   // -- CRUD ---------------------------------------------------------------
 
   async createRecord<T = Record<string, unknown>>(tableId: string, fields: T): Promise<BitableRecord<T>> {
-    console.log(`[bitable] createRecord table=${tableId.slice(0,12)} fields=${Object.keys(fields as any).join(',')}`);
-    const resp = await this.client.bitable.appTableRecord.create({
-      path: { app_token: this.cfg.appToken, table_id: tableId },
-      data: { fields: fields as any },
-    }, await this.authOptions());
-    if (resp.code !== 0 || !resp.data?.record) {
-      logger.error(`[bitable] createRecord FAILED: ${JSON.stringify(resp)}`);
-      throw new BitableError(`createRecord failed: ${JSON.stringify(resp)}`, resp.code ?? 0);
-    }
-    console.log(`[bitable] createRecord OK record=${resp.data.record.record_id?.slice(0,12)}`);
-    return { record_id: resp.data.record.record_id!, fields: resp.data.record.fields as unknown as T };
+    return this.withRetry(async () => {
+      const resp = await this.client.bitable.appTableRecord.create({
+        path: { app_token: this.cfg.appToken, table_id: tableId },
+        data: { fields: fields as any },
+      }, await this.authOptions());
+      if (resp.code !== 0 || !resp.data?.record) {
+        logger.error(`[bitable] createRecord FAILED: ${JSON.stringify(resp)}`);
+        throw new BitableError(`createRecord failed: ${JSON.stringify(resp)}`, resp.code ?? 0);
+      }
+      return { record_id: resp.data.record.record_id!, fields: resp.data.record.fields as unknown as T };
+    });
   }
 
   async updateRecord<T = Record<string, unknown>>(tableId: string, recordId: string, fields: Partial<T>): Promise<BitableRecord<T>> {
-    console.log(`[bitable] updateRecord table=${tableId.slice(0,12)} record=${recordId.slice(0,12)} keys=${Object.keys(fields as any).join(',')}`);
-    const resp = await this.client.bitable.appTableRecord.update({
-      path: { app_token: this.cfg.appToken, table_id: tableId, record_id: recordId },
-      data: { fields: fields as any },
-    }, await this.authOptions());
-    if (resp.code !== 0 || !resp.data?.record) {
-      logger.error(`[bitable] updateRecord FAILED: ${JSON.stringify(resp)}`);
-      throw new BitableError(`updateRecord failed: ${JSON.stringify(resp)}`, resp.code ?? 0);
-    }
-    console.log(`[bitable] updateRecord OK`);
-    return { record_id: resp.data.record.record_id!, fields: resp.data.record.fields as unknown as T };
+    return this.withRetry(async () => {
+      const resp = await this.client.bitable.appTableRecord.update({
+        path: { app_token: this.cfg.appToken, table_id: tableId, record_id: recordId },
+        data: { fields: fields as any },
+      }, await this.authOptions());
+      if (resp.code !== 0 || !resp.data?.record) {
+        logger.error(`[bitable] updateRecord FAILED: ${JSON.stringify(resp)}`);
+        throw new BitableError(`updateRecord failed: ${JSON.stringify(resp)}`, resp.code ?? 0);
+      }
+      return { record_id: resp.data.record.record_id!, fields: resp.data.record.fields as unknown as T };
+    });
   }
 
   async getRecord<T = Record<string, unknown>>(tableId: string, recordId: string): Promise<BitableRecord<T>> {
-    const resp = await this.client.bitable.appTableRecord.get({
-      path: { app_token: this.cfg.appToken, table_id: tableId, record_id: recordId },
-    }, await this.authOptions());
-    if (resp.code !== 0 || !resp.data?.record) {
-      if (resp.code === 0) throw new BitableError('getRecord: empty record', 0);
-      throw new BitableError(`getRecord failed: ${JSON.stringify(resp)}`, resp.code);
-    }
-    return { record_id: resp.data.record.record_id!, fields: resp.data.record.fields as unknown as T };
+    return this.withRetry(async () => {
+      const resp = await this.client.bitable.appTableRecord.get({
+        path: { app_token: this.cfg.appToken, table_id: tableId, record_id: recordId },
+      }, await this.authOptions());
+      if (resp.code !== 0 || !resp.data?.record) {
+        if (resp.code === 0) throw new BitableError('getRecord: empty record', 0);
+        throw new BitableError(`getRecord failed: ${JSON.stringify(resp)}`, resp.code);
+      }
+      return { record_id: resp.data.record.record_id!, fields: resp.data.record.fields as unknown as T };
+    });
   }
 
   async listRecords<T = Record<string, unknown>>(tableId: string, params?: Record<string, string>): Promise<BitableRecord<T>[]> {

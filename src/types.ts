@@ -16,11 +16,13 @@ export interface TicketFieldMapping {
   rootMsgId: string;
   chatId: string;
   senderId: string;
-  forRoles: string;
-  forKind: string;
   result: string;
   approvers: string;
   lastOwner: string;
+  /** Business domain, e.g. "tech_support" */
+  domain: string;
+  /** Latest Round record_id for this ticket (Round-driven mode). */
+  lastRoundId: string;
   metadata: string;
   createdAt: string;
   updatedAt: string;
@@ -28,9 +30,14 @@ export interface TicketFieldMapping {
 
 export interface TurnFieldMapping {
   ticketRecordId: string;
+  roundId: string;
   rootMsgId: string;
   role: string;
   content: string;
+  /** A2A-compatible Part array as JSON string */
+  parts: string;
+  /** Feishu attachment field for binary file storage */
+  attachments: string;
   status: string;
   dedupKey: string;
   agentIdentity: string;
@@ -43,18 +50,31 @@ export interface TurnFieldMapping {
   updatedAt: string;
 }
 
+export interface RoundFieldMapping {
+  ticketRecordId: string;
+  /** JSON array of required ability labels, e.g. ["tech_support.api"] */
+  domains: string;
+  status: string;
+  executor: string;
+  reviewer: string;
+  reviewComment: string;
+  supplementPrompt: string;
+  result: string;
+  /** A2A-compatible Artifact array as JSON string */
+  artifacts: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface RosterFieldMapping {
   identity: string;
   nickname: string;
   kind: string;
-  systemType: string;
-  channelType: string;
-  hostname: string;
-  user: string;
-  pid: string;
+  /** JSON metadata (hostname, user, pid, etc.) */
+  metadata: string;
   lastSeenAt: string;
   registeredAt: string;
-  roles: string;
+  domains: string;
   human: string;
   enabled: string;
   description: string;
@@ -68,19 +88,74 @@ export interface FieldMapping {
   ticket: TicketFieldMapping;
   turn: TurnFieldMapping;
   roster: RosterFieldMapping;
+  round: RoundFieldMapping;
 }
 
 // ---- Status mappings ----------------------------------------------------
 
 export interface StatusMapping {
   draft: string;
-  pending: string;
-  assigned: string;
-  pendingApproval: string;
-  done: string;
-  failed: string;
+  active: string;
   closed: string;
 }
+
+// ---- Round status mappings ------------------------------------------------
+
+export interface RoundStatusMapping {
+  pending: string;
+  pendingApproval: string;
+  approved: string;
+  rejected: string;
+  executing: string;
+  done: string;
+  failed: string;
+  cancelled: string;
+}
+
+/** Canonical Round state transitions: key is current status, value is allowed next statuses.
+ *  Keys match RoundStatusMapping property names (camelCase). */
+export const ROUND_TRANSITIONS: Record<string, string[]> = {
+  pending: ['pendingApproval', 'executing', 'cancelled'],
+  pendingApproval: ['approved', 'rejected', 'cancelled', 'pending'],
+  approved: ['executing', 'cancelled', 'pending'],
+  rejected: [],
+  executing: ['done', 'failed', 'pending', 'cancelled'],
+  done: [],
+  failed: [],
+  cancelled: [],
+};
+
+// ---- A2A Part types ------------------------------------------------------
+
+/** Plain text content part. */
+export interface TextPart {
+  kind: 'text';
+  text: string;
+}
+
+/** File attachment part (image, document, etc.). */
+export interface FilePart {
+  kind: 'file';
+  /** Feishu attachment field token, from uploading to the attachments field. */
+  file_token: string;
+  /** Coordinator proxy URL for downloading this file without Feishu credentials. */
+  file_uri: string;
+  /** File name, e.g. "screenshot.png". */
+  name?: string;
+  /** MIME type, e.g. "image/png". */
+  mime_type?: string;
+  /** File size in bytes. */
+  size?: number;
+}
+
+/** Structured data part. */
+export interface DataPart {
+  kind: 'data';
+  data: Record<string, unknown>;
+}
+
+/** Union of all A2A-compatible Part types stored in Turn.parts. */
+export type Part = TextPart | FilePart | DataPart;
 
 // ---- Auth ----------------------------------------------------------------
 
@@ -104,14 +179,36 @@ export interface StoredTokens {
 // ---- Config -------------------------------------------------------------
 
 export interface OperatorConfig {
-  useLLM: boolean;
   draftTTLMinutes: number;
   pollIntervalSeconds: number;
-  llmArgs?: string[];
-  /** Role mapping method. */
-  rolesMapping?: 'command' | 'keyword';
   /** Message received acknowledgment: 'emoji' (default), 'card', 'both'. */
   reactionMode?: 'emoji' | 'card' | 'both';
+}
+
+export interface S3Config {
+  /** S3 region. */
+  region?: string;
+  /** S3 bucket name. */
+  bucket?: string;
+  /** Access key ID. */
+  accessKeyId?: string;
+  /** Secret access key. */
+  secretAccessKey?: string;
+  /** Pre-signed URL expiry in seconds. Default 3600. */
+  presignExpiresSeconds?: number;
+  /** Endpoint URL (for S3-compatible storage like MinIO). */
+  endpoint?: string;
+  /** Force path-style addressing (needed for MinIO). */
+  forcePathStyle?: boolean;
+}
+
+export interface A2AServerConfig {
+  /** Enable A2A Server endpoints (default false). */
+  enabled?: boolean;
+  /** Base URL exposed to external agents, e.g. "http://public-host:8080". */
+  baseUrl?: string;
+  /** API token required from external A2A clients (empty = no auth). */
+  apiToken?: string;
 }
 
 export interface CoordinatorConfig {
@@ -127,15 +224,17 @@ export interface CoordinatorConfig {
   defaultHitlPolicy?: string;
   /** Global prompt sent to push executors. */
   globalPrompt?: string;
+  /** Enable file proxy endpoint GET /files/{file_token} (default true). */
+  fileProxyEnabled?: boolean;
+  /** A2A Server configuration for external agent interop. */
+  a2a?: A2AServerConfig;
+  /** S3 configuration for external file sharing. */
+  s3?: S3Config;
 }
 
 export interface ChannelConfig {
-  useLLM: boolean;
   draftTTLMinutes: number;
   pollIntervalSeconds: number;
-  llmArgs?: string[];
-  /** Role mapping method. 'command'=slash command, 'keyword'=keyword match. */
-  rolesMapping?: 'command' | 'keyword';
   /** Listen port for push executor WebSocket connections (0=disabled). */
   coordinatorPort?: number;
   /** Heartbeat interval for push executor liveness (seconds). */
@@ -157,42 +256,78 @@ export interface RoleDef {
   prompt?: string;
 }
 
+/** Per-domain Claude execution configuration. All fields optional — missing
+ *  values are inherited from the Executor's default_domain config. */
+export interface DomainConfig {
+  systemPrompt?: string;
+  securityPrompt?: string;
+  allowedTools?: string[];
+  disallowedTools?: string[];
+  args?: string[];
+  command?: string;
+  promptFlag?: string;
+  permissionMode?: string;
+  timeout?: number;
+  maxRetries?: number;
+  model?: string;
+  /** Effort level: low | medium | high | xhigh | max */
+  effort?: string;
+  /** Comma-separated fallback model(s) */
+  fallbackModel?: string;
+  /** Max API budget in USD */
+  maxBudgetUsd?: number;
+  settings?: Record<string, unknown>;
+}
+
 export interface ExecutorConfig {
-  roles: string[];
-  skipApproval?: boolean;
-  approvalTimeoutMinutes?: number;
-  postReview?: boolean;
-  /** Per-role command/env/prompt overrides. Fall back to global defaults. */
+  domains: string[];
   roleDef?: RoleDef[];
-  /** 'pull' (default, polls Bitable) or 'push' (WebSocket to Channel). */
-  mode?: 'pull' | 'push';
-  /** Channel WebSocket URL for push mode. */
-  coordinatorUrl?: string;
-  /** Push mode auth: 'user' (OAuth PKCE) or 'app' (app_secret). Default 'user'. */
-  auth?: 'user' | 'app';
-  /** Executor-specific system prompt. Falls back to Config.prompt. */
+  defaultDomain?: DomainConfig;
   prompt?: string;
-  /** Run Claude self-check on startup to generate capability description. */
+  coordinatorUrl?: string;
+  auth?: 'user' | 'app';
+  approvalTimeoutMinutes?: number;
   selfCheck?: boolean;
-  /** HITL preference: off | auto | always. Default 'off'. */
   hitl?: string;
   hitlPolicy?: string;
+  sessionDir?: string;
+  httpDownloadTimeout?: number;
 }
 
 export interface Config {
   appId: string;
   appSecret?: string;        // optional — PKCE mode doesn't need it
   openApiDomain?: string;    // e.g. "open.feishu.cn" or "open.larksuite.com"
+  /** Bitable app token. Empty string in agent mode. */
   appToken: string;
+  /** Tickets table ID. Empty string in agent mode. */
   ticketsTableId: string;
+  /** Turns table ID. Empty string in agent mode. */
   turnsTableId: string;
+  /** Roster table ID. Empty string in agent mode. */
   rosterTableId: string;
-  /** Optional — roles whitelist table for keyword-based classification. */
-  rolesWhitelistTableId?: string;
+  /** Optional — Round table for Round-driven state machine mode. */
+  roundsTableId?: string;
+  /** Optional — Domains table for intent classification. */
+  domainsTableId?: string;
+  /** Optional — Configs table for channel/operator/messages/coordinator config. */
+  configsTableId?: string;
+  /** Optional — intent recognition config for LLM-based ability classification. */
+  intent?: {
+    provider: 'anthropic' | 'openai' | 'deepseek';
+    apiKey: string;
+    model?: string;
+    /** Optional system prompt override for processMessage. */
+    systemPrompt?: string;
+  };
+  /** Per-domain config overrides (from TOML [domain.xxx] sections). */
+  domains?: Record<string, DomainConfig>;
   /** Optional — owner's Feishu open_id, written to Roster.human on register. */
   ownerOpenId?: string;
   fields: FieldMapping;
   statuses: StatusMapping;
+  /** Round state machine status mapping. Required when roundsTableId is set. */
+  roundStatuses: RoundStatusMapping;
   identity: string;
   nickname: string;
   /** Explicit executor ID, defaults to user@hostname. */
@@ -203,14 +338,7 @@ export interface Config {
   heartbeatIntervalSeconds: number;
   errorRetrySeconds: number;
   leaseDuration: number;
-  claudeTimeout: number;
-  claudeArgs: string[];
-  aiCommand: string;
-  /** Flag prefix for passing prompt text. Default '-p'. */
-  aiPromptFlag: string;
   maxRetries: number;
-  /** System prompt content (embedded in config, not a file path). */
-  prompt: string;
   maxConcurrency: number;
   /** Operator sub-config (IM interaction). */
   operator?: OperatorConfig;
@@ -263,6 +391,8 @@ export interface MessagesConfig {
   reassignFallback?: string;
   /** Fallback when answer is empty. Placeholders: none. */
   emptyAnswerFallback?: string;
+  /** Fallback when no executor matches the required abilities. */
+  fallbackNoExecutor?: string;
 }
 
 // ---- Bitable record -----------------------------------------------------
@@ -280,12 +410,25 @@ export interface ProcessContext {
   config: Config;
   /** Global prompt from Channel (safety rules + output schema). */
   globalPrompt?: string;
+  /** Current Round context (Round-driven mode). */
+  round?: BitableRecord;
+  /** Supplement prompt from reviewer (Round-driven HITL mode). */
+  roundSupplementPrompt?: string;
+  /** Round record_id for session traceability (Claude --session-id). */
+  roundId?: string;
+  /** Required ability labels from the current Round, e.g. ["tech_support.api"].
+   *  Used to select the matching AbilityConfig for prompt/tool overrides. */
+  domains?: string[];
+  /** Downloaded attachments: file_token → local file path, for multimodal model input. */
+  downloadedAttachments?: Record<string, string>;
 }
 
 export interface ProcessResult {
   answer: string;
   newSummary: string;
   newKeyfacts: Record<string, string>;
+  /** A2A structured output parts (text, file references, data). */
+  parts?: Part[];
   reassignTo?: { roles?: string[]; kind?: string };
 }
 
@@ -293,7 +436,6 @@ export interface CompletenessCheckResult {
   isComplete: boolean;
   summary: string;
   missingFields: string[];
-  forRoles: string[];
 }
 
 export interface Processor {

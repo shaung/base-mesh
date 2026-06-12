@@ -1,54 +1,14 @@
 import { appendFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { hostname, homedir } from 'node:os';
-import { Config, BitableRecord } from './types.js';
+import { Config, BitableRecord, ROUND_TRANSITIONS, Part } from './types.js';
 import { BitableClient } from './bitable.js';
 import { logger } from './log.js';
 import { formatMessage } from './messages.js';
 
-// Feishu Multiline text fields store values as { text, type } objects.
-// Normalise to a plain string for internal use.
-export function extractText(v: unknown): string {
-  if (typeof v === 'string') return v;
-  if (Array.isArray(v)) return v.map((e) => extractText(e)).join('');
-  if (v && typeof v === 'object') {
-    const obj = v as Record<string, unknown>;
-    if (typeof obj.text === 'string') return obj.text;
-  }
-  return String(v ?? '');
-}
-
-/**
- * Extract user open_ids from a Feishu Person field (type 11) or Lookup
- * field wrapping a Person field.
- *
- * Person field value:        [{ id: "ou_xxx", name: "...", ... }]
- * Lookup wrapping Person:    { type: 11, value: [{ id: "ou_xxx", name: "...", ... }] }
- *
- * Returns comma-separated open_ids, or empty string.
- */
-export function extractUserIds(v: unknown): string {
-  if (!v) return '';
-
-  // Lookup field wrapping a Person value
-  if (typeof v === 'object' && !Array.isArray(v)) {
-    const obj = v as Record<string, unknown>;
-    if (obj.type === 11 && Array.isArray(obj.value)) {
-      return extractUserIds(obj.value);
-    }
-    return '';
-  }
-
-  // Direct Person field value (array of user objects)
-  if (Array.isArray(v)) {
-    return v
-      .map((item: any) => (typeof item?.id === 'string' ? item.id : ''))
-      .filter(Boolean)
-      .join(',');
-  }
-
-  return '';
-}
+import { extractText, extractUserIds } from './text.js';
+// Re-export text utilities for backward compatibility
+export { extractText, extractUserIds }; // satisfies users of `from './protocol.js'`
 
 // ---------------------------------------------------------------------------
 // BAM protocol operations — fully driven by user config, no hardcoded
@@ -94,13 +54,40 @@ export class Session {
     return this.cfg.statuses;
   }
 
+  /** Round field mapping getter. */
+  private get rfRound(): import('./types.js').RoundFieldMapping {
+    return this.cfg.fields.round;
+  }
+
+  /** Round status mapping getter. */
+  private get rsv(): import('./types.js').RoundStatusMapping {
+    return this.cfg.roundStatuses;
+  }
+
+  /** Validate a Round state transition against ROUND_TRANSITIONS. */
+  private validateRoundTransition(current: string, next: string): boolean {
+    // Map config status names → canonical names
+    const rs = this.cfg.roundStatuses;
+    const reverse = (v: string): string | null => {
+      for (const [key, val] of Object.entries(rs)) {
+        if (val === v) return key;
+      }
+      return null;
+    };
+    const curCanonical = reverse(current);
+    const nextCanonical = reverse(next);
+    if (!curCanonical || !nextCanonical) return false;
+    const allowed = ROUND_TRANSITIONS[curCanonical];
+    return allowed ? allowed.includes(nextCanonical) : false;
+  }
+
   private log(...args: unknown[]): void {
     logger.info(`[session]`, ...args);
   }
 
   logToFile(msg: string): void {
     try {
-      const dir = join(homedir(), '.cache', 'bitable-mesh');
+      const dir = join(homedir(), '.bam', 'cache');
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
       appendFileSync(join(dir, 'subagent.log'), `[${new Date().toISOString()}] ${msg}\n`);
     } catch { /* ignore */ }
@@ -139,12 +126,12 @@ export class Session {
       this.log(`register: new identity=${this.identity} nickname=${this.nickname}`);
       rosterFields[this.rf.identity] = this.identity;
       rosterFields[this.rf.kind] = 'agent';
-      const roles = this.cfg.executor?.roles?.length ? this.cfg.executor.roles : ['general'];
-      rosterFields[this.rf.roles] = roles;
+      const executorDomains = this.cfg.executor?.domains?.length ? this.cfg.executor.domains : ['general'];
+      rosterFields[this.rf.domains] = executorDomains;
       rosterFields[this.rf.enabled] = true;
-      rosterFields[this.rf.hostname] = hostname();
-      rosterFields[this.rf.user] = process.env.USER ?? 'unknown';
-      rosterFields[this.rf.pid] = String(process.pid);
+      rosterFields[this.rf.metadata] = JSON.stringify({
+        hostname: hostname(), user: process.env.USER ?? 'unknown', pid: process.pid,
+      });
       rosterFields[this.rf.registeredAt] = nowMs;
       const record = await this.bitable.createRecord(this.cfg.rosterTableId, rosterFields);
       this.rosterRecordId = record.record_id;
@@ -196,6 +183,16 @@ export class Session {
     });
   }
 
+  /** Search tickets by sender ID without status restriction (for /cancel etc.). */
+  async searchTicketsBySender(senderId: string): Promise<BitableRecord[]> {
+    return this.bitable.searchRecords(this.cfg.ticketsTableId, {
+      conjunction: 'and',
+      conditions: [
+        { field_name: this.tf.senderId, operator: 'is', value: [senderId] },
+      ],
+    });
+  }
+
   /** Search for pending tickets (was: searchClaimable). Also finds orphan
    *  assigned tickets whose lease has expired (executor crashed after claim). */
   async searchPending(): Promise<BitableRecord[]> {
@@ -203,7 +200,7 @@ export class Session {
     const pending = await this.bitable.searchRecords(this.cfg.ticketsTableId, {
       conjunction: 'and',
       conditions: [
-        { field_name: this.tf.status, operator: 'is', value: [this.sv.pending] },
+        { field_name: this.tf.status, operator: 'is', value: [this.sv.active] },
       ],
     });
 
@@ -214,7 +211,7 @@ export class Session {
     const assigned = await this.bitable.searchRecords(this.cfg.ticketsTableId, {
       conjunction: 'and',
       conditions: [
-        { field_name: this.tf.status, operator: 'is', value: [this.sv.assigned] },
+        { field_name: this.tf.status, operator: 'is', value: [this.sv.active] },
       ],
     });
     const now = Date.now();
@@ -230,20 +227,15 @@ export class Session {
     return this.searchPending();
   }
 
-  /** Promote a draft ticket to pending with summary and capabilities. */
+  /** Promote a draft ticket to pending with summary. */
   async promoteToPending(
     recordId: string,
     summary: string,
-    capabilities?: string[],
   ): Promise<void> {
-    const update: Record<string, unknown> = {
-      [this.tf.status]: this.sv.pending,
+    await this.bitable.updateRecord(this.cfg.ticketsTableId, recordId, {
+      [this.tf.status]: this.sv.active,
       [this.tf.summary]: summary,
-    };
-    if (capabilities && capabilities.length > 0) {
-      update[this.tf.forRoles] = capabilities; // MultiSelect: array directly
-    }
-    await this.bitable.updateRecord(this.cfg.ticketsTableId, recordId, update);
+    });
   }
 
   /** Find a ticket by its root IM message ID (for thread replies). */
@@ -289,10 +281,10 @@ export class Session {
       await this.bitable.updateRecord(this.cfg.ticketsTableId, recordId, {
         [this.tf.owner]: ownerValue,
         [this.tf.ownerLeaseAt]: leaseMs,
-        [this.tf.status]: this.sv.assigned,
+        [this.tf.status]: this.sv.active,
       });
     } catch (err) {
-      this.log(`claim write failed ticket=${recordId.slice(0, 12)}:`, err);
+      this.log(`claim write failed ticket=${recordId}:`, err);
       return false;
     }
 
@@ -304,26 +296,23 @@ export class Session {
 
     const currentOwner = String(updated.fields[this.tf.owner] ?? '');
     if (!currentOwner.endsWith(`#${this.identity}`)) {
-      this.log(`claim lost ticket=${recordId.slice(0, 12)}: owner=${currentOwner}`);
+      this.log(`claim lost ticket=${recordId}: owner=${currentOwner}`);
       return false;
     }
 
-    this.log(`claim success ticket=${recordId.slice(0, 12)} as ${ownerValue}`);
+    this.log(`claim success ticket=${recordId} as ${ownerValue}`);
     return true;
   }
 
-  async release(ticketRecordId: string, status?: string, opts?: {
-    forRoles?: string[];
-    forKind?: string;
-  }): Promise<void> {
-    const nextStatus = status ?? this.sv.pending;
+  async release(ticketRecordId: string, status?: string): Promise<void> {
+    const nextStatus = status ?? this.sv.active;
 
     // Owner guard: only release if we still hold the lease
     const rec = await this.bitable.getRecord(this.cfg.ticketsTableId, ticketRecordId);
     if (!rec) return;
     const currentOwner = String(rec.fields[this.tf.owner] ?? '');
     if (currentOwner && !currentOwner.endsWith(`#${this.identity}`)) {
-      this.log(`release: owner changed, skip ticket=${ticketRecordId.slice(0, 12)}`);
+      this.log(`release: owner changed, skip ticket=${ticketRecordId}`);
       return;
     }
 
@@ -333,8 +322,6 @@ export class Session {
       [this.tf.status]: nextStatus,
     };
     if (currentOwner) update[this.tf.lastOwner] = currentOwner;
-    if (opts?.forRoles?.length) update[this.tf.forRoles] = opts.forRoles; // MultiSelect: array directly
-    if (opts?.forKind) update[this.tf.forKind] = opts.forKind;
 
     await this.bitable.updateRecord(this.cfg.ticketsTableId, ticketRecordId, update);
   }
@@ -348,14 +335,14 @@ export class Session {
     if (!rec) return;
     const currentOwner = String(rec.fields[this.tf.owner] ?? '');
     if (currentOwner && !currentOwner.endsWith(`#${this.identity}`)) {
-      this.log(`finalize: owner changed, skip ticket=${ticketRecordId.slice(0, 12)}`);
+      this.log(`finalize: owner changed, skip ticket=${ticketRecordId}`);
       return;
     }
 
     // Re-fetch turns to check if new user messages arrived while processing
     const turns = await this.getTurns(ticketRecordId);
     const hasUnanswered = this.findUnansweredTurns(turns).length > 0;
-    const nextStatus = hasUnanswered ? this.sv.pending : this.sv.done;
+    const nextStatus = hasUnanswered ? this.sv.active : this.sv.closed;
 
     const update: Record<string, unknown> = {
       [this.tf.owner]: '',
@@ -364,7 +351,7 @@ export class Session {
     };
     if (currentOwner) update[this.tf.lastOwner] = currentOwner;
     if (payload.newSummary) update[this.tf.summary] = payload.newSummary;
-    if (payload.newKeyfacts) update[this.tf.keyfacts] = JSON.stringify(payload.newKeyfacts);
+    if (payload.newKeyfacts && Object.keys(payload.newKeyfacts).length > 0) update[this.tf.keyfacts] = JSON.stringify(payload.newKeyfacts);
 
     await this.bitable.updateRecord(this.cfg.ticketsTableId, ticketRecordId, update);
   }
@@ -380,7 +367,7 @@ export class Session {
       [this.tf.result]: result,
       [this.tf.owner]: '',
       [this.tf.ownerLeaseAt]: 0,
-      [this.tf.status]: this.sv.done,
+      [this.tf.status]: this.sv.closed,
     };
     if (summary) update[this.tf.summary] = summary;
     if (owner) update[this.tf.lastOwner] = owner;
@@ -394,101 +381,20 @@ export class Session {
     if (!rec) return;
     const currentOwner = String(rec.fields[this.tf.owner] ?? '');
     if (currentOwner && !currentOwner.endsWith(`#${this.identity}`)) {
-      this.log(`markFailed: owner changed, skip ${recordId.slice(0, 12)}`);
+      this.log(`markFailed: owner changed, skip ${recordId}`);
       return;
     }
     await this.bitable.updateRecord(this.cfg.ticketsTableId, recordId, {
       [this.tf.owner]: '',
       [this.tf.ownerLeaseAt]: 0,
       [this.tf.lastOwner]: currentOwner,
-      [this.tf.status]: this.sv.failed,
+      [this.tf.status]: this.sv.closed,
     });
   }
 
   // ---------------------------------------------------------------------------
   // Human-in-the-loop: pre-execution approval
   // ---------------------------------------------------------------------------
-
-  /** Set ticket status to pending_approval (keep owner/lease for polling).
-   *  Also copies approvers from the Roster record's human field to the ticket. */
-  async setPendingApproval(recordId: string): Promise<void> {
-    // Owner guard
-    const rec = await this.bitable.getRecord(this.cfg.ticketsTableId, recordId);
-    if (!rec) return;
-    const currentOwner = String(rec.fields[this.tf.owner] ?? '');
-    if (currentOwner && !currentOwner.endsWith(`#${this.identity}`)) {
-      this.log(`setPendingApproval: owner changed, skip ${recordId.slice(0, 12)}`);
-      return;
-    }
-
-    // Look up approvers from this executor's Roster record
-    const rosterRec = await this.bitable.searchRecords(this.cfg.rosterTableId, {
-      conjunction: 'and',
-      conditions: [{ field_name: this.rf.identity, operator: 'is', value: [this.identity] }],
-    });
-
-    const update: Record<string, unknown> = {
-      [this.tf.status]: this.sv.pendingApproval,
-    };
-    if (rosterRec.length > 0) {
-      const human = rosterRec[0].fields[this.rf.human];
-      if (human) update[this.tf.approvers] = human;
-    }
-
-    await this.bitable.updateRecord(this.cfg.ticketsTableId, recordId, update);
-  }
-
-  /** Poll ticket.status for approval result. Returns when status changes
-   *  from pending_approval, or when timeoutMs elapses. */
-  async pollApproval(
-    recordId: string,
-    timeoutMs: number,
-  ): Promise<'approved' | 'rejected' | 'timeout'> {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const ticket = await this.bitable.getRecord(this.cfg.ticketsTableId, recordId);
-      if (!ticket) return 'rejected';
-      const status = String(ticket.fields[this.tf.status] ?? '');
-      if (status === this.sv.pendingApproval) {
-        await sleep(5000);
-        continue;
-      }
-      // Status changed from pending_approval
-      if (status === this.sv.assigned) return 'approved';
-      if (status === this.sv.done) return 'approved';
-      return 'rejected';
-    }
-    return 'timeout';
-  }
-
-  // ---------------------------------------------------------------------------
-  // Human-in-the-loop: post-answer review
-  // ---------------------------------------------------------------------------
-
-  /** Poll the pending_review turn for review result. Looks for the specific
-   *  turn that was written as pending_review, then watches its status change. */
-  async pollReview(
-    ticketRecordId: string,
-    timeoutMs: number,
-  ): Promise<'approved' | 'rejected' | 'timeout'> {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const turns = await this.getTurns(ticketRecordId);
-      // Find the turn that was originally written as pending_review
-      const reviewTurn = [...turns].reverse().find((t) =>
-        String(t.fields[this.nf.role] ?? '') === 'agent' &&
-        String(t.fields[this.nf.status] ?? '') !== 'processing',
-      );
-      if (reviewTurn) {
-        const status = String(reviewTurn.fields[this.nf.status] ?? '');
-        if (status === 'approved') return 'approved';
-        if (status === 'rejected') return 'rejected';
-        if (status === 'answered') return 'approved'; // skip-mode fallback
-      }
-      await sleep(5000);
-    }
-    return 'timeout';
-  }
 
   /** Look up a roster record by identity. */
   async getRosterByIdentity(identity: string): Promise<Record<string, unknown> | null> {
@@ -515,7 +421,7 @@ export class Session {
     if (!rec) return;
     const currentOwner = String(rec.fields[this.tf.owner] ?? '');
     if (currentOwner && !currentOwner.endsWith(`#${this.identity}`)) {
-      this.log(`releaseWithRetry: owner changed, skip ticket=${recordId.slice(0, 12)}`);
+      this.log(`releaseWithRetry: owner changed, skip ticket=${recordId}`);
       return;
     }
 
@@ -530,7 +436,7 @@ export class Session {
         [this.tf.owner]: `${RETRY_OWNER_PREFIX}${this.nickname}#${this.identity}`,
         [this.tf.ownerLeaseAt]: 0,
         [this.tf.lastOwner]: currentOwner,
-        [this.tf.status]: this.sv.pending,
+        [this.tf.status]: this.sv.active,
         [this.tf.retryCount]: nextRetryCount,
       });
 
@@ -547,7 +453,7 @@ export class Session {
         [this.tf.owner]: '',
         [this.tf.ownerLeaseAt]: 0,
         [this.tf.lastOwner]: currentOwner,
-        [this.tf.status]: this.sv.failed,
+        [this.tf.status]: this.sv.closed,
         [this.tf.retryCount]: nextRetryCount,
       });
 
@@ -564,8 +470,363 @@ export class Session {
         [this.tf.retryCount]: 0,
       });
     } catch (err) {
-      this.log(`resetRetryCount failed ${recordId.slice(0, 12)}:`, err);
+      this.log(`resetRetryCount failed ${recordId}:`, err);
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Round lifecycle (Round-driven state machine mode)
+  // ---------------------------------------------------------------------------
+
+  /** In-memory dedup for createRound: maps ticketRecordId → roundId.
+   *  Protects against Bitable eventual consistency where a freshly created
+   *  round is not yet visible to search queries, preventing the guard below
+   *  from seeing it and allowing a duplicate. */
+  private creatingRounds = new Map<string, string>();
+
+  /** Create a new Round in pending status linked to a ticket.
+   *  If the ticket already has an active (non-terminal) Round, returns the
+   *  existing one instead of creating a duplicate. This prevents duplicate
+   *  Round creation from Bitable event races regardless of the trigger path.
+   *  @param abilities — required ability labels stored in Round.required_abilities */
+  async createRound(ticketRecordId: string, domains?: string[]): Promise<BitableRecord> {
+    // In-memory guard: check if we already started creating a round for this ticket.
+    // Verifies via Bitable so a terminal round doesn't block a new one.
+    const inFlight = this.creatingRounds.get(ticketRecordId);
+    if (inFlight) {
+      const existing = await this.getRound(inFlight);
+      if (existing) {
+        const status = String(existing.fields[this.rfRound.status] ?? '');
+        const terminal = [this.rsv.done, this.rsv.failed, this.rsv.cancelled];
+        if (!terminal.includes(status)) {
+          this.log(`createRound: ticket ${ticketRecordId} already creating active round ${inFlight}, returning existing`);
+          return existing;
+        }
+        // Round is terminal — let it create a new one
+        this.creatingRounds.delete(ticketRecordId);
+      }
+    }
+
+    // Bitable guard: check for existing active Round before creating a new one
+    const currentRound = await this.getCurrentRound(ticketRecordId);
+    if (currentRound?.record_id) {
+      this.log(`createRound: ticket ${ticketRecordId} already has active round ${currentRound.record_id}, returning existing`);
+      return currentRound;
+    }
+
+    const roundFields: Record<string, unknown> = {
+      [this.rfRound.ticketRecordId]: ticketRecordId,
+      [this.rfRound.status]: this.rsv.pending,
+      [this.rfRound.executor]: '',
+      [this.rfRound.reviewer]: [],
+      [this.rfRound.reviewComment]: '',
+      [this.rfRound.supplementPrompt]: '',
+      [this.rfRound.result]: '',
+    };
+    if (domains && domains.length > 0) {
+      roundFields[this.rfRound.domains] = JSON.stringify(domains);
+    }
+    const round = await this.bitable.createRecord(this.cfg.roundsTableId!, roundFields);
+    // Register in in-memory dedup map for eventual-consistency resilience
+    if (round.record_id) {
+      this.creatingRounds.set(ticketRecordId, round.record_id);
+      // Clear after 10s (well beyond Bitable search consistency window)
+      setTimeout(() => {
+        if (this.creatingRounds.get(ticketRecordId) === round.record_id) {
+          this.creatingRounds.delete(ticketRecordId);
+        }
+      }, 10_000);
+    }
+    // Update ticket's lastRoundId to point to this Round
+    try {
+      await this.bitable.updateRecord(this.cfg.ticketsTableId, ticketRecordId, {
+        [this.tf.lastRoundId]: round.record_id,
+      });
+    } catch (err) {
+      this.log(`createRound: failed to update ticket.lastRoundId ${ticketRecordId}:`, err);
+    }
+    return round;
+  }
+
+  /** Fetch a single Round by record_id. */
+  async getRound(roundId: string): Promise<BitableRecord | null> {
+    try {
+      return await this.bitable.getRecord(this.cfg.roundsTableId!, roundId);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Find the most recent non-terminal Round for a ticket. */
+  async getCurrentRound(ticketRecordId: string): Promise<BitableRecord | null> {
+    const all = await this.bitable.searchRecords(this.cfg.roundsTableId!, {
+      conjunction: 'and',
+      conditions: [
+        { field_name: this.rfRound.ticketRecordId, operator: 'is', value: [ticketRecordId] },
+      ],
+    });
+    // Filter out terminal states (done, failed, cancelled)
+    const terminal = [this.rsv.done, this.rsv.failed, this.rsv.cancelled];
+    const active = all.filter(r => !terminal.includes(String(r.fields[this.rfRound.status] ?? '')));
+    // Return the most recently created active Round (last in array by default order)
+    return active.length > 0 ? active[active.length - 1] : null;
+  }
+
+  /** Transition a Round to a new status with WSR optimistic concurrency.
+   *  Validates the transition is allowed by ROUND_TRANSITIONS, writes the new
+   *  status, then reads back to verify. Returns false if the transition was
+   *  invalid or another process changed the status concurrently. */
+  async transitionRound(roundId: string, newStatus: string): Promise<boolean> {
+    const round = await this.getRound(roundId);
+    if (!round) return false;
+    const currentStatus = String(round.fields[this.rfRound.status] ?? '');
+    if (!this.validateRoundTransition(currentStatus, newStatus)) {
+      this.log(`transitionRound invalid: ${currentStatus} → ${newStatus} (round=${roundId})`);
+      return false;
+    }
+    try {
+      await this.bitable.updateRecord(this.cfg.roundsTableId!, roundId, {
+        [this.rfRound.status]: newStatus,
+      });
+      await sleep(300);
+      const updated = await this.getRound(roundId);
+      if (!updated) return false;
+      const actualStatus = String(updated.fields[this.rfRound.status] ?? '');
+      return actualStatus === newStatus;
+    } catch (err) {
+      this.log(`transitionRound failed ${roundId}:`, err);
+      return false;
+    }
+  }
+
+  /** Claim a Round for execution (write executor + lease, verify).
+   *  @param owner — optional explicit owner identity (default: this.nickname#this.identity) */
+  async claimRound(round: BitableRecord, owner?: string): Promise<boolean> {
+    const roundId = round.record_id;
+    if (!roundId) return false;
+    const ownerValue = owner || `${this.nickname}#${this.identity}`;
+    const leaseMs = Date.now() + this.cfg.leaseDuration * 1000;
+    try {
+      await this.bitable.updateRecord(this.cfg.roundsTableId!, roundId, {
+        [this.rfRound.executor]: ownerValue,
+      });
+    } catch (err) {
+      this.log(`claimRound write failed round=${roundId}:`, err);
+      return false;
+    }
+    await sleep(300);
+    const updated = await this.getRound(roundId);
+    if (!updated) return false;
+    // Verify we still own it AND the round hasn't been claimed by another assign cycle
+    const currentExecutor = String(updated.fields[this.rfRound.executor] ?? '');
+    if (owner) {
+      if (currentExecutor !== owner) {
+        this.log(`claimRound lost round=${roundId}: executor=${currentExecutor}`);
+        return false;
+      }
+    } else if (!currentExecutor.endsWith(`#${this.identity}`)) {
+      this.log(`claimRound lost round=${roundId}: executor=${currentExecutor}`);
+      return false;
+    }
+    // Verify the round is still in a claimable status (not already executing)
+    const status = String(updated.fields[this.rfRound.status] ?? '');
+    if (status !== this.rsv.pending && status !== this.rsv.approved) {
+      this.log(`claimRound stale round=${roundId}: status=${status}`);
+      return false;
+    }
+    this.log(`claimRound success round=${roundId} as ${ownerValue}`);
+    return true;
+  }
+
+  /** Release a Round back to pending (clear executor). */
+  async releaseRound(roundId: string): Promise<void> {
+    try {
+      await this.bitable.updateRecord(this.cfg.roundsTableId!, roundId, {
+        [this.rfRound.executor]: '',
+        [this.rfRound.status]: this.rsv.pending,
+      });
+    } catch (err) {
+      this.log(`releaseRound failed ${roundId}:`, err);
+    }
+  }
+
+  /** Search Rounds by status. */
+  async searchRoundsByStatus(status: string): Promise<BitableRecord[]> {
+    return this.bitable.searchRecords(this.cfg.roundsTableId!, {
+      conjunction: 'and',
+      conditions: [
+        { field_name: this.rfRound.status, operator: 'is', value: [status] },
+      ],
+    });
+  }
+
+  /** Search Rounds by status with prefix-based ability matching.
+   *  Reads `required_abilities` directly from the Round record — no Ticket lookup. */
+  async searchRoundsByStatusAndDomains(status: string, domains: string[]): Promise<BitableRecord[]> {
+    const rounds = await this.searchRoundsByStatus(status);
+    if (domains.length === 0) return rounds;
+    const { PrefixMatcher } = await import('./matcher.js');
+    const matcher = new PrefixMatcher();
+    return rounds.filter(r => {
+      const raw = String(r.fields[this.rfRound.domains] ?? '');
+      if (!raw) return true; // no requirement = match all
+      try {
+        const required: string[] = JSON.parse(raw);
+        return matcher.matches(required, domains);
+      } catch {
+        return true;
+      }
+    });
+  }
+
+  /** Find stuck Rounds (executing status with expired lease). */
+  async searchStuckRounds(timeoutMs: number): Promise<BitableRecord[]> {
+    const executing = await this.bitable.searchRecords(this.cfg.roundsTableId!, {
+      conjunction: 'and',
+      conditions: [
+        { field_name: this.rfRound.status, operator: 'is', value: [this.rsv.executing] },
+      ],
+    });
+    const cutoff = Date.now() - timeoutMs;
+    return executing.filter(r => {
+      const updatedAt = Number(r.fields[this.rfRound.updatedAt] ?? 0);
+      return updatedAt > 0 && updatedAt < cutoff;
+    });
+  }
+
+  /** Write the processing result to a Round record. */
+  async setRoundResult(roundId: string, result: string): Promise<void> {
+    try {
+      await this.bitable.updateRecord(this.cfg.roundsTableId!, roundId, {
+        [this.rfRound.result]: result,
+        [this.rfRound.updatedAt]: Date.now(),
+      });
+    } catch (err) {
+      this.log(`setRoundResult failed ${roundId}:`, err);
+    }
+  }
+
+  /** Write supplement prompt and reviewer to a Round (after approval). */
+  async setRoundSupplement(roundId: string, prompt: string, reviewerOpenId?: string): Promise<void> {
+    const update: Record<string, unknown> = {
+      [this.rfRound.supplementPrompt]: prompt,
+      [this.rfRound.updatedAt]: Date.now(),
+    };
+    if (reviewerOpenId) {
+      update[this.rfRound.reviewer] = [{ id: reviewerOpenId }];
+    }
+    try {
+      await this.bitable.updateRecord(this.cfg.roundsTableId!, roundId, update);
+    } catch (err) {
+      this.log(`setRoundSupplement failed ${roundId}:`, err);
+    }
+  }
+
+  /** Get all Rounds for a ticket. */
+  async getRoundsByTicket(ticketRecordId: string): Promise<BitableRecord[]> {
+    return this.bitable.searchRecords(this.cfg.roundsTableId!, {
+      conjunction: 'and',
+      conditions: [
+        { field_name: this.rfRound.ticketRecordId, operator: 'is', value: [ticketRecordId] },
+      ],
+    });
+  }
+
+  /** Find turns associated with a specific Round. */
+  async getTurnsByRound(roundId: string): Promise<BitableRecord[]> {
+    return this.bitable.searchRecords(this.cfg.turnsTableId, {
+      conjunction: 'and',
+      conditions: [
+        { field_name: this.nf.roundId, operator: 'is', value: [roundId] },
+      ],
+    });
+  }
+
+  /** Assign unowned Turns to a Round (set their roundId field). Returns count assigned. */
+  async assignTurnsToRound(ticketRecordId: string, roundId: string): Promise<number> {
+    const turns = await this.getTurns(ticketRecordId);
+    let assigned = 0;
+    for (const turn of turns) {
+      const existingRoundId = String(turn.fields[this.nf.roundId] ?? '');
+      if (!existingRoundId && turn.record_id) {
+        try {
+          await this.bitable.updateRecord(this.cfg.turnsTableId, turn.record_id, {
+            [this.nf.roundId]: roundId,
+          });
+          assigned++;
+        } catch { /* skip individual failures */ }
+      }
+    }
+    return assigned;
+  }
+
+  /** Build a conversation prompt string from Turns belonging to a Round. */
+  async buildConversation(round: BitableRecord): Promise<string> {
+    const roundId = round.record_id;
+    if (!roundId) return '';
+    const turns = await this.getTurnsByRound(roundId);
+    const supplementPrompt = String(round.fields[this.rfRound.supplementPrompt] ?? '');
+
+    const lines: string[] = [];
+    for (const turn of turns) {
+      const role = String(turn.fields[this.nf.role] ?? '');
+      const content = String(turn.fields[this.nf.content] ?? '');
+      if (role && content) {
+        lines.push(`[${role}]\n${content}`);
+      }
+    }
+
+    let conversation = lines.join('\n\n---\n\n');
+    if (supplementPrompt) {
+      conversation += `\n\n[system supplement]\n${supplementPrompt}`;
+    }
+    return conversation;
+  }
+
+  /** Build a conversation prompt string from Turns belonging to a Round,
+   *  using the A2A `parts` field when available and falling back to `content`
+   *  for backward compatibility with unstructured messages. */
+  async buildConversationWithParts(round: BitableRecord): Promise<string> {
+    const roundId = round.record_id;
+    if (!roundId) return '';
+    const turns = await this.getTurnsByRound(roundId);
+    const supplementPrompt = String(round.fields[this.rfRound.supplementPrompt] ?? '');
+
+    const lines: string[] = [];
+    for (const turn of turns) {
+      const role = String(turn.fields[this.nf.role] ?? '');
+      if (!role) continue;
+
+      // Priority 1: parse structured `parts` field
+      const partsRaw = extractText(turn.fields[this.nf.parts]);
+      if (partsRaw) {
+        try {
+          const parts: Part[] = JSON.parse(partsRaw);
+          const text = parts.map((p) => {
+            switch (p.kind) {
+              case 'text': return p.text;
+              case 'file': return `[attachment: ${p.name ?? 'file'}](${p.file_uri})`;
+              case 'data': return `[data: ${JSON.stringify(p.data)}]`;
+              default: return '';
+            }
+          }).join('\n');
+          if (text) lines.push(`[${role}]\n${text}`);
+          continue;
+        } catch {
+          // Malformed parts JSON — fall through to content
+        }
+      }
+
+      // Priority 2: fall back to legacy `content` field
+      const content = String(turn.fields[this.nf.content] ?? '');
+      if (content) lines.push(`[${role}]\n${content}`);
+    }
+
+    let conversation = lines.join('\n\n---\n\n');
+    if (supplementPrompt) {
+      conversation += `\n\n[system supplement]\n${supplementPrompt}`;
+    }
+    return conversation;
   }
 
   /** Find turns ready for IM delivery. */
@@ -672,7 +933,7 @@ export class Session {
         [this.nf.deliveryLeaseAt]: leaseMs,
       });
     } catch (err) {
-      this.log(`claimTurnDelivery write failed turn=${turnRecordId.slice(0, 12)}:`, err);
+      this.log(`claimTurnDelivery write failed turn=${turnRecordId}:`, err);
       return false;
     }
 
@@ -683,11 +944,11 @@ export class Session {
 
     const currentOwner = String(record.fields[this.nf.deliveryOwner] ?? '');
     if (currentOwner !== ownerValue) {
-      this.log(`claimTurnDelivery lost turn=${turnRecordId.slice(0, 12)}: owner=${currentOwner}`);
+      this.log(`claimTurnDelivery lost turn=${turnRecordId}: owner=${currentOwner}`);
       return false;
     }
 
-    this.log(`claimTurnDelivery won turn=${turnRecordId.slice(0, 12)} as ${ownerValue}`);
+    this.log(`claimTurnDelivery won turn=${turnRecordId}`);
     return true;
   }
 
@@ -721,6 +982,9 @@ export class Session {
     agentIdentity?: string,
     turnStatus?: string,
     rootMsgId?: string,
+    roundId?: string,
+    parts?: Part[],
+    notified?: number,
   ): Promise<string | null> {
     // Dedup check
     if (dedupKey) {
@@ -750,12 +1014,14 @@ export class Session {
       [this.nf.content]: content,
       [this.nf.dedupKey]: dedupKey ?? '',
       [this.nf.agentIdentity]: resolvedAgentIdentity,
-      [this.nf.notified]: 0,
+      [this.nf.notified]: notified ?? 0,
       [this.nf.deliveryLeaseAt]: 0,
     };
     if (human) fields[this.nf.human] = human;
     if (rootMsgId) fields[this.nf.rootMsgId] = rootMsgId;
     if (turnStatus) fields[this.nf.status] = turnStatus;
+    if (roundId) fields[this.nf.roundId] = roundId;
+    if (parts && parts.length > 0) fields[this.nf.parts] = JSON.stringify(parts);
 
     const record = await this.bitable.createRecord(this.cfg.turnsTableId, fields);
     return record.record_id;
@@ -772,7 +1038,7 @@ export class Session {
     try {
       await this.appendTurn(ticketRecordId, 'agent', text, dedupKey, this.identity, 'error', rootMsgId);
     } catch (err) {
-      this.log(`writeErrorTurn failed ticket=${ticketRecordId.slice(0, 12)}:`, err);
+      this.log(`writeErrorTurn failed ticket=${ticketRecordId}:`, err);
     }
   }
 

@@ -14,7 +14,7 @@ import { getDomainConfig } from './domain.js';
 function configDir(): string {
   const env = process.env.XDG_CONFIG_HOME;
   const base = env ? env : join(homedir(), '.config');
-  return join(base, 'bitable-mesh');
+  return join(base, 'bam');
 }
 
 function tokensPath(): string {
@@ -98,13 +98,13 @@ export class UserTokenProvider implements TokenProvider {
       await this.refresh();
       return this.tokens.accessToken;
     }
-    throw new Error('No refresh token available. Run `bitable-mesh login` to re-authorize.');
+    throw new Error('No refresh token available. Run `bam login` to re-authorize.');
   }
 
   // -- Refresh --------------------------------------------------------------
 
   private async refresh(): Promise<void> {
-    const resp = await fetch(`https://${this.dc.open}/open-apis/authen/v1/oidc/refresh_access_token`, {
+    const resp = await fetch(`${this.dc.sdkBaseUrl}/open-apis/authen/v1/oidc/refresh_access_token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -118,7 +118,7 @@ export class UserTokenProvider implements TokenProvider {
       const text = await resp.text();
       if (resp.status === 400 || resp.status === 401) {
         clearStoredTokens(this.appId);
-        throw new Error('Session expired. Run `bitable-mesh login` to re-authorize.');
+        throw new Error('Session expired. Run `bam login` to re-authorize.');
       }
       throw new Error(`Token refresh failed (${resp.status}): ${text}`);
     }
@@ -221,7 +221,7 @@ async function exchangeCode(
   redirectUri: string,
   dc: ReturnType<typeof getDomainConfig>,
 ): Promise<StoredTokens> {
-  const resp = await fetch(`https://${dc.open}/open-apis/authen/v1/oidc/access_token`, {
+  const resp = await fetch(`${dc.sdkBaseUrl}/open-apis/authen/v1/oidc/access_token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -252,7 +252,7 @@ async function exchangeCode(
   // If the token response didn't include user info, fetch it separately
   if (!userId && data.access_token) {
     try {
-      const userResp = await fetch(`https://${dc.open}/open-apis/authen/v1/user_info`, {
+      const userResp = await fetch(`${dc.sdkBaseUrl}/open-apis/authen/v1/user_info`, {
         headers: { Authorization: `Bearer ${data.access_token}` },
       });
       if (userResp.ok) {

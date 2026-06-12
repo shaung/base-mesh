@@ -23,7 +23,7 @@ export async function createTicket(
 
   // 1. Create ticket (Topic)
   const ticket = await bitable.createRecord(cfg.ticketsTableId, {
-    [tf.status]: cfg.statuses.pending,
+    [tf.status]: cfg.statuses.active,
     [tf.owner]: '',
     [tf.ownerLeaseAt]: 0,
     [tf.summary]: params.message.slice(0, 80),
