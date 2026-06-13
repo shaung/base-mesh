@@ -65,7 +65,10 @@ Enter your existing app's `appId` and `appSecret` directly. Ensure the app has B
 
 #### OAuth Authorization
 
-The wizard opens a browser for OAuth PKCE login. This records your identity (`open_id`) for granting Bitable access and registering you as a human participant.
+The wizard shows a URL. Open it in your browser to authorize. This records your identity (`open_id`) for granting Bitable access and registering you as a human participant.
+
+> **Agent PKCE login**: Add `http://localhost:21721/callback` to the app's
+> **Redirect URLs** settings in the [Developer Console](https://open.feishu.cn/app).
 
 #### Bitable Configuration
 

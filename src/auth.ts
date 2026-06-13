@@ -142,14 +142,14 @@ export class UserTokenProvider implements TokenProvider {
   /**
    * Interactive OAuth PKCE login.
    *
-   * 1. Start a local HTTP server on a fixed port (59356, +1 if busy)
+   * 1. Start a local HTTP server on a fixed port (21721, +1 if busy)
    * 2. Open browser to the OAuth authorize page with PKCE challenge
    * 3. User authorizes → browser redirects to localhost
    * 4. Exchange auth code (+ code_verifier) for tokens (NO app_secret)
    * 5. Store tokens, return UserTokenProvider
    *
    * The redirect URI must match what's configured in the app →
-   * 安全设置 → 重定向URL. Add: http://localhost:59356/callback
+   * Redirect URLs settings. Add: http://localhost:21721/callback
    */
   static async login(appId: string, openApiDomain?: string): Promise<UserTokenProvider> {
     const dc = getDomainConfig(openApiDomain);
@@ -281,8 +281,8 @@ async function exchangeCode(
 // Constants
 // ---------------------------------------------------------------------------
 
-const LOGIN_PORT = 59356;
-/** Must match what's configured in the app → 安全设置 → 重定向URL */
+const LOGIN_PORT = 21721;
+/** Must match what's configured in the app → Redirect URLs settings */
 const CALLBACK_URI = `http://localhost:${LOGIN_PORT}/callback`;
 
 // ---------------------------------------------------------------------------

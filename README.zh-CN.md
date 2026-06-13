@@ -65,7 +65,10 @@ bam setup
 
 #### OAuth 授权
 
-向导会在浏览器中打开 OAuth PKCE 登录页面，授权后记录你的身份（`open_id`），用于多维表格授权和注册为人工参与者。
+向导会输出一个 URL，在浏览器中打开完成授权。授权后记录你的身份（`open_id`），用于多维表格授权和注册为人工参与者。
+
+> **Agent PKCE 登录**：在[开发者后台](https://open.feishu.cn/app)的
+> **安全设置 → 重定向 URL** 中添加 `http://localhost:21721/callback`。
 
 #### 多维表格配置
 

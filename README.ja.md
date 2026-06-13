@@ -65,7 +65,10 @@ bam setup
 
 #### OAuth 認可
 
-ブラウザで OAuth PKCE ログインが開きます。承認後、あなたの `open_id` が記録されます。
+ウィザードが URL を表示します。ブラウザで開いて認可してください。認可後、あなたの `open_id` が記録されます。
+
+> **Agent PKCE ログイン**：[Developer Console](https://open.feishu.cn/app) の
+> **安全設定 → リダイレクト URL** に `http://localhost:21721/callback` を追加してください。
 
 #### Bitable 設定
 

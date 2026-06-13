@@ -9,6 +9,7 @@ import chalk from 'chalk';
 import ora from 'ora';
 import { getDomainConfig } from './domain.js';
 import { UserTokenProvider, loadStoredTokens } from './auth.js';
+import { MESSAGES, type SetupLang, type SetupMessages, detectLang } from './setup-i18n.js';
 
 // ---------------------------------------------------------------------------
 // Bitable field type constants
@@ -521,26 +522,38 @@ function buildConfig(
 // Interactive setup wizard — dispatcher
 // ---------------------------------------------------------------------------
 
-export async function interactiveSetup(profile = 'default', mode?: 'channel' | 'agent'): Promise<void> {
+export async function interactiveSetup(profile = 'default', mode?: 'channel' | 'agent', lang?: SetupLang): Promise<void> {
+  // Step 0: Language selection
+  if (!lang) {
+    console.log('');
+    console.log('  ╔══════════════════════════════════════════════════════╗');
+    console.log('  ║             bam Setup Wizard                        ║');
+    console.log('  ╚══════════════════════════════════════════════════════╝');
+    console.log('');
+    lang = await promptList('Select language / 选择语言 / 言語を選択:', [
+      { name: 'English', value: 'en' },
+      { name: '中文', value: 'zh' },
+      { name: '日本語', value: 'ja' },
+    ]);
+    return interactiveSetup(profile, mode, lang);
+  }
+
+  const msg = MESSAGES[lang];
+
   // If mode not specified, prompt user to choose
   if (!mode) {
     console.log('');
-    console.log('  ╔══════════════════════════════════════════════════════╗');
-    console.log('  ║               bam Setup Wizard                      ║');
-    console.log('  ╚══════════════════════════════════════════════════════╝');
-    console.log('');
-    mode = await promptList('Are you setting up a Channel (server) or an Agent (client)?', [
-      { name: 'Channel — server that connects to Feishu IM and manages Bitable', value: 'channel' },
-      { name: 'Agent — client that connects to a Channel and processes tickets', value: 'agent' },
+    mode = await promptList(msg.selectMode, [
+      { name: msg.modeChannel, value: 'channel' },
+      { name: msg.modeAgent, value: 'agent' },
     ]);
-    // Re-dispatch with chosen mode
-    return interactiveSetup(profile, mode);
+    return interactiveSetup(profile, mode, lang);
   }
 
   if (mode === 'channel') {
-    return setupChannel(profile);
+    return setupChannel(profile, lang);
   } else {
-    return setupAgent(profile);
+    return setupAgent(profile, lang);
   }
 }
 
@@ -548,10 +561,11 @@ export async function interactiveSetup(profile = 'default', mode?: 'channel' | '
 // Channel setup — full Feishu + Bitable + Intent configuration
 // ---------------------------------------------------------------------------
 
-async function setupChannel(profile = 'default'): Promise<void> {
+async function setupChannel(profile = 'default', lang?: SetupLang): Promise<void> {
+  const msg: SetupMessages = MESSAGES[lang || detectLang()];
   console.log('');
   console.log('  ╔══════════════════════════════════════════════════════╗');
-  console.log('  ║              bam — Channel Setup                     ║');
+  console.log(`  ║          ${msg.channelBanner.padEnd(42)}║`);
   console.log('  ╚══════════════════════════════════════════════════════╝');
   console.log('');
 
@@ -568,10 +582,10 @@ async function setupChannel(profile = 'default'): Promise<void> {
   // Step 1: Server domain
   // =========================================================================
 
-  console.log(chalk.bold('\nStep 1: Lark / Feishu Server'));
-  const domainChoice = await promptList('Which server does your account belong to?', [
-    { name: 'International — Lark (larksuite.com)', value: 'open.larksuite.com' },
-    { name: 'Chinese — 飞书 (feishu.cn)', value: 'open.feishu.cn' },
+  console.log(chalk.bold(`\nStep 1: ${msg.step1Title}`));
+  const domainChoice = await promptList(msg.step1Title, [
+    { name: msg.step1Lark, value: 'open.larksuite.com' },
+    { name: msg.step1Feishu, value: 'open.feishu.cn' },
     { name: 'Custom — specify manually', value: 'custom' },
   ]);
   let openApiDomain = domainChoice === 'custom'
@@ -583,7 +597,7 @@ async function setupChannel(profile = 'default'): Promise<void> {
   // Step 2: Credentials
   // =========================================================================
 
-  console.log(chalk.bold('\nStep 2: Feishu App Credentials'));
+  console.log(chalk.bold(`\nStep 2: ${msg.step2Credentials}`));
   let appId = def('appId');
   let appSecret = def('appSecret');
 
@@ -594,69 +608,63 @@ async function setupChannel(profile = 'default'): Promise<void> {
 
   if (!appId) {
     const credentialMode = await promptList(
-      'How would you like to provide app credentials?',
+      msg.step2Credentials,
       [
-        { name: 'Use an existing Lark/Feishu bot app (enter appId + appSecret)', value: 'manual' },
-        { name: 'Create a NEW bot app via QR code', value: 'qr' },
+        { name: msg.step2Manual, value: 'manual' },
+        { name: msg.step2QR, value: 'qr' },
       ],
     );
 
     if (credentialMode === 'qr') {
-      const spinner = ora('Waiting for QR authorization...').start();
+      const spinner = ora(msg.step2WaitingQR).start();
       try {
-        const { createAppViaQR } = await import('./device-auth.js');
+        const { createAppViaQR, sendProbe } = await import('./device-auth.js');
         const result = await createAppViaQR({ openApiDomain });
         appId = result.appId;
         appSecret = result.appSecret;
         if (result.domain === 'lark') openApiDomain = 'open.larksuite.com';
-        spinner.succeed(chalk.green(`App created: ${appId}`));
+        spinner.succeed(chalk.green(`${msg.step2AppCreated}: ${appId}`));
+        // Trigger server-side scope provisioning + release submission
+        await sendProbe(appId, appSecret, openApiDomain).catch(() => {});
       } catch (err: any) {
-        spinner.warn(chalk.yellow(`QR failed: ${err.message}`));
-        appId = await promptInput('appId (required)');
-        if (!appId) { logger.error(chalk.red('Error: appId is required.')); return; }
-        appSecret = await promptInput('appSecret (required)');
-        if (!appSecret) { logger.error(chalk.red('Error: appSecret is required for channel mode.')); return; }
+        spinner.warn(chalk.yellow(`${msg.step2QRFailed}: ${err.message}`));
+        appId = await promptInput(msg.step2AppId);
+        if (!appId) { logger.error(chalk.red(`Error: ${msg.step2AppId}`)); return; }
+        appSecret = await promptInput(msg.step2AppSecret);
+        if (!appSecret) { logger.error(chalk.red(`Error: ${msg.step2AppSecret}`)); return; }
       }
     }
 
     if (credentialMode === 'manual') {
-      appId = await promptInput('appId (required)');
-      if (!appId) { logger.error(chalk.red('Error: appId is required.')); return; }
-      appSecret = await promptInput('appSecret (required)');
-      if (!appSecret) { logger.error(chalk.red('Error: appSecret is required for channel mode.')); return; }
+      appId = await promptInput(msg.step2AppId);
+      if (!appId) { logger.error(chalk.red(`Error: ${msg.step2AppId}`)); return; }
+      appSecret = await promptInput(msg.step2AppSecret);
+      if (!appSecret) { logger.error(chalk.red(`Error: ${msg.step2AppSecret}`)); return; }
     }
   }
 
   if (appSecret) console.log(chalk.gray(`  appSecret: ${maskMiddle(appSecret)}`));
 
   // =========================================================================
-  // Step 3: OAuth PKCE Login
+  // Step 3: Authorize Your Identity (device grant)
   // =========================================================================
 
-  console.log('\nStep 3: Authorize Your Identity');
-  console.log('  OAuth login gives you access to your existing Bitables');
-  console.log('  and records your identity (open_id) in the profile.\n');
+  console.log(`\nStep 3: ${msg.step3Title}`);
+  console.log(`  ${msg.step3Desc}\n`);
 
   let ownerOpenId = process.env.OWNER_OPEN_ID || undefined;
 
   const existingTokens = loadStoredTokens(appId);
   if (existingTokens?.userId) {
     ownerOpenId = existingTokens.userId;
-    console.log(`  ✓ Already authorized as ${ownerOpenId}`);
+    console.log(`  ✓ ${msg.step3Already} ${ownerOpenId}`);
   } else {
-    const doLogin = await promptInput('  Authorize via browser now? [y/N]: ');
-    if (doLogin.toLowerCase() === 'y') {
-      try {
-        await UserTokenProvider.login(appId, openApiDomain);
-        const stored = loadStoredTokens(appId);
-        if (stored?.userId) {
-          ownerOpenId = stored.userId;
-          console.log(`  ✓ Authorized as ${ownerOpenId}`);
-        }
-      } catch (err: any) {
-        console.log(`  ⚠ Authorization failed: ${err.message}`);
-        console.log('  Continuing without identity. Table listing with appSecret may still work.\n');
-      }
+    try {
+      const { deviceGrantLogin } = await import('./device-auth.js');
+      ownerOpenId = await deviceGrantLogin(appId, appSecret, openApiDomain);
+    } catch (err: any) {
+      console.log(`  ⚠ ${msg.step3Failed}: ${err.message}`);
+      console.log(`  ${msg.step3Continue}\n`);
     }
   }
 
@@ -666,10 +674,10 @@ async function setupChannel(profile = 'default'): Promise<void> {
 
   let result: SetupResult;
 
-  console.log('\nStep 4: Bitable Configuration');
+  console.log(`\nStep 4: ${msg.step4Bitable}`);
   const bitableMode = await promptList(
-    'How would you like to set up the bitable?',
-    [{ name: 'Create a new Bitable base automatically', value: 'new' }, { name: 'Use an existing Bitable base', value: 'existing' }],
+    msg.step4Bitable,
+    [{ name: msg.step4CreateNew, value: 'new' }, { name: msg.step4UseExisting, value: 'existing' }],
   );
 
   if (bitableMode === 'new') {
@@ -680,7 +688,7 @@ async function setupChannel(profile = 'default'): Promise<void> {
       return;
     }
     console.log('');
-    const meshName = await promptInput('  Name for the new base [base-mesh]: ');
+    const meshName = await promptInput(`  ${msg.step4Name} [base-mesh]: `);
     result = await createBaseMesh({
       appId, appSecret, openApiDomain, appName: meshName || 'base-mesh',
       ownerOpenId: ownerOpenId,
@@ -689,10 +697,10 @@ async function setupChannel(profile = 'default'): Promise<void> {
   } else {
     // -- Use existing -------------------------------------------------------
     console.log('');
-    const url = await promptInput('  Paste your Bitable URL:\n  > ');
+    const url = await promptInput(`  ${msg.step4URL}:\n  > `);
     const parsed = parseBitableUrl(url);
     if (!parsed) {
-      logger.error('  Error: Could not parse URL. Expected format:');
+      logger.error(`  ${msg.step4ParseError}`);
       logger.error('    https://<org>.larksuite.com/base/<app_token>');
       return;
     }
@@ -801,19 +809,26 @@ async function setupChannel(profile = 'default'): Promise<void> {
   // Summary
   const appUrl = result.appUrl ?? `${openApiDomain === 'open.larksuite.com' ? 'https://bytedance.larksuite.com' : 'https://bytedance.feishu.cn'}/base/${result.appToken}`;
   const configsUrl = `${appUrl}?table=${result.configsTableId}`;
-  console.log('  ── Channel setup complete ──');
+  const devConsoleBase = openApiDomain === 'open.larksuite.com'
+    ? 'https://open.larksuite.com' : 'https://open.feishu.cn';
+  const safeUrl = `${devConsoleBase}/app/${appId}/safe`;
+  console.log(`  ── ${msg.setupComplete} ──`);
   console.log(`  app_token:    ${result.appToken}`);
   console.log(`  tickets:      ${result.ticketsTableId}`);
   console.log(`  turns:        ${result.turnsTableId}`);
   console.log(`  roster:       ${result.rosterTableId}`);
   console.log('');
-  console.log('  Configs table (edit runtime settings):');
+  console.log(`  ${msg.configsTable}`);
   console.log(`    ${configsUrl}`);
-  console.log('    Configure coordinator port, intent LLM, messages, and more here.');
+  console.log(`    ${msg.configsHint}`);
   console.log('');
-  console.log(`  To start the Channel:\n    npx tsx src/cli.ts channel -p ${profile}`);
+  console.log(`  ${msg.startChannel} bam channel -p ${profile}`);
   console.log('');
-  console.log(`  Open in browser:\n    ${appUrl}`);
+  console.log(`  ${msg.openBrowser}\n    ${appUrl}`);
+  console.log('');
+  console.log(chalk.yellow(`  ${msg.redirectURLHint}`));
+  console.log(chalk.yellow(`    ${safeUrl}`));
+  console.log(chalk.yellow('     http://localhost:21721/callback'));
   console.log('');
 
   // Notify owner via Lark IM
@@ -832,8 +847,9 @@ async function setupChannel(profile = 'default'): Promise<void> {
           config: { wide_screen_mode: true },
           header: { title: { tag: 'plain_text', content: '✅ bam setup complete' } },
           elements: [
-            result.configsTableId ? { tag: 'markdown', content: `**Configs table:** [Open](${configsUrl})` } : null,
-            { tag: 'markdown', content: `Start channel: \`bam channel -p ${profile}\`` },
+            result.configsTableId ? { tag: 'markdown', content: `**${msg.configsTable}** [Open](${configsUrl})` } : null,
+            { tag: 'markdown', content: `${msg.startChannel} \`bam channel -p ${profile}\`` },
+            { tag: 'markdown', content: `**${msg.redirectURLLink}**: [${safeUrl}](${safeUrl})` },
           ].filter(Boolean),
         };
         await fetch(`${dc.sdkBaseUrl}/open-apis/im/v1/messages?receive_id_type=open_id`, {
@@ -850,11 +866,11 @@ async function setupChannel(profile = 'default'): Promise<void> {
 // Agent setup — minimal configuration (no Feishu/Bitable)
 // ---------------------------------------------------------------------------
 
-async function setupAgent(profile = 'default'): Promise<void> {
+async function setupAgent(profile = 'default', lang?: SetupLang): Promise<void> {
+  const msg: SetupMessages = MESSAGES[lang || detectLang()];
   console.log('');
   console.log('  ╔══════════════════════════════════════════════════════╗');
-  console.log('  ║              bam — Agent Setup                       ║');
-  console.log('  ║     Connects to a Channel to process tickets        ║');
+  console.log(`  ║          ${msg.agentBanner.padEnd(42)}║`);
   console.log('  ╚══════════════════════════════════════════════════════╝');
   console.log('');
 
@@ -873,11 +889,9 @@ async function setupAgent(profile = 'default'): Promise<void> {
   // Step 1: Channel connection
   // =========================================================================
 
-  console.log(chalk.bold('\nStep 1: Channel Connection'));
-  console.log('  Enter the WebSocket URL of the Channel server to connect to.');
-  console.log('  The Channel operator will provide this address.\n');
+  console.log(chalk.bold(`\nStep 1: ${msg.agentCoordinatorURL}`));
   let coordinatorUrl = def('coordinatorUrl') || def('coordinator_url');
-  coordinatorUrl = await promptInput('  Coordinator WebSocket URL (e.g., ws://192.168.1.100:8765):', coordinatorUrl || 'ws://localhost:8765');
+  coordinatorUrl = await promptInput(`  ${msg.agentCoordinatorURL}:`, coordinatorUrl || 'ws://localhost:8765');
   if (!coordinatorUrl.trim()) {
     logger.error(chalk.red('\n  Error: Coordinator URL is required.'));
     return;
@@ -888,36 +902,34 @@ async function setupAgent(profile = 'default'): Promise<void> {
   // Step 2: Agent Identity
   // =========================================================================
 
-  console.log(chalk.bold('\nStep 2: Agent Identity'));
+  console.log(chalk.bold(`\nStep 2: ${msg.agentIdentity}`));
   const { hostname } = await import('node:os');
   const defaultIdentity = `${process.env.USER ?? 'agent'}@${hostname()}`;
   let identity = def('clientId') || def('identity');
-  identity = await promptInput('  Agent identity (used for registration on Channel):', identity || defaultIdentity);
+  identity = await promptInput(`  ${msg.agentIdentity}:`, identity || defaultIdentity);
   if (!identity.trim()) identity = defaultIdentity;
-  console.log(chalk.cyan(`  → Identity: ${identity}`));
+  console.log(chalk.cyan(`  → ${identity}`));
 
   // =========================================================================
   // Step 3: Domains
   // =========================================================================
 
-  console.log(chalk.bold('\nStep 3: Capability Domains'));
-  console.log('  List the domains you want this agent to handle.');
-  console.log('  Comma-separated, e.g.: tech_support, billing, api\n');
+  console.log(chalk.bold(`\nStep 3: ${msg.agentDomains}`));
   let domainsStr = def('domains', 'general');
   if (Array.isArray(existingExecutor?.domains)) {
     domainsStr = (existingExecutor.domains as string[]).join(', ');
   }
-  domainsStr = await promptInput('  Domains:', domainsStr);
+  domainsStr = await promptInput(`  ${msg.agentDomains}:`, domainsStr);
   const domains = domainsStr.split(',').map(s => s.trim()).filter(Boolean);
-  console.log(chalk.cyan(`  → Domains: ${domains.join(', ') || 'general'}`));
+  console.log(chalk.cyan(`  → ${domains.join(', ') || 'general'}`));
 
   // =========================================================================
   // Step 4: Claude Configuration
   // =========================================================================
 
-  console.log(chalk.bold('\nStep 4: Claude Configuration'));
+  console.log(chalk.bold(`\nStep 4: ${msg.agentPrompt}`));
   const sessionDir = await promptInput(
-    '  Session storage directory:',
+    `  ${msg.agentSessionDir}:`,
     def('sessionDir') || join(homedir(), '.bam', 'claude', 'sessions'),
   );
   const prompt = await promptInput(
@@ -965,12 +977,12 @@ async function setupAgent(profile = 'default'): Promise<void> {
   console.log(`  ✓ Profile saved to ${savedPath}`);
   console.log('');
 
-  console.log('  ── Agent setup complete ──');
+  console.log(`  ── ${msg.agentSetupComplete} ──`);
   console.log(`  coordinatorUrl: ${coordinatorUrl}`);
   console.log(`  identity:       ${identity}`);
   console.log(`  domains:        ${domains.join(', ') || 'general'}`);
   console.log('');
-  console.log(`  To start the Agent:\n    npx tsx src/cli.ts join -p ${profile}`);
+  console.log(`  ${msg.agentStartCmd}\n    npx tsx src/cli.ts join -p ${profile}`);
   console.log('');
 }
 
