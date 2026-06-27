@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 
 import { join } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import { parse as parseToml, stringify as stringifyToml } from 'smol-toml';
-import { Config, FieldMapping, StatusMapping, RoundStatusMapping, ChannelConfig, OperatorConfig, CoordinatorConfig, ExecutorConfig, MessagesConfig, DomainConfig } from './types.js';
+import { Config, FieldMapping, StatusMapping, RoundStatusMapping, ChannelConfig, OperatorConfig, CoordinatorConfig, ExecutorConfig, MessagesConfig, DomainConfig, BackendConfig } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Profile path
@@ -364,7 +364,6 @@ export function loadConfig(profile = 'default'): Config {
       const dd = parseDomainConfig(rawExecutor?.default_domain as Record<string, unknown> | undefined) || {};
       // Merge legacy top-level AI config fields into defaultDomain
       if (!dd.command && rawExecutor?.aiCommand) dd.command = String(rawExecutor.aiCommand);
-      if (!dd.promptFlag && rawExecutor?.aiPromptFlag) dd.promptFlag = String(rawExecutor.aiPromptFlag);
       if (!dd.args && rawExecutor?.claudeArgs) dd.args = rawExecutor.claudeArgs as string[];
       if (dd.timeout === undefined && rawExecutor?.claudeTimeout !== undefined) dd.timeout = Number(rawExecutor.claudeTimeout);
       return Object.keys(dd).length > 0 ? dd : undefined;
@@ -436,13 +435,28 @@ export function loadConfig(profile = 'default'): Config {
 function parseDomainConfig(raw: Record<string, unknown> | undefined): DomainConfig | undefined {
   if (!raw) return undefined;
   const r: DomainConfig = {};
+  if (typeof raw.backend === 'string') r.backend = raw.backend;
+  if (raw.backends && typeof raw.backends === 'object' && !Array.isArray(raw.backends)) {
+    r.backends = {};
+    for (const [bk, bv] of Object.entries(raw.backends as Record<string, unknown>)) {
+      if (bv && typeof bv === 'object' && !Array.isArray(bv)) {
+        const bc = bv as Record<string, unknown>;
+        const b: BackendConfig = {};
+        if (typeof bc.command === 'string') b.command = bc.command;
+        if (typeof bc.model === 'string') b.model = bc.model;
+        if (typeof bc.timeout === 'number') b.timeout = bc.timeout;
+        if (Array.isArray(bc.args)) b.args = bc.args as string[];
+        if (typeof bc.env === 'object' && !Array.isArray(bc.env)) b.env = bc.env as Record<string, string>;
+        if (Object.keys(b).length > 0) r.backends[bk] = b;
+      }
+    }
+  }
   if (typeof raw.system_prompt === 'string') r.systemPrompt = raw.system_prompt;
   if (typeof raw.security_prompt === 'string') r.securityPrompt = raw.security_prompt;
   if (Array.isArray(raw.allowed_tools)) r.allowedTools = raw.allowed_tools as string[];
   if (Array.isArray(raw.disallowed_tools)) r.disallowedTools = raw.disallowed_tools as string[];
   if (Array.isArray(raw.args)) r.args = raw.args as string[];
   if (typeof raw.command === 'string') r.command = raw.command;
-  if (typeof raw.prompt_flag === 'string') r.promptFlag = raw.prompt_flag;
   if (typeof raw.permission_mode === 'string') r.permissionMode = raw.permission_mode;
   if (typeof raw.timeout === 'number') r.timeout = raw.timeout;
   if (typeof raw.max_retries === 'number') r.maxRetries = raw.max_retries;

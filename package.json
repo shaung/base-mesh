@@ -51,6 +51,7 @@
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.62.1",
     "@types/ws": "^8.18.1",
+    "@typooo/kekkai": "^0.0.1",
     "chalk": "^5.6.2",
     "inquirer": "^13.4.3",
     "ora": "^9.4.0",

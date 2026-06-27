@@ -447,6 +447,8 @@ export async function createBaseMesh(opts: SetupOptions): Promise<SetupResult> {
     { section: 'coordinator', key: 'session_ttl_days', default: '30', type: 'number', description: '' },
     { section: 'coordinator', key: 'default_hitl_policy', default: 'off', type: 'string', description: '' },
     { section: 'coordinator', key: 'global_prompt', default: 'You are a support agent in an async collaboration system.', type: 'string', description: '' },
+    { section: 'coordinator', key: 'stream_output', default: 'false', type: 'boolean', description: 'Enable streaming output (typewriter card effect)' },
+    { section: 'coordinator', key: 'stream_thinking', default: 'false', type: 'boolean', description: 'Include thinking process in streaming output (as quote blocks)' },
     // coordinator.a2a
     { section: 'coordinator.a2a', key: 'enabled', default: 'false', type: 'boolean', description: '' },
     { section: 'coordinator.a2a', key: 'base_url', default: '', type: 'string', description: '' },
@@ -526,10 +528,6 @@ export async function interactiveSetup(profile = 'default', mode?: 'channel' | '
   // Step 0: Language selection
   if (!lang) {
     console.log('');
-    console.log('  ╔══════════════════════════════════════════════════════╗');
-    console.log('  ║             bam Setup Wizard                        ║');
-    console.log('  ╚══════════════════════════════════════════════════════╝');
-    console.log('');
     lang = await promptList('Select language / 选择语言 / 言語を選択:', [
       { name: 'English', value: 'en' },
       { name: '中文', value: 'zh' },
@@ -563,12 +561,6 @@ export async function interactiveSetup(profile = 'default', mode?: 'channel' | '
 
 async function setupChannel(profile = 'default', lang?: SetupLang): Promise<void> {
   const msg: SetupMessages = MESSAGES[lang || detectLang()];
-  console.log('');
-  console.log('  ╔══════════════════════════════════════════════════════╗');
-  console.log(`  ║          ${msg.channelBanner.padEnd(42)}║`);
-  console.log('  ╚══════════════════════════════════════════════════════╝');
-  console.log('');
-
   // Load existing profile for defaults
   const { readProfile: readExistingProfile } = await import('./config.js');
   let existingProfile: Record<string, unknown> = {};
@@ -868,12 +860,6 @@ async function setupChannel(profile = 'default', lang?: SetupLang): Promise<void
 
 async function setupAgent(profile = 'default', lang?: SetupLang): Promise<void> {
   const msg: SetupMessages = MESSAGES[lang || detectLang()];
-  console.log('');
-  console.log('  ╔══════════════════════════════════════════════════════╗');
-  console.log(`  ║          ${msg.agentBanner.padEnd(42)}║`);
-  console.log('  ╚══════════════════════════════════════════════════════╝');
-  console.log('');
-
   // Load existing profile for defaults
   const { readProfile: readExistingProfile } = await import('./config.js');
   let existingProfile: Record<string, unknown> = {};

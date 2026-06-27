@@ -2,7 +2,7 @@ import { logger } from './log.js';
 import { Config, BitableRecord, Part, FilePart, ProcessContext } from './types.js';
 import { extractText } from './text.js';
 import { FLD } from './fields.js';
-import { ClaudeProcessor } from './processor.js';
+import { KekkaiProcessor } from './processor.js';
 import { spawn } from 'node:child_process';
 import { mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -12,15 +12,15 @@ import { startDashboard } from './dashboard.js';
 
 // ---------------------------------------------------------------------------
 // Executor — push-mode only. Connects to Channel via WebSocket, receives
-// tasks, runs Claude, reports results. No direct Bitable API access.
+// tasks, runs AI backend via KekkaiProcessor, reports results.
 // ---------------------------------------------------------------------------
 
 export class Executor {
-  private processor: ClaudeProcessor;
+  private processor: KekkaiProcessor;
   private running = true;
 
   constructor(private cfg: Config) {
-    this.processor = new ClaudeProcessor(cfg);
+    this.processor = new KekkaiProcessor(cfg);
   }
 
   async run(): Promise<void> {
@@ -32,7 +32,6 @@ export class Executor {
       process.exit(1);
     }
 
-    // Start dashboard if sessionDir is configured
     const sessionDir = this.cfg.executor?.sessionDir;
     if (sessionDir) {
       startDashboard(sessionDir, 3456);
@@ -48,10 +47,9 @@ export class Executor {
     const prompt = `Describe your capabilities as a support agent in under 500 characters. Include your expertise domains, available tools, and response style. Output only the description text, no JSON, no markdown.`;
     const dd = this.cfg.executor?.defaultDomain;
     const aiCmd = dd?.command ?? 'claude';
-    const promptFlag = dd?.promptFlag ?? '-p';
     const args = dd?.args ?? [];
     return new Promise((resolve) => {
-      const proc = spawn(aiCmd, [promptFlag, prompt, '--max-tokens', '200', ...args], {
+      const proc = spawn(aiCmd, ['-p', prompt, '--max-tokens', '200', ...args], {
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: 30_000,
       });
@@ -149,30 +147,54 @@ export class Executor {
             const round = msg.round as { record_id?: string; supplementPrompt?: string; fields?: Record<string, unknown> } | undefined;
             const currentRoundId = round?.record_id || '';
             const supplementPrompt = round?.supplementPrompt || '';
-            // Extract required abilities from round fields for per-ability config selection
             const roundFields = round?.fields;
             const domainsRaw = roundFields ? String(roundFields[FLD.domains] ?? '') : '';
             const domainsList: string[] = domainsRaw ? (() => { try { const p = JSON.parse(domainsRaw); return Array.isArray(p) ? p.map(String) : []; } catch { return []; } })() : [];
+            let streamOutput = false;
+            let streamThinking = false;
             try {
+              streamOutput = (msg.stream_output as boolean) === true && !!rootMsgId;
+              streamThinking = (msg.stream_thinking as boolean) === true;
               const downloadedAttachments = await this.downloadAttachments(turns);
-              const ctx: ProcessContext = { ticket, turns, config: this.cfg, globalPrompt, roundSupplementPrompt: supplementPrompt, roundId: currentRoundId || undefined, domains: domainsList.length > 0 ? domainsList : undefined, downloadedAttachments };
+              const ctx: ProcessContext = {
+                ticket, turns, config: this.cfg, globalPrompt,
+                roundSupplementPrompt: supplementPrompt,
+                roundId: currentRoundId || undefined,
+                domains: domainsList.length > 0 ? domainsList : undefined,
+                downloadedAttachments,
+                onStream: streamOutput ? (content: string, type?: string) => {
+                  try { currentWs?.send(JSON.stringify({ type: 'stream_update', ticket_id: recordId, round_id: currentRoundId, root_msg_id: rootMsgId, content, content_type: type === 'thinking' && streamThinking ? 'thinking' : 'message' })); } catch {}
+                } : undefined,
+              };
               console.log(`[executor] prompt: global=${!!globalPrompt} system=${!!this.cfg.executor?.prompt} turns=${turns.length}${currentRoundId ? ` round=${currentRoundId}` : ''}`);
-              console.log(`[executor] running claude for ticket=${recordId}`);
+              console.log(`[executor] processing ticket=${recordId} streamOutput=${streamOutput}`);
               const result = await this.processor.process(ctx);
-              console.log(`[executor] claude done ticket=${recordId} answer=${(result?.answer || '').slice(0, 60)}`);
+              console.log(`[executor] done ticket=${recordId} answer=${(result?.answer || '').slice(0, 60)}`);
+              const finalAnswer = result?.answer || '(processing error)';
+              // Send stream_end to close the typewriter card (with error content if failed)
+              if (streamOutput) {
+                try { currentWs?.send(JSON.stringify({ type: 'stream_end', ticket_id: recordId, round_id: currentRoundId, content: finalAnswer, duration_ms: result?.durationMs, token_usage: result?.tokenUsage })); } catch {}
+              }
               this.cleanupAttachments(downloadedAttachments);
               currentWs?.send(JSON.stringify({
                 type: 'result', ticket_id: recordId,
                 round_id: currentRoundId,
-                answer: result?.answer || '(processing error)',
+                answer: finalAnswer,
                 newSummary: result?.newSummary || '',
                 root_msg_id: rootMsgId,
+                // Only mark streamed when streaming was actually active
+                // (not on retry where onStream was undefined, not on error where no stream was sent)
+                streamed: streamOutput && !!result?.answer && !result?.retried,
                 reassignTo: result?.reassignTo,
                 parts: result?.parts ?? [],
               }));
             } catch (err) {
               logger.error(`[executor] push task error ticket=${recordId}:`, err instanceof Error ? err.message : err);
-              currentWs?.send(JSON.stringify({ type: 'result', ticket_id: recordId, round_id: currentRoundId, answer: `(processing error): ${err instanceof Error ? err.message : String(err)}`, newSummary: '', root_msg_id: rootMsgId, parts: [] }));
+              const errorMsg = `(processing error): ${err instanceof Error ? err.message : String(err)}`;
+              if (streamOutput) {
+                try { currentWs?.send(JSON.stringify({ type: 'stream_end', ticket_id: recordId, round_id: currentRoundId, content: errorMsg })); } catch {}
+              }
+              currentWs?.send(JSON.stringify({ type: 'result', ticket_id: recordId, round_id: currentRoundId, answer: errorMsg, newSummary: '', root_msg_id: rootMsgId, parts: [], streamed: false }));
             }
           }
         } catch { /* malformed */ }

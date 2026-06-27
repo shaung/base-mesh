@@ -240,6 +240,8 @@ function html(sessionDir: string): string {
       else if (e.subtype === 'compact_boundary') { lbl = 'Context compacted'; det = e.content || S(e.compactMetadata, 500); }
       else if (e.subtype === 'informational') { lbl = 'Info'; det = e.content || ''; }
       else { lbl = 'System' + (e.subtype ? ': ' + e.subtype : ''); det = e.content || S(e, 1000); }
+    } else if (e.type === 'status') {
+      return '';
     } else {
       lbl = e.type || 'event';
       det = S(e, 3000);

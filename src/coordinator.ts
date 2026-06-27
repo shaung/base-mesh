@@ -26,7 +26,14 @@ export class Coordinator {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private roundPollTimer: ReturnType<typeof setInterval> | null = null;
   private inflightRounds = new Map<string, Promise<void>>();
-
+  /** Streaming card state per ticket (cardId + sequence). */
+  private streamingCards = new Map<string, { cardId: string; seq: number }>();
+  /** Buffered content for cards being created (key → pending updates). */
+  private streamBuffer = new Map<string, Array<{ content: string; type: string }>>();
+  /** Accumulated thinking content per card key (for final result update). */
+  private streamThinkingAccumulated = new Map<string, string>();
+  /** Accumulated answer content per card key (for final result update). */
+  private streamAnswerAccumulated = new Map<string, string>();
   constructor(private cfg: Config) {
     this.bitable = new BitableClient(cfg);
     this.session = new Session('channel', 'Channel', cfg, this.bitable);
@@ -146,6 +153,150 @@ export class Coordinator {
           return;
         }
 
+        // ── Streaming output ──────────────────────────────────
+        if (type === 'stream_update' && this.cfg.coordinator?.streamOutput) {
+          const ticketId = msg.ticket_id as string;
+          const roundId = msg.round_id as string || '';
+          const cardKey = roundId || ticketId;
+          const content = msg.content as string || '';
+          const rootMsgId = msg.root_msg_id as string;
+          const contentType = msg.content_type as string || 'message';
+          if (!this.streamingCards.has(cardKey) && rootMsgId) {
+            // Buffer content and set placeholder so stream_end can find us
+            const buf = this.streamBuffer.get(cardKey) || [];
+            buf.push({ content, type: contentType });
+            this.streamBuffer.set(cardKey, buf);
+            if (buf.length > 1) return;
+            this.streamingCards.set(cardKey, { cardId: '', seq: 0 });
+            try {
+              const cardSpec = {
+                schema: '2.0',
+                config: { streaming_mode: true, summary: { content: '[Generating...]' }, streaming_config: { print_frequency_ms: { default: 70 }, print_step: { default: 1 }, print_strategy: 'fast' } },
+                body: { elements: [
+                  { tag: 'markdown', element_id: 'stream_thinking', content: '', text_size: 'text_size_note' },
+                  { tag: 'markdown', element_id: 'stream_answer', content: '...' },
+                  { tag: 'markdown', element_id: 'stream_stats', content: '', text_size: 'body' },
+                ] },
+              };
+              const cardResp = await this.client.cardkit.v1.card.create({ data: { type: 'card_json', data: JSON.stringify(cardSpec) } }) as any;
+              const cardId = cardResp?.data?.card_id;
+              if (!cardId) { this.streamingCards.delete(cardKey); this.streamBuffer.delete(cardKey); return; }
+              const sendResp = await this.client.im.v1.message.reply({ path: { message_id: rootMsgId }, data: { msg_type: 'interactive', content: JSON.stringify({ type: 'card', data: { card_id: cardId } }), reply_in_thread: true } as any }) as any;
+              if (!sendResp?.data?.message_id) { this.streamingCards.delete(cardKey); this.streamBuffer.delete(cardKey); return; }
+              // Update placeholder with real cardId
+              const st = this.streamingCards.get(cardKey);
+              if (st) st.cardId = cardId;
+              console.log(`[coordinator] stream: created card ${cardId} for ${roundId ? `round ${roundId}` : `ticket ${ticketId}`}`);
+              // Flush buffered content to respective elements
+              const pending = this.streamBuffer.get(cardKey) || [];
+              this.streamBuffer.delete(cardKey);
+              let thinkingFull = '';
+              let answerFull = '';
+              for (const chunk of pending) {
+                if (chunk.type === 'thinking') {
+                  const sep = thinkingFull ? '\n' : '';
+                  thinkingFull += sep + '> ' + chunk.content.replace(/\n/g, '\n> ');
+                } else {
+                  const sep = answerFull ? '\n' : '';
+                  answerFull += sep + chunk.content;
+                }
+              }
+              const st2 = this.streamingCards.get(cardKey);
+              if (thinkingFull && st2) {
+                st2.seq++;
+                try { await this.client.cardkit.v1.cardElement.content({ path: { card_id: cardId, element_id: 'stream_thinking' }, data: { content: thinkingFull, sequence: st2.seq, uuid: `t_${cardId}_${st2.seq}` } }); } catch {}
+              }
+              if (answerFull && st2) {
+                st2.seq++;
+                try { await this.client.cardkit.v1.cardElement.content({ path: { card_id: cardId, element_id: 'stream_answer' }, data: { content: answerFull, sequence: st2.seq, uuid: `a_${cardId}_${st2.seq}` } }); } catch {}
+              }
+              this.streamThinkingAccumulated.set(cardKey, thinkingFull);
+              this.streamAnswerAccumulated.set(cardKey, answerFull);
+            } catch { this.streamBuffer.delete(cardKey); return; }
+            return;
+          }
+          const s = this.streamingCards.get(cardKey);
+          if (s) {
+            if (contentType === 'thinking') {
+              const display = '> ' + content.replace(/\n/g, '\n> ');
+              const prev = this.streamThinkingAccumulated.get(cardKey) || '';
+              const sep = prev && !prev.endsWith('\n') ? '\n' : '';
+              const full = prev + sep + display;
+              this.streamThinkingAccumulated.set(cardKey, full);
+              s.seq++;
+              try { await this.client.cardkit.v1.cardElement.content({ path: { card_id: s.cardId, element_id: 'stream_thinking' }, data: { content: full, sequence: s.seq, uuid: `st_${s.cardId}_${s.seq}` } }); } catch {}
+            } else {
+              const prev = this.streamAnswerAccumulated.get(cardKey) || '';
+              const sep = prev && !prev.endsWith('\n') ? '\n' : '';
+              const full = prev + sep + content;
+              this.streamAnswerAccumulated.set(cardKey, full);
+              s.seq++;
+              try { await this.client.cardkit.v1.cardElement.content({ path: { card_id: s.cardId, element_id: 'stream_answer' }, data: { content: full, sequence: s.seq, uuid: `sa_${s.cardId}_${s.seq}` } }); } catch {}
+            }
+          }
+          return;
+        }
+
+        if (type === 'stream_end' && this.cfg.coordinator?.streamOutput) {
+          const ticketId = msg.ticket_id as string;
+          const roundId = msg.round_id as string || '';
+          const cardKey = roundId || ticketId;
+          const content = msg.content as string || '';
+          const durationMs = msg.duration_ms as number | undefined;
+          const tokenUsage = msg.token_usage as { input?: number; output?: number } | undefined;
+          const s = this.streamingCards.get(cardKey);
+          if (s && !s.cardId && this.streamBuffer.has(cardKey)) {
+            // Card creation still in progress — add end content to buffer
+            this.streamBuffer.get(cardKey)!.push({ content, type: 'message' });
+            return;
+          }
+          if (s && s.cardId) {
+            // Finalize both elements, then close streaming mode.
+            const thinkingContent = this.streamThinkingAccumulated.get(cardKey) || '';
+            const answerContent = this.streamAnswerAccumulated.get(cardKey) || content;
+            if (thinkingContent) {
+              s.seq++;
+              try { await this.client.cardkit.v1.cardElement.content({ path: { card_id: s.cardId, element_id: 'stream_thinking' }, data: { content: thinkingContent, sequence: s.seq, uuid: `ft_${s.cardId}_${s.seq}` } }); } catch { /* best-effort */ }
+            }
+            if (answerContent) {
+              s.seq++;
+              try { await this.client.cardkit.v1.cardElement.content({ path: { card_id: s.cardId, element_id: 'stream_answer' }, data: { content: answerContent, sequence: s.seq, uuid: `fa_${s.cardId}_${s.seq}` } }); } catch { /* best-effort */ }
+            }
+            // Append stats line (token usage + duration) in a separate element
+            const statsParts: string[] = [];
+            if (tokenUsage) {
+              const total = (tokenUsage.input || 0) + (tokenUsage.output || 0);
+              if (total > 0) statsParts.push(`⚡ ${total.toLocaleString()} tokens`);
+            }
+            if (durationMs && durationMs > 100) {
+              statsParts.push(`${(durationMs / 1000).toFixed(1)}s`);
+            }
+            if (statsParts.length > 0) {
+              s.seq++;
+              const statsText = `— *${statsParts.join(' · ')}* —`;
+              try { await this.client.cardkit.v1.cardElement.content({ path: { card_id: s.cardId, element_id: 'stream_stats' }, data: { content: statsText, sequence: s.seq, uuid: `ss_${s.cardId}_${s.seq}` } }); } catch { /* best-effort */ }
+            }
+            try {
+              const settingsData = {
+                path: { card_id: s.cardId },
+                data: {
+                  settings: JSON.stringify({
+                    config: { streaming_mode: false, summary: { content: (answerContent || thinkingContent).slice(0, 50) || '[Done]' } },
+                  }),
+                  sequence: ++s.seq,
+                  uuid: `c_${s.cardId}_${s.seq}`,
+                },
+              };
+              await this.client.cardkit.v1.card.settings(settingsData);
+            } catch { /* best-effort */ }
+            this.streamingCards.delete(cardKey);
+            this.streamThinkingAccumulated.delete(cardKey);
+            this.streamAnswerAccumulated.delete(cardKey);
+          }
+          this.streamBuffer.delete(cardKey);
+          // Fall through to type: 'result' for Bitable writes
+        }
+
         if (type === 'result') {
           const ticketId = msg.ticket_id as string;
           const roundId = msg.round_id as string | undefined;
@@ -159,14 +310,11 @@ export class Coordinator {
           try {
             const turnId = await this.session.appendTurn(ticketId, 'agent', answer, `${ticketId}_${Date.now()}`, identity, 'answered', rootMsgId, roundId, parts, 1);
             console.log(`[coordinator] agent turn written ticket=${ticketId} turnId=${turnId}`);
-            // Deliver to IM directly. Turn is created with notified=1 so
-            // channel/operator polling won't race and duplicate delivery.
-            if (answer && rootMsgId) {
+            if (answer && rootMsgId && !msg.streamed) {
               try {
                 await this.notifyIM(rootMsgId, answer);
               } catch (imErr) {
                 logger.error(`[coordinator] direct IM delivery failed ticket=${ticketId}:`, imErr instanceof Error ? imErr.message : imErr);
-                // Re-open for channel/operator fallback
                 if (turnId) try { await this.bitable.updateRecord(this.cfg.turnsTableId, turnId, { [this.cfg.fields.turn.notified]: 0 }); } catch { /* */ }
               }
             }
@@ -289,6 +437,8 @@ export class Coordinator {
       type: 'task', ticket: { record_id: recordId, fields: ticket.fields },
       turns: turns.map(t => ({ record_id: t.record_id, fields: t.fields })),
       globalPrompt: this.cfg.coordinator?.globalPrompt || '',
+      stream_output: this.cfg.coordinator?.streamOutput === true,
+      stream_thinking: this.cfg.coordinator?.streamThinking === true,
     }));
 
     // React to the latest user turn message, not the thread root
@@ -572,6 +722,8 @@ export class Coordinator {
       ticket: { record_id: recordId, fields: ticket.fields },
       turns: turns.map(t => ({ record_id: t.record_id, fields: t.fields })),
       globalPrompt: this.cfg.coordinator?.globalPrompt || '',
+      stream_output: this.cfg.coordinator?.streamOutput === true,
+      stream_thinking: this.cfg.coordinator?.streamThinking === true,
       round: {
         record_id: round.record_id,
         fields: round.fields,
@@ -608,10 +760,19 @@ export class Coordinator {
   }
 
   /** Process a stuck Round (executing with expired lease).
-   *  Only reverts if the assigned executor is no longer connected. */
+   *  Only reverts if the assigned executor is no longer connected AND the
+   *  round has been executing longer than the stuck timeout. */
   private async processStuckRound(round: BitableRecord): Promise<void> {
     const roundId = round.record_id;
     if (!roundId) return;
+
+    // Don't revert rounds that haven't been executing long enough
+    const stuckTimeout = (this.cfg.coordinator?.heartbeatSeconds ?? 60) * 2000;
+    const updatedAt = Number(round.fields[this.cfg.fields.round.updatedAt] ?? 0);
+    if (updatedAt > 0 && Date.now() - updatedAt < stuckTimeout) {
+      return;
+    }
+
     // Check if the executor assigned to this Round is still connected
     const executorField = String(round.fields[this.cfg.fields.round.executor] ?? '');
     const identity = executorField.includes('#') ? executorField.split('#').pop()! : executorField;

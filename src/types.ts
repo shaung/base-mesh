@@ -226,6 +226,10 @@ export interface CoordinatorConfig {
   globalPrompt?: string;
   /** Enable file proxy endpoint GET /files/{file_token} (default true). */
   fileProxyEnabled?: boolean;
+  /** Enable streaming output (typewriter card effect via CardKit). */
+  streamOutput?: boolean;
+  /** When streaming, also output thinking process as quote blocks. */
+  streamThinking?: boolean;
   /** A2A Server configuration for external agent interop. */
   a2a?: A2AServerConfig;
   /** S3 configuration for external file sharing. */
@@ -256,16 +260,31 @@ export interface RoleDef {
   prompt?: string;
 }
 
-/** Per-domain Claude execution configuration. All fields optional — missing
- *  values are inherited from the Executor's default_domain config. */
+/** Per-backend configuration (maps to Kekkai's BackendConfig). */
+export interface BackendConfig {
+  command?: string;
+  model?: string;
+  timeout?: number;
+  args?: string[];
+  env?: Record<string, string>;
+}
+
+/** Per-domain execution configuration. All fields optional — missing
+ *  values are inherited from the Executor's default_domain config.
+ *  New-style: domain.backend + domain.backends.<name> for Kekkai.
+ *  Legacy Claude-specific fields kept for backward compat, converted
+ *  to CLI args by resolveDomainConfig(). */
 export interface DomainConfig {
+  /** Default backend name for this domain (e.g. "claude", "codex"). */
+  backend?: string;
+  /** Per-backend configuration, keyed by backend name. */
+  backends?: Record<string, BackendConfig>;
   systemPrompt?: string;
   securityPrompt?: string;
   allowedTools?: string[];
   disallowedTools?: string[];
   args?: string[];
   command?: string;
-  promptFlag?: string;
   permissionMode?: string;
   timeout?: number;
   maxRetries?: number;
@@ -421,6 +440,9 @@ export interface ProcessContext {
   domains?: string[];
   /** Downloaded attachments: file_token → local file path, for multimodal model input. */
   downloadedAttachments?: Record<string, string>;
+  /** Optional callback for streaming output chunks. Called with each chunk
+   *  of content as it becomes available from Kekkai.stream(). */
+  onStream?: (content: string, type?: StreamContentType) => void;
 }
 
 export interface ProcessResult {
@@ -430,7 +452,19 @@ export interface ProcessResult {
   /** A2A structured output parts (text, file references, data). */
   parts?: Part[];
   reassignTo?: { roles?: string[]; kind?: string };
+  /** Set to true when processing was retried without streaming (e.g. session resume failed). */
+  retried?: boolean;
+  /** Execution duration in milliseconds. */
+  durationMs?: number;
+  /** Token usage breakdown from the backend. */
+  tokenUsage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
 }
+
+export interface Processor {
+  process(ctx: ProcessContext): Promise<ProcessResult | null>;
+}
+
+export type StreamContentType = 'message' | 'thinking';
 
 export interface CompletenessCheckResult {
   isComplete: boolean;
@@ -438,6 +472,3 @@ export interface CompletenessCheckResult {
   missingFields: string[];
 }
 
-export interface Processor {
-  process(ctx: ProcessContext): Promise<ProcessResult | null>;
-}
