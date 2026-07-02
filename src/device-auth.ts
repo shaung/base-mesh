@@ -196,6 +196,7 @@ export async function deviceGrantLogin(
     if (tokenData.access_token) {
       // 4. Get user info
       let userId: string | undefined;
+      let unionId: string | undefined;
       let userName: string | undefined;
       try {
         const userResp = await fetch(`${apiBase}/open-apis/authen/v1/user_info`, {
@@ -205,6 +206,7 @@ export async function deviceGrantLogin(
           const userData = (await userResp.json()) as Record<string, unknown>;
           const d = userData.data as Record<string, unknown> ?? userData;
           userId = (d.open_id ?? d.user_id) as string | undefined;
+          unionId = (d.union_id) as string | undefined;
           userName = (d.name) as string | undefined;
         }
       } catch { /* best-effort */ }
@@ -216,6 +218,7 @@ export async function deviceGrantLogin(
         expiresAt: Date.now() + ((tokenData.expires_in as number) ?? 7200) * 1000,
         scope: tokenData.scope as string,
         userId,
+        unionId,
         userName,
         openApiDomain,
       });

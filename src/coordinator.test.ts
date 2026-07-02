@@ -146,6 +146,7 @@ function makeCoordinatorConfig(): Config {
         human: 'f_human', deliveryOwner: 'f_delivery_owner',
         deliveryLeaseAt: 'f_delivery_lease_at', createdAt: 'f_created_at',
         notified: 'f_notified', metadata: 'f_metadata', updatedAt: 'f_updated_at',
+        appId: 'f_app_id',
       },
       roster: {
         identity: 'f_identity', nickname: 'f_nickname', kind: 'f_kind',
@@ -160,7 +161,8 @@ function makeCoordinatorConfig(): Config {
         ticketRecordId: 'f_r_ticket_id', domains: 'f_r_abilities', status: 'f_r_status',
         executor: 'f_r_executor', reviewer: 'f_r_reviewer',
         reviewComment: 'f_r_review_comment', supplementPrompt: 'f_r_supplement_prompt',
-        result: 'f_r_result', createdAt: 'f_r_created_at', updatedAt: 'f_r_updated_at',
+        result: 'f_r_result', input: 'f_r_input', createdAt: 'f_r_created_at',
+        updatedAt: 'f_r_updated_at', appId: 'f_r_app_id',
       },
     },
     statuses: {
@@ -193,7 +195,7 @@ async function createTicket(cfg: Config): Promise<BitableRecord> {
   return ticket;
 }
 
-async function createRound(cfg: Config, ticketRecordId: string, status?: string): Promise<BitableRecord> {
+async function createRound(cfg: Config, ticketRecordId: string, status?: string, overrides?: Record<string, unknown>): Promise<BitableRecord> {
   const bitable = new (BitableClient as any)(cfg) as any;
   const round = await bitable.createRecord(cfg.roundsTableId!, {
     [cfg.fields.round.ticketRecordId]: ticketRecordId,
@@ -201,6 +203,7 @@ async function createRound(cfg: Config, ticketRecordId: string, status?: string)
     [cfg.fields.round.executor]: '',
     [cfg.fields.round.createdAt]: Date.now(),
     [cfg.fields.round.updatedAt]: Date.now(),
+    ...(overrides ?? {}),
   });
   return round;
 }
@@ -370,7 +373,9 @@ describe('Coordinator — Round state machine', () => {
     it('reverts stuck executing round to pending', async () => {
       const bitable = new (BitableClient as any)(cfg) as any;
       const ticket = await createTicket(cfg);
-      const round = await createRound(cfg, ticket.record_id, cfg.roundStatuses.executing);
+      const round = await createRound(cfg, ticket.record_id, cfg.roundStatuses.executing, {
+        [cfg.fields.round.updatedAt]: Date.now() - 300_000, // 5 min old = past stuck timeout
+      });
 
       await (coordinator as any)['processStuckRound'](round);
 

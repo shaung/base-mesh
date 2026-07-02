@@ -247,6 +247,7 @@ async function exchangeCode(
   }
 
   let userId = data.open_id || undefined;
+  let unionId = data.union_id || undefined;
   let userName = data.name || undefined;
 
   // If the token response didn't include user info, fetch it separately
@@ -258,6 +259,7 @@ async function exchangeCode(
       if (userResp.ok) {
         const userData = await userResp.json() as any;
         userId = userData.data?.open_id || userData.open_id || undefined;
+        unionId = userData.data?.union_id || userData.union_id || undefined;
         userName = userData.data?.name || userData.name || undefined;
       }
     } catch { /* user_info is best-effort */ }
@@ -269,6 +271,7 @@ async function exchangeCode(
     expiresAt: Date.now() + (data.expires_in ?? 7200) * 1000,
     scope: data.scope,
     userId,
+    unionId,
     userName,
     openApiDomain: dc.open,
   };

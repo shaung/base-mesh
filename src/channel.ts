@@ -1,6 +1,6 @@
 import { logger } from './log.js';
 import { Client, WSClient, EventDispatcher } from '@larksuiteoapi/node-sdk';
-import { Config, BitableRecord, Part } from './types.js';
+import { Config, BitableRecord, Part, BotConfig } from './types.js';
 import { parsePostToParts } from './message-parser.js';
 import { BitableClient } from './bitable.js';
 import { Session } from './protocol.js';
@@ -12,10 +12,25 @@ import { Coordinator } from './coordinator.js';
 const DEFAULT_EMOJI = 'OneSecond';
 
 // ---------------------------------------------------------------------------
+// Per-operator client state
+// ---------------------------------------------------------------------------
+
+interface OperatorClient {
+  wsClient: WSClient;
+  dispatcher: EventDispatcher;
+  client: Client;
+  config: BotConfig;
+  appId: string;
+  domain?: string;
+  /** Bot's own open_id, fetched from bot/v3/info, used for @-mention matching. */
+  botOpenId?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Channel — Feishu IM communication only.
 //
 // Responsibilities:
-//   1. Receive user DMs via WebSocket
+//   1. Receive user DMs via WebSocket (one per operator bot)
 //   2. Create draft topics and gather info (multi-turn if needed)
 //   3. Optionally use LLM to assess completeness
 //   4. Promote drafts to pending for executors
@@ -27,10 +42,10 @@ const DEFAULT_EMOJI = 'OneSecond';
 // ---------------------------------------------------------------------------
 
 export class Channel {
-  private wsClient: WSClient | null = null;
+  private operatorClients = new Map<string, OperatorClient>();
   private bitable: BitableClient;
   private session: Session;
-  private client: Client;
+  private client: Client;            // primary channel-credential Client for Bitable ops
   private coordinator: Coordinator | null = null;
   private running = true;
   private draftCleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -44,6 +59,7 @@ export class Channel {
     this.bitable = new BitableClient(cfg);
     this.session = new Session('channel', 'Channel', cfg, this.bitable);
     const dc = getDomainConfig(cfg.openApiDomain);
+    // Primary channel-credential Client (Bitable ops, coordinator)
     this.client = new Client({
       appId: cfg.appId,
       appSecret: cfg.appSecret || 'unused',
@@ -73,7 +89,7 @@ export class Channel {
     }
 
     await this.subscribeBitableEvents();
-    await this.connectWebSocket();
+    await this.connectOperatorWebSockets();
 
     // Draft TTL cleanup
     const ttlMs = (this.cfg.operator?.draftTTLMinutes ?? 60) * 60 * 1000;
@@ -98,10 +114,19 @@ export class Channel {
     this.running = false;
     if (this.draftCleanupTimer) clearInterval(this.draftCleanupTimer);
     if (this.coordinator) this.coordinator.stop();
-    if (this.wsClient) {
-      try { this.wsClient.close({ force: true }); } catch { /* ignore */ }
-      this.wsClient = null;
+    for (const [, oc] of this.operatorClients) {
+      try { oc.wsClient.close({ force: true }); } catch { /* ignore */ }
     }
+    this.operatorClients.clear();
+  }
+
+  /** Get the Lark Client for a given appId, falling back to the primary client. */
+  private getClient(appId?: string): Client {
+    if (appId) {
+      const oc = this.operatorClients.get(appId);
+      if (oc) return oc.client;
+    }
+    return this.client;
   }
 
   // -----------------------------------------------------------------------
@@ -129,13 +154,11 @@ export class Channel {
     setTimeout(() => this.recentEvents.delete(key), 10_000);
     // Skip log for Roster heartbeat noise
     if (tableId !== this.cfg.rosterTableId) {
-      console.log(`[channel] bitable event: ${tableId.slice(0,8)}/${recordId.slice(0,8)} ${action?.action}`);
+      console.log(`[channel] bitable event: ${tableId}/${recordId} ${action?.action}`);
     }
 
     // Dispatch by table
     if (tableId === this.cfg.ticketsTableId) {
-      // Round-driven mode: routing is triggered by new user Turns, not ticket
-      // status changes. Log only for debugging.
       if (!this.cfg.roundsTableId && this.coordinator) {
         try {
           const ticket = await this.bitable.getRecord(this.cfg.ticketsTableId, recordId);
@@ -152,8 +175,6 @@ export class Channel {
         await this.coordinator.processRound(recordId);
       } catch { /* */ }
     } else if (tableId === this.cfg.turnsTableId) {
-      // Turn changed — deliver to IM if notifiable. Routing is driven by
-      // Round events (Round created by handleThreadReply after Turn is written).
       try {
         const turn = await this.bitable.getRecord(this.cfg.turnsTableId, recordId);
         if (!turn) return;
@@ -182,6 +203,7 @@ export class Channel {
     const rootMsgId = extractText(turn.fields[this.cfg.fields.turn.rootMsgId]);
     if (!content || !rootMsgId) { this.deliveryInFlight.delete(turnRecordId); return; }
     const human = extractUserIds(turn.fields[this.cfg.fields.turn.human]);
+    const turnAppId = this.getAppIdFromTurn(turn);
     let finalContent = content;
     if (human) {
       const parts = human.split(',').filter(Boolean);
@@ -189,7 +211,7 @@ export class Channel {
       finalContent = formatMessage(this.cfg.messages?.ccFormat || '{content}\n\ncc {mentions}', { content, mentions });
     }
     try {
-      await this.reply(rootMsgId, finalContent, true);
+      await this.reply(rootMsgId, finalContent, true, turnAppId);
       this.deliveredTurnIds.add(turnRecordId);
       await this.session.markTurnNotified(turnRecordId);
     } catch { /* */ } finally {
@@ -230,54 +252,125 @@ export class Channel {
   }
 
   // -----------------------------------------------------------------------
-  // WebSocket
+  // WebSocket — one connection per operator
   // -----------------------------------------------------------------------
 
-  private async connectWebSocket(): Promise<void> {
-    if (!this.cfg.appSecret) {
-      console.log('[channel] appSecret required for WebSocket event subscription.');
+  private async connectOperatorWebSockets(): Promise<void> {
+    const operators = this.getOperatorList();
+    for (const op of operators) {
+      await this.connectOneOperator(op);
+    }
+  }
+
+  /** Get list of operator configs to connect. Falls back to single channel bot. */
+  private getOperatorList(): BotConfig[] {
+    if (this.cfg.operators && this.cfg.operators.length > 0) {
+      // Filter to operators that have appSecret (can connect WS)
+      return this.cfg.operators.filter(op => op.appSecret);
+    }
+    // Fallback: single operator from channel credentials
+    if (this.cfg.appSecret) {
+      return [{
+        name: 'default',
+        appId: this.cfg.appId,
+        appSecret: this.cfg.appSecret,
+      }];
+    }
+    return [];
+  }
+
+  private async connectOneOperator(bot: BotConfig): Promise<void> {
+    if (this.operatorClients.has(bot.appId)) return;
+    if (!bot.appSecret) {
+      console.log(`[channel] operator "${bot.name}" (${bot.appId}): appSecret required for WS, skipping`);
       return;
     }
 
     try {
       const dc = getDomainConfig(this.cfg.openApiDomain);
-      this.wsClient = new WSClient({
-        appId: this.cfg.appId,
-        appSecret: this.cfg.appSecret,
+      const client = new Client({
+        appId: bot.appId,
+        appSecret: bot.appSecret,
         domain: dc.sdkBaseUrl,
         loggerLevel: 2, // warn
+      });
+
+      const wsClient = new WSClient({
+        appId: bot.appId,
+        appSecret: bot.appSecret,
+        domain: dc.sdkBaseUrl,
+        loggerLevel: 2,
         autoReconnect: true,
-        onReady: () => console.log('[channel] WS connected'),
-        onError: (err) => logger.error(`[channel] WS error: ${err.message}`),
-        onReconnecting: () => console.log('[channel] WS reconnecting...'),
-        onReconnected: () => console.log('[channel] WS reconnected'),
+        onReady: () => console.log(`[channel] WS connected: ${bot.name} (${bot.appId})`),
+        onError: (err) => logger.error(`[channel] WS error ${bot.name}: ${err.message}`),
+        onReconnecting: () => console.log(`[channel] WS reconnecting: ${bot.name}`),
+        onReconnected: () => console.log(`[channel] WS reconnected: ${bot.name}`),
       });
 
       const dispatcher = new EventDispatcher({});
+      const appId = bot.appId;
+      const domain = bot.domain;
+
       dispatcher.register({
         'im.message.receive_v1': async (data: any) => {
-          try { await this.onBotMessage(data); } catch (err) { logger.error('[channel] onBotMessage crashed:', err); }
+          try { await this.onOperatorMessage(appId, domain, data); } catch (err) { logger.error(`[channel] onOperatorMessage crashed: ${bot.name}`, err); }
         },
         'drive.file.bitable_record_changed_v1': async (data: any) => { await this.onBitableEvent(data); },
         'card.action.trigger': async (data: any) => {
-          try { await this.onCardAction(data); } catch (err) { logger.error('[channel] onCardAction crashed:', err); }
+          try { await this.onCardAction(data); } catch (err) { logger.error(`[channel] onCardAction crashed: ${bot.name}`, err); }
         },
       });
 
-      await this.wsClient.start({ eventDispatcher: dispatcher });
+      await wsClient.start({ eventDispatcher: dispatcher });
+
+      // Fetch bot's own open_id via bot/v3/info (used for @-mention matching).
+      // mention.id.open_id contains the bot's open_id; app_id is NOT returned.
+      let botOpenId: string | undefined;
+      try {
+        const tr = await fetch(`${dc.sdkBaseUrl}/open-apis/auth/v3/app_access_token/internal`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ app_id: bot.appId, app_secret: bot.appSecret }),
+        });
+        const td = await tr.json() as any;
+        const tk = td?.app_access_token as string;
+        if (tk) {
+          const br = await fetch(`${dc.sdkBaseUrl}/open-apis/bot/v3/info`, {
+            headers: { Authorization: `Bearer ${tk}` },
+          });
+          const bd = await br.json() as any;
+          console.log(`[channel] bot/v3/info for "${bot.name}": ${JSON.stringify(bd).slice(0, 300)}`);
+          if (bd?.code === 0) botOpenId = bd?.bot?.open_id as string | undefined;
+        } else {
+          console.warn(`[channel] app_token failed "${bot.name}": ${JSON.stringify(td).slice(0,150)}`);
+        }
+      } catch (err: any) {
+        console.warn(`[channel] botOpenId error "${bot.name}": ${err.message}`);
+      }
+
+      this.operatorClients.set(appId, {
+        wsClient,
+        dispatcher,
+        client,
+        config: bot,
+        appId,
+        domain,
+        botOpenId,
+      });
+
+      console.log(`[channel] operator "${bot.name}" (${bot.appId}) ${domain ? `domain="${domain}" ` : ''}${botOpenId ? 'botOpenId cached' : ''} connected`);
     } catch (err: any) {
-      console.warn(`[channel] WS init failed: ${err.message}`);
+      console.warn(`[channel] WS init failed for "${bot.name}" (${bot.appId}): ${err.message}`);
     }
   }
 
   // -----------------------------------------------------------------------
-  // Message handler
+  // Message handler — per-operator routing
   // -----------------------------------------------------------------------
 
-  private async onBotMessage(raw: any): Promise<void> {
+  private async onOperatorMessage(appId: string, domain: string | undefined, raw: any): Promise<void> {
     const data = raw.event ?? raw;
     const msg = data.message;
-    console.log(`[channel] IM event type=${msg?.message_type} chat=${msg?.chat_type}`);
+    console.log(`[channel] IM event type=${msg?.message_type} chat=${msg?.chat_type} operator=${appId}`);
 
     if (!msg) {
       console.log(`[channel] no message in event, raw=${JSON.stringify(raw).slice(0, 500)}`);
@@ -289,12 +382,23 @@ export class Channel {
 
     if (msg.chat_type !== 'p2p' && msg.chat_type !== 'group') return;
 
-    // Check if the bot itself was @mentioned (mention_type='bot' in Feishu).
-    // When the app has "receive all messages" event subscription, non-@mentioned
-    // group messages also arrive — those are used for context accumulation.
+    // Identify which bot was @-mentioned. Feishu mentions for bots carry
+    // the bot's open_id in mention.id.open_id (NOT app_id). We fetch each
+    // bot's open_id once via the SDK Client and cache it for matching.
     const botMentioned = Array.isArray(msg.mentions) && msg.mentions.some(
-      (m: any) => m?.mentioned_type === 'bot',
+      (m: any) => m?.mentioned_type === 'bot' && (
+        // Match by cached bot open_id (from bot/v3/info via SDK)
+        m?.id?.open_id === this.operatorClients.get(appId)?.botOpenId
+      ),
     );
+
+    // For new conversations in group chat (no thread parent), skip entirely
+    // when this bot was not @-mentioned. Thread replies (root_id present)
+    // need to pass through so the last-operator bot can capture the turn.
+    if (msg.chat_type === 'group' && !botMentioned && !msg.root_id) {
+      console.log(`[channel] skip: non-mentioned group msg (op=${appId}...)`);
+      return;
+    }
 
     // /reload — only respond to @mentioned /reload
     const contentRaw = String(msg.content ?? '');
@@ -302,14 +406,14 @@ export class Channel {
     try { textContent = JSON.parse(contentRaw).text ?? contentRaw; } catch { textContent = contentRaw; }
     if (botMentioned && textContent.trim().toLowerCase() === '/reload') {
       if (!this.cfg.configsTableId) {
-        await this.reply(msg.message_id, '⚠️ No configs table configured.', true);
+        await this.reply(msg.message_id, '⚠️ No configs table configured.', true, appId);
       } else {
         try {
           const { enrichConfigFromBitable } = await import('./config.js');
           await enrichConfigFromBitable(this.cfg);
-          await this.reply(msg.message_id, '✅ Configs reloaded from Bitable.', true);
+          await this.reply(msg.message_id, '✅ Configs reloaded from Bitable.', true, appId);
         } catch (err: any) {
-          await this.reply(msg.message_id, `⚠️ Reload failed: ${err.message}`, true);
+          await this.reply(msg.message_id, `⚠️ Reload failed: ${err.message}`, true, appId);
         }
       }
       return;
@@ -323,7 +427,6 @@ export class Channel {
         const parsed = JSON.parse(msg.content);
         console.log(`[channel] post raw=${msg.content}`);
         content = extractPostText(parsed);
-        // Also parse structured parts for the turn record
         const parsedParts = parsePostToParts(msg.content);
         parts = parsedParts.parts;
         if (!parts.length) console.log(`[channel] parsePostToParts returned empty parts, raw=${msg.content.slice(0, 300)}`);
@@ -341,7 +444,6 @@ export class Channel {
       }
     } else if (msg.message_type === 'text') {
       try { content = JSON.parse(msg.content).text ?? msg.content; } catch { content = msg.content; }
-      // Strip mention markers (@_user_N) from group chat messages
       content = content.replace(/@_user_\d+/g, '').trim();
       if (content) parts.push({ kind: 'text', text: content });
     } else {
@@ -353,16 +455,17 @@ export class Channel {
     if (!messageId) return;
 
     const senderId = data.sender.sender_id?.open_id ?? 'unknown';
+    // union_id is cross-app resolvable — use it for Person field writes
+    // since the BitableClient uses channel app credentials and can't
+    // resolve other operator apps' open_ids.
+    const senderUnionId = data.sender.sender_id?.union_id;
     const chatId = msg.chat_id;
     const rootId = msg.root_id;
 
     // If this message is a reply to another message, fetch the parent's text
-    // and prepend it as a quote so the executor has full context.
-    // Skip when parent is just the thread root (same as root_id) — that's
-    // every message in the thread and quoting it is just noise.
     if (msg.parent_id && msg.parent_id !== rootId) {
       try {
-        const parentText = await this.fetchMessageText(msg.parent_id);
+        const parentText = await this.fetchMessageText(msg.parent_id, appId);
         if (parentText) {
           content = `> ${parentText.replace(/\n/g, '\n> ')}\n\n${content}`;
         }
@@ -371,32 +474,33 @@ export class Channel {
       }
     }
 
-    console.log(`[channel] DM from ${senderId}: ${content.slice(0, 80)}`);
+    console.log(`[channel] DM from ${senderId}: ${content} (op=${appId})`);
 
     // Acknowledge receipt — only when bot is @mentioned
     if (botMentioned) {
       const mode = this.cfg.operator?.reactionMode ?? 'emoji';
       const ackMsg = this.cfg.messages?.ackReceived || '✅ Received';
       if (mode !== 'card') {
-        try { await this.react(messageId, DEFAULT_EMOJI); } catch {
-          if (mode === 'both') await this.reply(messageId, ackMsg, false);
+        try { await this.react(messageId, DEFAULT_EMOJI, appId); } catch {
+          if (mode === 'both') await this.reply(messageId, ackMsg, false, appId);
         }
       }
       if (mode === 'card') {
-        try { await this.reply(messageId, ackMsg, false); } catch { /* best effort */ }
+        try { await this.reply(messageId, ackMsg, false, appId); } catch { /* best effort */ }
       }
     }
 
-    // Dedup
+    // Dedup key includes appId for multi-operator isolation
+    const dedupKey = `${appId}:${messageId}`;
     try {
       const existing = await this.bitable.searchRecords(this.cfg.turnsTableId, {
         conjunction: 'and',
         conditions: [
-          { field_name: this.cfg.fields.turn.dedupKey, operator: 'is', value: [messageId] },
+          { field_name: this.cfg.fields.turn.dedupKey, operator: 'is', value: [dedupKey] },
         ],
       });
       if (existing.length > 0) {
-        console.log(`[channel] dedup: message ${messageId.slice(0, 16)} already processed, skipping`);
+        console.log(`[channel] dedup: ${dedupKey.slice(0, 30)} already processed, skipping`);
         return;
       }
     } catch { /* best effort */ }
@@ -404,26 +508,23 @@ export class Channel {
     // --- /cancel command ────────────────────────────────────────────
 
     if (this.cfg.roundsTableId && content.trim() === '/cancel') {
-      await this.handleCancel(senderId, messageId);
+      await this.handleCancel(senderId, messageId, appId);
       return;
     }
 
     // --- Thread reply ────────────────────────────────────────────────
 
     if (rootId) {
-      console.log(`[channel] thread reply lookup rootId=${rootId.slice(0,20)}... botMentioned=${botMentioned}`);
+      console.log(`[channel] thread reply lookup rootId=${rootId} botMentioned=${botMentioned}`);
       let ticket = await this.session.findByThreadRoot(rootId);
       if (!ticket || !ticket.record_id) {
-        // rootId lookup may fail if ticket was created before the rootMsgId
-        // fix. Fall back to finding the most recent ticket in this chat.
-        console.log(`[channel] thread root not found, fallback by chat_id=${chatId.slice(0,20)}...`);
+        console.log(`[channel] thread root not found, fallback by chat_id=${chatId}`);
         const recent = await this.bitable.searchRecords(this.cfg.ticketsTableId, {
           conjunction: 'and',
           conditions: [
             { field_name: this.cfg.fields.ticket.chatId, operator: 'is', value: [chatId] },
           ],
         });
-        // Sort by updatedAt descending, take the most recent
         recent.sort((a, b) => Number(b.fields[this.cfg.fields.ticket.updatedAt] ?? 0) - Number(a.fields[this.cfg.fields.ticket.updatedAt] ?? 0));
         ticket = recent[0] ?? null;
         if (ticket) console.log(`[channel] fallback found ticket ${ticket.record_id}`);
@@ -431,34 +532,22 @@ export class Channel {
       }
       if (ticket?.record_id) {
         console.log(`[channel] thread reply → ticket ${ticket.record_id} mentioned=${botMentioned}`);
-        await this.handleThreadReply(ticket, content, messageId, senderId, parts, botMentioned);
+        await this.handleThreadReply(ticket, content, messageId, senderId, parts, botMentioned, appId);
         return;
       }
     }
 
     // --- New conversation ────────────────────────────────────────────
 
-    // In group chat, non-@mentioned messages don't start new tickets
-    // (they're only used for context accumulation in existing threads).
-    if (!botMentioned && msg.chat_type === 'group') {
-      console.log(`[channel] skip new conversation: non-mentioned group msg rootId=${(rootId || '').slice(0,20)}`);
-      return;
-    }
-
-    // Ensure sender has a Roster record (human participant)
-    await this.ensureHumanRoster(senderId);
+    await this.ensureHumanRoster(senderId, senderUnionId);
 
     try {
       const ticket = await this.session.createTicket(content, {
-        // Use thread root_id if available so subsequent thread replies
-        // (including non-@mentioned ones) can find this ticket via findByThreadRoot.
         rootMsgId: rootId || messageId,
         chatId,
         senderId,
       });
 
-      // Resolve IM images to Drive file_tokens BEFORE writing the Turn,
-      // so the stored parts and attachments already have real persistent tokens.
       let resolvedParts = parts;
       let attachmentTokens: string[] = [];
       if (msg.message_type === 'post' && parts.some(p => p.kind === 'file')) {
@@ -473,21 +562,21 @@ export class Channel {
         [this.cfg.fields.turn.rootMsgId]: messageId,
         [this.cfg.fields.turn.role]: 'user',
         [this.cfg.fields.turn.content]: content,
-        [this.cfg.fields.turn.dedupKey]: messageId,
+        [this.cfg.fields.turn.dedupKey]: dedupKey,
         [this.cfg.fields.turn.agentIdentity]: senderId,
+        [this.cfg.fields.turn.appId]: appId,
         [this.cfg.fields.turn.createdAt]: Date.now(),
       };
       if (resolvedParts.length > 0) turnFields[this.cfg.fields.turn.parts] = JSON.stringify(resolvedParts);
       if (attachmentTokens.length > 0) turnFields[this.cfg.fields.turn.attachments] = attachmentTokens.map(t => ({ file_token: t }));
       const turnRecord = await this.bitable.createRecord(this.cfg.turnsTableId, turnFields);
 
-      await this.processDraft(ticket, content, messageId, chatId);
+      await this.processDraft(ticket, content, messageId, chatId, appId, domain);
 
-      // Assign the initial Turn to the newly created Round (Round-driven mode)
       if (this.cfg.roundsTableId && ticket.record_id) {
         const currentRound = await this.session.getCurrentRound(ticket.record_id);
         if (currentRound?.record_id) {
-          await this.session.assignTurnsToRound(ticket.record_id, currentRound.record_id);
+          await this.session.assignTurnsToRound(ticket.record_id, currentRound.record_id, appId);
         }
       }
     } catch (err) {
@@ -506,16 +595,31 @@ export class Channel {
     senderId: string,
     parts: Part[] = [],
     mentioned = false,
+    appId?: string,
   ): Promise<void> {
     const recordId = ticket.record_id!;
     const status = String(ticket.fields[this.cfg.fields.ticket.status] ?? '');
     const chatId = String(ticket.fields[this.cfg.fields.ticket.chatId] ?? '');
 
-    // New turns are NOT associated with any existing round. When the bot
-    // is @mentioned later, processDraft creates a fresh round that pulls
-    // in all accumulated turns via assignTurnsToRound.
+    // When the user replies without @-mentioning a bot, only the last
+    // operator bot for this ticket should write the user turn. This
+    // prevents duplicate turns in multi-operator group chat scenarios.
+    if (!mentioned && appId) {
+      const lastAppId = await this.session.getLastOperatorAppId(recordId);
+      if (lastAppId && lastAppId !== appId) {
+        // Skip if the actual last operator is still connected — they'll
+        // handle the turn. If they're offline, fall through so any
+        // available operator captures the turn as a best-effort fallback.
+        if (this.operatorClients.has(lastAppId)) {
+          console.log(`[channel] thread reply: ticket=${recordId.slice(0,12)} lastOp=${lastAppId} online, deferring`);
+          return;
+        }
+        console.log(`[channel] thread reply: ticket=${recordId.slice(0,12)} lastOp=${lastAppId} offline, fallback`);
+      }
+    }
 
-    // Resolve IM images to Drive file_tokens BEFORE writing the Turn
+    const dedupKey = appId ? `${appId}:${messageId}` : messageId;
+
     let resolvedReplyParts = parts;
     let replyAttachTokens: string[] = [];
     if (parts.some(p => p.kind === 'file')) {
@@ -525,39 +629,35 @@ export class Channel {
       replyAttachTokens = result.attachmentTokens;
     }
 
-    // Append the user turn with round_id association
     const rootMsgId = extractText(ticket.fields[this.cfg.fields.ticket.rootMsgId]);
     const replyFields: Record<string, unknown> = {
       [this.cfg.fields.turn.ticketRecordId]: recordId,
       [this.cfg.fields.turn.rootMsgId]: rootMsgId,
       [this.cfg.fields.turn.role]: 'user',
       [this.cfg.fields.turn.content]: content,
-      [this.cfg.fields.turn.dedupKey]: messageId,
+      [this.cfg.fields.turn.dedupKey]: dedupKey,
       [this.cfg.fields.turn.agentIdentity]: senderId,
+      [this.cfg.fields.turn.appId]: appId ?? this.cfg.appId,
       [this.cfg.fields.turn.createdAt]: Date.now(),
     };
     if (resolvedReplyParts.length > 0) replyFields[this.cfg.fields.turn.parts] = JSON.stringify(resolvedReplyParts);
     if (replyAttachTokens.length > 0) replyFields[this.cfg.fields.turn.attachments] = replyAttachTokens.map(t => ({ file_token: t }));
     const turnRecord = await this.bitable.createRecord(this.cfg.turnsTableId, replyFields);
 
-    // Draft → re-evaluate completeness (only when bot is @mentioned)
     if (mentioned && status === this.cfg.statuses.draft) {
-      await this.processDraft(ticket, content, messageId, chatId);
-      // Assign turns to the Round created by processDraft (draft has no Round yet)
+      await this.processDraft(ticket, content, messageId, chatId, appId);
       if (this.cfg.roundsTableId && recordId) {
         const round = await this.session.getCurrentRound(recordId);
         if (round?.record_id) {
-          await this.session.assignTurnsToRound(recordId, round.record_id);
+          await this.session.assignTurnsToRound(recordId, round.record_id, appId);
         }
       }
       return;
     }
 
     console.log(`[channel] thread reply: ticket=${recordId.slice(0,12)} status=${status} mentioned=${mentioned}`);
-    // Only @mentioned messages should trigger round lifecycle changes
     if (!mentioned) return;
 
-    // Pending/assigned — check whether current Round is still active
     if (status === this.cfg.statuses.active) {
       if (this.cfg.roundsTableId) {
         const currentRound = await this.session.getCurrentRound(recordId);
@@ -566,60 +666,56 @@ export class Channel {
           const terminal = [this.cfg.roundStatuses.done, this.cfg.roundStatuses.failed, this.cfg.roundStatuses.cancelled];
           const nonPendingActive = [this.cfg.roundStatuses.pendingApproval, this.cfg.roundStatuses.approved, this.cfg.roundStatuses.executing];
           if (roundStatus === this.cfg.roundStatuses.pending) {
-            // Pending round was never assigned — cancel and create a new one
             console.log(`[channel] pending round ${currentRound.record_id}, cancelling and creating new round`);
             await this.session.transitionRound(currentRound.record_id, this.cfg.roundStatuses.cancelled);
-            const domains = await this.runIntent(ticket, content, recordId);
-            const round = await this.session.createRound(recordId, domains);
+            const domains = await this.runIntent(ticket, content, recordId, appId);
+            const round = await this.session.createRound(recordId, domains, appId, content);
             console.log(`[channel] created round ${round.record_id!} with domains=${domains}`);
-            await this.session.assignTurnsToRound(recordId, round.record_id!);
+            await this.session.assignTurnsToRound(recordId, round.record_id!, appId);
           } else if (nonPendingActive.includes(roundStatus)) {
-            // Round still active — revert, executor will pick up
             console.log(`[channel] revert round ${currentRound.record_id} (${roundStatus}) for new reply`);
             await this.session.transitionRound(currentRound.record_id, this.cfg.roundStatuses.pending);
             await this.session.releaseRound(currentRound.record_id);
             if (roundStatus === this.cfg.roundStatuses.executing && this.coordinator) {
               await this.coordinator.dispatchCancelToExecutor(currentRound.record_id);
             }
+            // Assign the new user turn to the reverted round so the coordinator
+            // picks it up when it dispatches this round to an executor.
+            await this.session.assignTurnsToRound(recordId, currentRound.record_id, appId);
           } else if (terminal.includes(roundStatus)) {
-            // Previous Round is terminal — create a new one
             console.log(`[channel] prev round ${currentRound.record_id} done, creating new round`);
-            const domains = await this.runIntent(ticket, content, recordId);
-            const round = await this.session.createRound(recordId, domains);
+            const domains = await this.runIntent(ticket, content, recordId, appId);
+            const round = await this.session.createRound(recordId, domains, appId, content);
             console.log(`[channel] created round ${round.record_id!} with domains=${domains}`);
-            await this.session.assignTurnsToRound(recordId, round.record_id!);
+            await this.session.assignTurnsToRound(recordId, round.record_id!, appId);
           }
         } else {
-          // No active Round at all — create one
-          const domains = await this.runIntent(ticket, content, recordId);
-          const round = await this.session.createRound(recordId, domains);
+          const domains = await this.runIntent(ticket, content, recordId, appId);
+          const round = await this.session.createRound(recordId, domains, appId, content);
           console.log(`[channel] created round ${round.record_id!} with domains=${domains}`);
-          await this.session.assignTurnsToRound(recordId, round.record_id!);
+          await this.session.assignTurnsToRound(recordId, round.record_id!, appId);
         }
       }
       return;
     }
 
-    // Done — reopen with intent re-evaluation
     if (status === this.cfg.statuses.closed) {
       await this.session.promoteToPending(recordId, content);
       if (this.cfg.roundsTableId) {
-        const domains = await this.runIntent(ticket, content, recordId);
+        const domains = await this.runIntent(ticket, content, recordId, appId);
         try {
-          const round = await this.session.createRound(recordId, domains);
+          const round = await this.session.createRound(recordId, domains, appId, content);
           console.log(`[channel] created round ${round.record_id!} for reopened ticket ${recordId}`);
           if (round.record_id) {
-            await this.session.assignTurnsToRound(recordId, round.record_id);
+            await this.session.assignTurnsToRound(recordId, round.record_id, appId);
           }
         } catch (err) {
           logger.error('[channel] createRound failed:', err);
         }
       }
-      // silently reopened
       return;
     }
 
-    // Failed — reactivate with intent re-evaluation
     if (status === this.cfg.statuses.closed) {
       await this.bitable.updateRecord(this.cfg.ticketsTableId, recordId, {
         [this.cfg.fields.ticket.status]: this.cfg.statuses.active,
@@ -628,25 +724,33 @@ export class Channel {
         [this.cfg.fields.ticket.ownerLeaseAt]: 0,
       });
       if (this.cfg.roundsTableId) {
-        const domains = await this.runIntent(ticket, content, recordId);
+        const domains = await this.runIntent(ticket, content, recordId, appId);
         try {
-          const round = await this.session.createRound(recordId, domains);
+          const round = await this.session.createRound(recordId, domains, appId, content);
           console.log(`[channel] created round ${round.record_id!} for reactivated ticket ${recordId}`);
           if (round.record_id) {
-            await this.session.assignTurnsToRound(recordId, round.record_id);
+            await this.session.assignTurnsToRound(recordId, round.record_id, appId);
           }
         } catch (err) {
           logger.error('[channel] createRound failed:', err);
         }
       }
-      // silently reactivated
       return;
     }
   }
 
-  /** Run intent recognition + #domain tag override, returns abilities array. */
-  private async runIntent(ticket: BitableRecord, content: string, recordId: string): Promise<string[] | undefined> {
-    // Check for explicit #domain tag first (e.g. "#developer fix the bug")
+  /** Run intent recognition or use domain override if operator has a bound domain. */
+  private async runIntent(ticket: BitableRecord, content: string, recordId: string, appId?: string): Promise<string[] | undefined> {
+    // If operator has a bound domain, skip intent and use it directly
+    if (appId) {
+      const oc = this.operatorClients.get(appId);
+      if (oc?.domain) {
+        console.log(`[channel] domain override for operator ${appId}: "${oc.domain}"`);
+        return [oc.domain];
+      }
+    }
+
+    // Check for explicit #domain tag first
     const { parseDomainTag } = await import('./intent.js');
     const loadedDomains = await this.loadDomains();
     const tagResult = parseDomainTag(content, loadedDomains);
@@ -664,19 +768,15 @@ export class Channel {
   }
 
   /** Handle /cancel command — cancel the current Round for the user's ticket. */
-  private async handleCancel(senderId: string, messageId: string): Promise<void> {
+  private async handleCancel(senderId: string, messageId: string, appId?: string): Promise<void> {
     try {
-      // Find an active ticket for this sender across all non-terminal statuses.
-      // The ticket may have been promoted from draft → pending/assigned, so we
-      // cannot restrict the search to draft status only.
       const tickets = await this.session.searchTicketsBySender(senderId);
-      const terminalStatuses = [this.cfg.statuses.closed, this.cfg.statuses.closed, this.cfg.statuses.closed];
       const activeTickets = tickets.filter(t => {
         const status = String(t.fields[this.cfg.fields.ticket.status] ?? '');
-        return !terminalStatuses.includes(status);
+        return status !== this.cfg.statuses.closed;
       });
       if (activeTickets.length === 0) {
-        await this.reply(messageId, 'No active ticket found to cancel.', true);
+        await this.reply(messageId, 'No active ticket found to cancel.', true, appId);
         return;
       }
       const ticket = activeTickets[activeTickets.length - 1];
@@ -684,21 +784,20 @@ export class Channel {
       if (round && round.record_id) {
         const ok = await this.session.transitionRound(round.record_id, this.cfg.roundStatuses.cancelled);
         if (ok) {
-          await this.reply(messageId, '✅ Processing cancelled.', true);
+          await this.reply(messageId, '✅ Processing cancelled.', true, appId);
           console.log(`[channel] cancelled round ${round.record_id} for ticket ${ticket.record_id!}`);
-          // Propagate cancel to push executor if running
           if (this.coordinator) {
             await this.coordinator.dispatchCancelToExecutor(round.record_id);
           }
         } else {
-          await this.reply(messageId, 'Could not cancel — round may have already completed.', true);
+          await this.reply(messageId, 'Could not cancel — round may have already completed.', true, appId);
         }
       } else {
-        await this.reply(messageId, 'No active processing round to cancel.', true);
+        await this.reply(messageId, 'No active processing round to cancel.', true, appId);
       }
     } catch (err) {
       logger.error('[channel] handleCancel error:', err);
-      await this.reply(messageId, 'Error processing cancel command.', true);
+      await this.reply(messageId, 'Error processing cancel command.', true, appId);
     }
   }
 
@@ -707,12 +806,18 @@ export class Channel {
     content: string,
     messageId: string,
     _chatId: string,
+    appId?: string,
+    domain?: string,
   ): Promise<void> {
     let domains: string[] = ['general'];
     let summary = content;
     const loadedDomains = await this.loadDomains();
 
-    if (this.cfg.intent) {
+    // If operator has a bound domain, skip intent entirely
+    if (domain) {
+      domains = [domain];
+      console.log(`[channel] processDraft domain override: "${domain}"`);
+    } else if (this.cfg.intent) {
       const { processMessage } = await import('./intent.js');
       const turns = await this.session.getTurns(ticket.record_id!);
       const conversation = turns.map(t => `[${t.fields[this.cfg.fields.turn.role]}]\n${t.fields[this.cfg.fields.turn.content]}`).join('\n');
@@ -725,14 +830,12 @@ export class Channel {
         const question = result.missingFields.length > 0
           ? `Please provide: ${result.missingFields.join(', ')}`
           : (this.cfg.messages?.clarifyQuestion || 'Could you please provide more details?');
-        await this.reply(messageId, question, true);
+        await this.reply(messageId, question, true, appId);
         console.log(`[channel] clarification asked for ticket ${ticket.record_id!}: missing=${result.missingFields}`);
         return;
       }
     }
 
-    // Check for explicit #domain tag override (e.g. "#developer fix the bug").
-    // Tags take precedence over LLM intent result.
     const { parseDomainTag } = await import('./intent.js');
     const tagResult = parseDomainTag(summary || content, loadedDomains);
     if (tagResult) {
@@ -744,17 +847,15 @@ export class Channel {
     await this.session.promoteToPending(ticket.record_id!, summary);
     console.log(`[channel] ticket ${ticket.record_id!} promoted to pending`);
 
-    // In Round-driven mode, create a Round with abilities
     if (this.cfg.roundsTableId && ticket.record_id) {
       try {
-        const round = await this.session.createRound(ticket.record_id, domains.length > 0 ? domains : undefined);
+        const round = await this.session.createRound(ticket.record_id, domains.length > 0 ? domains : undefined, appId, content);
         console.log(`[channel] created round ${round.record_id!} for ticket ${ticket.record_id} with domains=${domains}`);
       } catch (err) {
         logger.error('[channel] createRound failed:', err);
       }
     }
 
-    // Try routing to push executor
     if (this.coordinator && ticket.record_id) {
       const updated = await this.session.getTicket(ticket.record_id);
       if (updated) await this.coordinator.tryRoute(updated);
@@ -777,9 +878,6 @@ export class Channel {
         if (!turnRecordId) continue;
         if (this.deliveredTurnIds.has(turnRecordId)) continue;
 
-        // Multi-process safety: claim the turn before delivering.  The claim
-        // writes deliveryOwner + deliveryLeaseAt using WSR (write-sleep-read).
-        // Only the winning Channel process proceeds with IM delivery.
         const claimed = await this.session.claimTurnDelivery(turnRecordId);
         if (!claimed) {
           continue;
@@ -788,15 +886,13 @@ export class Channel {
         const content = extractText(turn.fields[this.cfg.fields.turn.content]);
         const rootMsgId = extractText(turn.fields[this.cfg.fields.turn.rootMsgId]);
         const status = String(turn.fields[this.cfg.fields.turn.status] ?? '');
+        const turnAppId = this.getAppIdFromTurn(turn);
 
         if (!content || !rootMsgId) {
           console.log(`[channel] skip turn ${turnRecordId} (missing content/rootMsgId)`);
           continue;
         }
 
-        // Append human CC mention if the turn carries reviewer/owner people.
-        // This may be either a direct Person field or a Lookup-wrapped Person
-        // field depending on how the user's Bitable schema is configured.
         const human = extractUserIds(turn.fields[this.cfg.fields.turn.human]);
         let finalContent = content;
         if (human) {
@@ -808,10 +904,10 @@ export class Channel {
         }
 
         try {
-          await this.reply(rootMsgId, finalContent, true);
+          await this.reply(rootMsgId, finalContent, true, turnAppId);
           this.deliveredTurnIds.add(turnRecordId);
           await this.session.markTurnNotified(turnRecordId);
-          console.log(`[channel] delivered ${status} turn ${turnRecordId}`);
+          console.log(`[channel] delivered ${status} turn ${turnRecordId} via appId=${turnAppId || 'primary'}`);
         } catch (err) {
           logger.error(`[channel] deliver turn failed ${turnRecordId}:`, err);
         }
@@ -841,7 +937,6 @@ export class Channel {
         const summary = extractText(ticket.fields[this.cfg.fields.ticket.summary]);
         if (!rootMsgId) continue;
 
-        // Check if we already sent a card (avoid duplicates)
         const cardDedupKey = `approval_card_${round.record_id}`;
         const existing = await this.bitable.searchRecords(this.cfg.turnsTableId, {
           conjunction: 'and',
@@ -851,7 +946,10 @@ export class Channel {
         });
         if (existing.length > 0) continue;
 
-        // Send approval card
+        // Determine which operator's client to use from round's appId
+        const roundAppId = extractText(round.fields[this.cfg.fields.round.appId]) || undefined;
+        const imClient = this.getClient(roundAppId);
+
         const reviewer = round.fields[this.cfg.fields.round.reviewer];
         const reviewerMention = reviewer ? extractUserIds(reviewer).split(',').map(id => `<at id=${id.trim()}></at>`).join(' ') : '';
         const card: Record<string, any> = {
@@ -872,11 +970,10 @@ export class Channel {
         };
 
         try {
-          await this.client.im.v1.message.reply({
+          await imClient.im.v1.message.reply({
             path: { message_id: rootMsgId },
             data: { msg_type: 'interactive', content: JSON.stringify(card), reply_in_thread: true } as any,
           });
-          // Record the card as a turn for dedup
           await this.bitable.createRecord(this.cfg.turnsTableId, {
             [this.cfg.fields.turn.ticketRecordId]: ticketId,
             [this.cfg.fields.turn.rootMsgId]: rootMsgId,
@@ -900,7 +997,7 @@ export class Channel {
     const action = raw.event?.action;
     if (!action?.value?.round_id) return;
     const roundId = action.value.round_id;
-    const decision = action.value.action; // 'approve' | 'reject'
+    const decision = action.value.action;
     if (!roundId || !decision) return;
 
     console.log(`[channel] card action: ${decision} round=${roundId}`);
@@ -944,7 +1041,6 @@ export class Channel {
 
       if (closed > 0) console.log(`[channel] closed ${closed} stale draft(s)`);
 
-      // Prevent unbounded growth of the delivered-turn dedup set
       if (this.deliveredTurnIds.size > 10_000) {
         this.deliveredTurnIds.clear();
         console.log('[channel] cleared deliveredTurnIds set');
@@ -958,16 +1054,7 @@ export class Channel {
   // Capabilities classification
   // -----------------------------------------------------------------------
 
-  /** Classify user message to a capability.
-   *
-   *  Method 1 (command): if message starts with `/tech_support`, etc.
-   *    The prefix is stripped from the returned content.
-   *
-   *  Method 2 (keyword): fetch the capabilities whitelist table, match
-   *    keywords from each row's description field against the message.
-   *
-   *  Falls back to undefined if no match. */
-  /** Load enabled capabilities from Roles table (cached). */
+  /** Load enabled capabilities from Domains table (cached). */
   private async loadDomains(): Promise<import('./intent.js').Domain[]> {
     if (this.cachedDomains) return this.cachedDomains;
     if (!this.cfg.domainsTableId) return [];
@@ -982,7 +1069,6 @@ export class Channel {
           description: extractText(r.fields['description']),
         }))
         .filter(d => d.domain.length > 0) as unknown as import('./intent.js').Domain[];
-      // Refresh cache every 60s
       setTimeout(() => { this.cachedDomains = null; }, 60_000);
       return this.cachedDomains;
     } catch {
@@ -994,46 +1080,59 @@ export class Channel {
   // Human participant management
   // -----------------------------------------------------------------------
 
-  /** Ensure a human Roster record exists for the given sender_id (open_id).
-   *  Creates one with kind=human if not found. */
-  private async ensureHumanRoster(senderId: string): Promise<void> {
+  /** Ensure a human Roster record exists for the given sender (by open_id).
+   *  Uses cross-app union_id as the primary identifier for Person field writes
+   *  — the channel app's BitableClient can't resolve other operator apps' open_ids,
+   *  but union_id works across all apps in the same developer account. */
+  private async ensureHumanRoster(senderId: string, unionId?: string): Promise<void> {
+    const primaryId = unionId || senderId;
+    const userIdType = unionId ? 'union_id' : undefined;
+
     try {
-      // Search for existing human record — filter by kind and human field
       const existing = await this.bitable.searchRecords(this.cfg.rosterTableId, {
         conjunction: 'and',
         conditions: [
           { field_name: this.cfg.fields.roster.kind, operator: 'is', value: ['human'] },
         ],
       });
-      // The human field (Person type) stores [{id: "ou_xxx", ...}].
-      // We can't search Person fields with 'is' directly, so filter in code.
+      // Search by union_id (primary) or open_id (legacy)
       const found = existing.find((r) => {
-        const human = extractUserIds(r.fields[this.cfg.fields.roster.human]);
-        return human.includes(senderId);
+        const ids = extractUserIds(r.fields[this.cfg.fields.roster.human]);
+        return ids.includes(primaryId) || ids.includes(senderId);
       });
       if (found) return;
     } catch { /* best effort */ }
 
-    // Create a new human Roster record
+    const identity = `human_${primaryId}`;
+    const fields: Record<string, unknown> = {
+      [this.cfg.fields.roster.identity]: identity,
+      [this.cfg.fields.roster.nickname]: `user_${primaryId.slice(0, 8)}`,
+      [this.cfg.fields.roster.kind]: 'human',
+      [this.cfg.fields.roster.enabled]: true,
+    };
+
     try {
-      const identity = `human_${senderId}`;
-      await this.bitable.createRecord(this.cfg.rosterTableId, {
-        [this.cfg.fields.roster.identity]: identity,
-        [this.cfg.fields.roster.nickname]: `user_${senderId.slice(0, 8)}`,
-        [this.cfg.fields.roster.kind]: 'human',
-        [this.cfg.fields.roster.human]: [{ id: senderId }],
-        [this.cfg.fields.roster.enabled]: true,
-      });
+      fields[this.cfg.fields.roster.human] = [{ id: primaryId }];
+      await this.bitable.createRecord(this.cfg.rosterTableId, fields, userIdType);
       console.log(`[channel] created human roster: ${identity}`);
-    } catch (err) {
-      console.log('[channel] ensureHumanRoster failed:', err);
+    } catch (err: any) {
+      if (String(err?.code ?? err) === '1254066' || String(err?.message ?? '').includes('UserFieldConvFail')) {
+        delete fields[this.cfg.fields.roster.human];
+        try {
+          await this.bitable.createRecord(this.cfg.rosterTableId, fields);
+          console.log(`[channel] created human roster ${identity} (without Person field)`);
+        } catch (retryErr) {
+          console.log('[channel] ensureHumanRoster failed:', retryErr);
+        }
+      } else {
+        console.log('[channel] ensureHumanRoster failed:', err);
+      }
     }
   }
 
   /** Notify human roster participants when tickets are pending. */
   private async notifyHumans(): Promise<void> {
     try {
-      // Only notify humans for tickets pending direct human assignment
       const tickets = await this.bitable.searchRecords(this.cfg.ticketsTableId, {
         conjunction: 'and',
         conditions: [
@@ -1048,7 +1147,6 @@ export class Channel {
         const senderId = extractText(ticket.fields[this.cfg.fields.ticket.senderId]);
         const summary = extractText(ticket.fields[this.cfg.fields.ticket.summary]);
 
-        // Find matching humans from Roster
         const roster = await this.bitable.searchRecords(this.cfg.rosterTableId, {
           conjunction: 'and',
           conditions: [
@@ -1059,7 +1157,6 @@ export class Channel {
 
         if (roster.length === 0) continue;
 
-        // Build @mention string
         let atMentions = '';
         if (senderId) {
           atMentions = `<at id=${senderId}></at>`;
@@ -1090,18 +1187,18 @@ export class Channel {
   }
 
   // -----------------------------------------------------------------------
-  // IM helpers
+  // IM helpers — operator-aware
   // -----------------------------------------------------------------------
 
-  private async react(messageId: string, emojiType: string): Promise<void> {
-    await this.client.im.v1.messageReaction.create({
+  private async react(messageId: string, emojiType: string, appId?: string): Promise<void> {
+    await this.getClient(appId).im.v1.messageReaction.create({
       path: { message_id: messageId },
       data: { reaction_type: { emoji_type: emojiType } },
     });
   }
 
-  /** Reply to a message, optionally in thread mode, using Card JSON 2.0 markdown. */
-  private async reply(messageId: string, text: string, replyInThread?: boolean): Promise<void> {
+  /** Reply to a message, optionally in thread mode and with a specific operator appId. */
+  private async reply(messageId: string, text: string, replyInThread?: boolean, appId?: string): Promise<void> {
     if (!text.trim()) return;
 
     const card = {
@@ -1113,8 +1210,10 @@ export class Channel {
       },
     };
 
+    const imClient = this.getClient(appId);
+
     try {
-      await this.client.im.v1.message.reply({
+      await imClient.im.v1.message.reply({
         path: { message_id: messageId },
         data: {
           msg_type: 'interactive',
@@ -1123,12 +1222,10 @@ export class Channel {
         } as any,
       });
     } catch (err: any) {
-      // Card may fail if markdown content has too many tables (Feishu limit).
-      // Fall back to plain text. SDK error is at err.response.data.code.
       const apiCode = err?.response?.data?.code ?? err?.code;
       const isTableLimit = apiCode === 230099 || String(err?.message ?? err).includes('card table number over limit');
       if (isTableLimit) {
-        await this.client.im.v1.message.reply({
+        await imClient.im.v1.message.reply({
           path: { message_id: messageId },
           data: {
             msg_type: 'text',
@@ -1142,9 +1239,9 @@ export class Channel {
     }
   }
 
-  /** Fetch a message by ID and extract its text content for context quoting. */
-  private async fetchMessageText(messageId: string): Promise<string> {
-    const resp: any = await this.client.im.v1.message.get({
+  /** Fetch a message by ID using the appropriate bot client. */
+  private async fetchMessageText(messageId: string, appId?: string): Promise<string> {
+    const resp: any = await this.getClient(appId).im.v1.message.get({
       path: { message_id: messageId },
     });
     const msg = resp?.data?.items?.[0];
@@ -1152,17 +1249,33 @@ export class Channel {
     return parseMessageContent(msg.msg_type, msg.body.content);
   }
 
+  /** Get the appId from a turn record, with fallback to parsing from dedupKey.
+   *  The appId field may be empty if the Turns table doesn't have an app_id
+   *  column (pre-multi-operator setup). In that case, parse from the dedupKey
+   *  which has the format "appId:messageId". */
+  private getAppIdFromTurn(turn: BitableRecord): string | undefined {
+    const fieldVal = extractText(turn.fields[this.cfg.fields.turn.appId]);
+    if (fieldVal) return fieldVal;
+    // Fallback: parse appId prefix from dedupKey (format: "appId:messageId")
+    const dedupKey = extractText(turn.fields[this.cfg.fields.turn.dedupKey]);
+    if (dedupKey) {
+      const colonIdx = dedupKey.indexOf(':');
+      if (colonIdx > 0) return dedupKey.slice(0, colonIdx);
+    }
+    return undefined;
+  }
+
   private cleanup(): void {
     if (this.draftCleanupTimer) clearInterval(this.draftCleanupTimer);
-    if (this.wsClient) {
-      try { this.wsClient.close({ force: true }); } catch { /* ignore */ }
-      this.wsClient = null;
+    for (const [, oc] of this.operatorClients) {
+      try { oc.wsClient.close({ force: true }); } catch { /* ignore */ }
     }
+    this.operatorClients.clear();
   }
 }
 
 // ---------------------------------------------------------------------------
-// Utilities
+// Utilities (unchanged from original)
 // ---------------------------------------------------------------------------
 
 /**

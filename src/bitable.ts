@@ -87,11 +87,14 @@ export class BitableClient {
 
   // -- CRUD ---------------------------------------------------------------
 
-  async createRecord<T = Record<string, unknown>>(tableId: string, fields: T): Promise<BitableRecord<T>> {
+  async createRecord<T = Record<string, unknown>>(tableId: string, fields: T, userIdType?: string): Promise<BitableRecord<T>> {
     return this.withRetry(async () => {
+      const params: Record<string, string> = {};
+      if (userIdType) params.user_id_type = userIdType;
       const resp = await this.client.bitable.appTableRecord.create({
         path: { app_token: this.cfg.appToken, table_id: tableId },
         data: { fields: fields as any },
+        params,
       }, await this.authOptions());
       if (resp.code !== 0 || !resp.data?.record) {
         logger.error(`[bitable] createRecord FAILED: ${JSON.stringify(resp)}`);
@@ -101,11 +104,14 @@ export class BitableClient {
     });
   }
 
-  async updateRecord<T = Record<string, unknown>>(tableId: string, recordId: string, fields: Partial<T>): Promise<BitableRecord<T>> {
+  async updateRecord<T = Record<string, unknown>>(tableId: string, recordId: string, fields: Partial<T>, userIdType?: string): Promise<BitableRecord<T>> {
     return this.withRetry(async () => {
+      const params: Record<string, string> = {};
+      if (userIdType) params.user_id_type = userIdType;
       const resp = await this.client.bitable.appTableRecord.update({
         path: { app_token: this.cfg.appToken, table_id: tableId, record_id: recordId },
         data: { fields: fields as any },
+        params,
       }, await this.authOptions());
       if (resp.code !== 0 || !resp.data?.record) {
         logger.error(`[bitable] updateRecord FAILED: ${JSON.stringify(resp)}`);

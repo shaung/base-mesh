@@ -51,6 +51,8 @@ export interface SetupOptions {
   appName?: string;
   /** Feishu open_id to grant edit permission and register as Roster.human. */
   ownerOpenId?: string;
+  /** Cross-app union_id for Person field writes. */
+  ownerUnionId?: string;
   /** If provided, skip base creation and use this existing token. */
   existingAppToken?: string;
 }
@@ -303,6 +305,7 @@ export async function createBaseMesh(opts: SetupOptions): Promise<SetupResult> {
       { name: 'approved', color: 3 },
       { name: 'rejected', color: 4 },
     ]}},
+    { field_name: 'app_id', type: FT.Text },
     { field_name: 'dedup_key', type: FT.Text },
     { field_name: 'agent_identity', type: FT.Text },
     { field_name: 'human', type: FT.Person, property: { multiple: true } },
@@ -346,10 +349,12 @@ export async function createBaseMesh(opts: SetupOptions): Promise<SetupResult> {
       { name: 'failed', color: 4 },
       { name: 'cancelled', color: 5 },
     ]}},
+    { field_name: 'app_id', type: FT.Text },
     { field_name: 'executor', type: FT.Text },
     { field_name: 'reviewer', type: FT.Person, property: { multiple: false } },
     { field_name: 'review_comment', type: FT.Text },
     { field_name: 'supplement_prompt', type: FT.Text },
+    { field_name: 'input', type: FT.Text },
     { field_name: 'result', type: FT.Text },
     { field_name: 'artifacts', type: FT.Text },
     { field_name: 'created_at', type: FT.CreatedTime },
@@ -475,14 +480,15 @@ export async function createBaseMesh(opts: SetupOptions): Promise<SetupResult> {
     }
   }
 
-  if (opts.ownerOpenId) {
+  const ownerMemberId = opts.ownerUnionId || opts.ownerOpenId;
+  if (ownerMemberId) {
     const { grantBitableAccess } = await import('./bitable-auth.js');
     const ok = await grantBitableAccess({
       appId: opts.appId, appSecret: opts.appSecret, openApiDomain: opts.openApiDomain,
-      appToken, memberType: 'openid', memberId: opts.ownerOpenId,
+      appToken, memberType: opts.ownerUnionId ? 'unionid' : 'openid', memberId: ownerMemberId,
     });
-    if (ok) console.log(`  ✓ Granted edit access to ${opts.ownerOpenId}`);
-    else console.log(`  ⚠ Could not auto-grant access to ${opts.ownerOpenId}`);
+    if (ok) console.log(`  ✓ Granted edit access to ${ownerMemberId}`);
+    else console.log(`  ⚠ Could not auto-grant access to ${ownerMemberId}`);
   }
 
   return { appToken, appUrl, ticketsTableId, turnsTableId, rosterTableId, domainsTableId, configsTableId };
@@ -493,7 +499,7 @@ export async function createBaseMesh(opts: SetupOptions): Promise<SetupResult> {
 // ---------------------------------------------------------------------------
 
 function buildConfig(
-  fields: { appId: string; appSecret?: string; openApiDomain?: string; ownerOpenId?: string },
+  fields: { appId: string; appSecret?: string; openApiDomain?: string; ownerOpenId?: string; ownerUnionId?: string },
   result: SetupResult,
 ): Record<string, unknown> {
   return {
@@ -503,6 +509,7 @@ function buildConfig(
       openApiDomain: fields.openApiDomain || 'open.larksuite.com',
       appToken: result.appToken,
       ...(fields.ownerOpenId ? { ownerOpenId: fields.ownerOpenId } : {}),
+      ...(fields.ownerUnionId ? { ownerUnionId: fields.ownerUnionId } : {}),
       ...(result.configsTableId ? { configsTableId: result.configsTableId } : {}),
     },
     executor: {
@@ -638,6 +645,20 @@ async function setupChannel(profile = 'default', lang?: SetupLang): Promise<void
   if (appSecret) console.log(chalk.gray(`  appSecret: ${maskMiddle(appSecret)}`));
 
   // =========================================================================
+  // Auto-configure app via Feishu API (bot ability, permissions, events, redirect URL)
+  // =========================================================================
+
+  const appConfig = appId && appSecret ? await configureApp(appId, appSecret, openApiDomain) : null;
+  if (appConfig) {
+    if (appConfig.ability) console.log(chalk.green(`  ✓ Bot capability enabled`));
+    if (appConfig.scope) console.log(chalk.green(`  ✓ Permissions & events subscribed`));
+    if (appConfig.redirectUrl) console.log(chalk.green(`  ✓ Redirect URL auto-configured`));
+    if (!appConfig.ability && !appConfig.scope && !appConfig.redirectUrl) {
+      console.log(chalk.yellow(`  → Will show manual configuration hints after setup.`));
+    }
+  }
+
+  // =========================================================================
   // Step 3: Authorize Your Identity (device grant)
   // =========================================================================
 
@@ -645,15 +666,19 @@ async function setupChannel(profile = 'default', lang?: SetupLang): Promise<void
   console.log(`  ${msg.step3Desc}\n`);
 
   let ownerOpenId = process.env.OWNER_OPEN_ID || undefined;
+  let ownerUnionId: string | undefined;
 
   const existingTokens = loadStoredTokens(appId);
   if (existingTokens?.userId) {
     ownerOpenId = existingTokens.userId;
+    ownerUnionId = existingTokens.unionId;
     console.log(`  ✓ ${msg.step3Already} ${ownerOpenId}`);
   } else {
     try {
       const { deviceGrantLogin } = await import('./device-auth.js');
       ownerOpenId = await deviceGrantLogin(appId, appSecret, openApiDomain);
+      const updatedTokens = loadStoredTokens(appId);
+      if (updatedTokens?.unionId) ownerUnionId = updatedTokens.unionId;
     } catch (err: any) {
       console.log(`  ⚠ ${msg.step3Failed}: ${err.message}`);
       console.log(`  ${msg.step3Continue}\n`);
@@ -684,6 +709,7 @@ async function setupChannel(profile = 'default', lang?: SetupLang): Promise<void
     result = await createBaseMesh({
       appId, appSecret, openApiDomain, appName: meshName || 'base-mesh',
       ownerOpenId: ownerOpenId,
+      ownerUnionId: ownerUnionId,
     });
     console.log('\n  ✓ Bitable is ready!');
   } else {
@@ -778,7 +804,7 @@ async function setupChannel(profile = 'default', lang?: SetupLang): Promise<void
   // =========================================================================
 
   console.log('\nStep 5: Save Profile');
-  const base = buildConfig({ appId, appSecret, openApiDomain, ownerOpenId }, result);
+  const base = buildConfig({ appId, appSecret, openApiDomain, ownerOpenId, ownerUnionId }, result);
   const config: Record<string, unknown> = {
     ...existingProfile,
     ...base,
@@ -789,6 +815,7 @@ async function setupChannel(profile = 'default', lang?: SetupLang): Promise<void
       appToken: result.appToken,
       configsTableId: result.configsTableId,
       ...(ownerOpenId ? { ownerOpenId } : {}),
+      ...(ownerUnionId ? { ownerUnionId } : {}),
     },
     executor: { ...((base.executor ?? {}) as object), ...((existingProfile.executor ?? {}) as object) },
   };
@@ -818,10 +845,12 @@ async function setupChannel(profile = 'default', lang?: SetupLang): Promise<void
   console.log('');
   console.log(`  ${msg.openBrowser}\n    ${appUrl}`);
   console.log('');
-  console.log(chalk.yellow(`  ${msg.redirectURLHint}`));
-  console.log(chalk.yellow(`    ${safeUrl}`));
-  console.log(chalk.yellow('     http://localhost:21721/callback'));
-  console.log('');
+  if (!appConfig?.redirectUrl) {
+    console.log(chalk.yellow(`  ${msg.redirectURLHint}`));
+    console.log(chalk.yellow(`    ${safeUrl}`));
+    console.log(chalk.yellow('     http://localhost:21721/callback'));
+    console.log('');
+  }
 
   // Notify owner via Lark IM
   if (ownerOpenId && appSecret) {
@@ -844,14 +873,112 @@ async function setupChannel(profile = 'default', lang?: SetupLang): Promise<void
             { tag: 'markdown', content: `**${msg.redirectURLLink}**: [${safeUrl}](${safeUrl})` },
           ].filter(Boolean),
         };
-        await fetch(`${dc.sdkBaseUrl}/open-apis/im/v1/messages?receive_id_type=open_id`, {
+        const notifyId = ownerUnionId || ownerOpenId;
+        if (!notifyId) return;
+        await fetch(`${dc.sdkBaseUrl}/open-apis/im/v1/messages?receive_id_type=${ownerUnionId ? 'union_id' : 'open_id'}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          body: JSON.stringify({ receive_id: ownerOpenId, msg_type: 'interactive', content: JSON.stringify(card) }),
+          body: JSON.stringify({ receive_id: notifyId, msg_type: 'interactive', content: JSON.stringify(card) }),
         });
       }
     } catch { /* best effort */ }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-configure app via Feishu API
+// ---------------------------------------------------------------------------
+
+interface AppConfigResult {
+  ability: boolean;
+  scope: boolean;
+  redirectUrl: boolean;
+}
+
+/**
+ * Best-effort app auto-configuration via Feishu v7 APIs.
+ * Enables bot capability, adds permissions, subscribes events,
+ * and (for coordinator) sets redirect URL. Failures are non-blocking.
+ *
+ * @param operator — true = operator bot (IM permissions only, no redirect URL);
+ *                   false/undefined = coordinator bot (full setup including bitable:app + redirect URL).
+ */
+async function configureApp(appId: string, appSecret: string, openApiDomain?: string, operator?: boolean): Promise<AppConfigResult> {
+  const result: AppConfigResult = { ability: false, scope: false, redirectUrl: false };
+  const { getDomainConfig } = await import('./domain.js');
+  const dc = getDomainConfig(openApiDomain || 'open.larksuite.com');
+
+  let token: string;
+  try {
+    const tokenResp = await fetch(`${dc.sdkBaseUrl}/open-apis/auth/v3/tenant_access_token/internal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+    });
+    const tokenData = await tokenResp.json() as { code?: number; tenant_access_token?: string; msg?: string };
+    token = tokenData.tenant_access_token as string;
+    if (!token) {
+      console.log(chalk.gray(`  app-config: no tenant_access_token (${tokenData.msg || tokenData.code})`));
+      return result;
+    }
+  } catch {
+    console.log(chalk.gray(`  app-config: failed to get tenant_access_token`));
+    return result;
+  }
+
+  // 1. Enable bot capability via ability API (separate endpoint — can't merge with config)
+  try {
+    const abResp = await fetch(`${dc.sdkBaseUrl}/open-apis/application/v7/applications/${appId}/ability`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json; charset=utf-8', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ bot: {} }),
+    });
+    const abData = await abResp.json() as { code?: number; msg?: string };
+    result.ability = abData.code === 0;
+    if (!result.ability) console.log(chalk.gray(`  app-config: ability API code=${abData.code} ${abData.msg || ''}`));
+  } catch { /* best effort */ }
+
+  // 2. Set permissions + event subscription (+ redirect URL for coordinator) via config API
+  try {
+    const scopeAdds: Array<{ scope_name: string; token_type: string }> = [
+      { scope_name: 'im:message', token_type: 'tenant' },
+      { scope_name: 'im:message:send_as_bot', token_type: 'tenant' },
+    ];
+    // Coordinator bot needs bitable for Bitable CRUD; operator bots only handle IM.
+    if (!operator) {
+      scopeAdds.push({ scope_name: 'bitable:app', token_type: 'tenant' });
+    }
+
+    const evtAdds: string[] = ['im.message.receive_v1'];
+    // Bitable record change event only relevant for coordinator (owns Bitable)
+    if (!operator) {
+      evtAdds.push('drive.file.bitable_record_changed_v1');
+    }
+
+    const body: Record<string, unknown> = {
+      scope: { add_scopes: scopeAdds },
+      event: { subscription_type: 'websocket', add_events: evtAdds },
+    };
+    // Redirect URL only needed for PKCE login on the coordinator bot
+    if (!operator) {
+      body.security = { add: { redirect_urls: ['http://localhost:21721/callback'] } };
+    }
+
+    const cfgResp = await fetch(`${dc.sdkBaseUrl}/open-apis/application/v7/applications/${appId}/config`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json; charset=utf-8', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+    const cfgData = await cfgResp.json() as { code?: number; msg?: string };
+    if (cfgData.code === 0) {
+      result.scope = true;
+      if (!operator) result.redirectUrl = true;
+    } else {
+      console.log(chalk.gray(`  app-config: config API code=${cfgData.code} ${cfgData.msg || ''}`));
+    }
+  } catch { /* best effort */ }
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -970,6 +1097,103 @@ async function setupAgent(profile = 'default', lang?: SetupLang): Promise<void> 
   console.log('');
   console.log(`  ${msg.agentStartCmd}\n    npx tsx src/cli.ts join -p ${profile}`);
   console.log('');
+}
+
+// ---------------------------------------------------------------------------
+// Multi-operator setup — add a new operator bot to an existing profile
+// ---------------------------------------------------------------------------
+
+/** Interactive multi-operator setup. Adds one operator to the profile.
+ *  Can be run multiple times to add multiple operators. */
+export async function setupOperator(profile = 'default'): Promise<void> {
+  const { readProfile, saveProfile, profilePath } = await import('./config.js');
+  const existingProfile = readProfile(profile);
+  if (!existingProfile) {
+    logger.error(chalk.red(`\n  Profile "${profile}" not found. Run \`bam setup channel\` first.\n`));
+    return;
+  }
+
+  console.log(chalk.bold('\n── Add a Multi-Operator Bot ──\n'));
+  console.log('  This adds a new bot account (operator) to process messages alongside');
+  console.log('  the primary bot. Each operator can have its own Feishu/Lark credentials');
+  console.log('  and optionally a bound domain (skipping intent recognition).\n');
+
+  // Step 1: How to get credentials
+  const credentialMode = await promptList(
+    'How to add the operator?',
+    [
+      { name: 'Create via QR code (recommended)', value: 'qr' },
+      { name: 'Manual input', value: 'manual' },
+    ],
+  );
+
+  let appId: string;
+  let appSecret: string;
+
+  if (credentialMode === 'qr') {
+    const spinner = ora('Waiting for QR scan...').start();
+    try {
+      const { createAppViaQR, sendProbe } = await import('./device-auth.js');
+      const result = await createAppViaQR({ openApiDomain: undefined });
+      appId = result.appId;
+      appSecret = result.appSecret;
+      spinner.succeed(chalk.green(`✓ Operator app created: ${appId}`));
+      await sendProbe(appId, appSecret, result.domain === 'lark' ? 'open.larksuite.com' : 'open.feishu.cn').catch(() => {});
+    } catch (err: any) {
+      spinner.warn(chalk.yellow(`QR creation failed: ${err.message}`));
+      appId = await promptInput('Enter operator appId');
+      if (!appId) { logger.error(chalk.red('Error: appId is required')); return; }
+      appSecret = await promptInput('Enter operator appSecret');
+      if (!appSecret) { logger.error(chalk.red('Error: appSecret is required')); return; }
+    }
+  } else {
+    appId = await promptInput('Enter operator appId');
+    if (!appId) { logger.error(chalk.red('Error: appId is required')); return; }
+    appSecret = await promptInput('Enter operator appSecret');
+    if (!appSecret) { logger.error(chalk.red('Error: appSecret is required')); return; }
+  }
+
+  // Auto-configure operator app (bot ability, IM permissions, events)
+  // Note: redirect URL and bitable:app are coordinator-only — not needed here.
+  const opCfg = appId && appSecret ? await configureApp(appId, appSecret, undefined, true) : null;
+  if (opCfg) {
+    if (opCfg.ability) console.log(chalk.green(`  ✓ Bot capability enabled`));
+    if (opCfg.scope) console.log(chalk.green(`  ✓ IM permissions & events subscribed`));
+    if (opCfg.ability || opCfg.scope) console.log('');
+  }
+
+  // Step 2: Name (optional)
+  const existingOps = Array.isArray(existingProfile.operators) ? existingProfile.operators : [];
+  const defaultName = `op-${appId.slice(0, 8)}`;
+  const name = await promptInput('Operator name (optional, for identification):', defaultName);
+
+  // Step 3: Domain (optional — skips intent recognition)
+  const hasDomain = await promptConfirm('Bind a domain to skip intent recognition?', false);
+  let domain: string | undefined;
+  if (hasDomain) {
+    domain = await promptInput('Domain name (e.g., "tech_support", "developer"):');
+    if (!domain.trim()) domain = undefined;
+  }
+
+  // Step 4: Save to profile
+  const operatorConfig = {
+    name: name || defaultName,
+    appId,
+    appSecret,
+    ...(domain ? { domain } : {}),
+  };
+
+  const operators = [...existingOps, operatorConfig];
+  existingProfile.operators = operators;
+  saveProfile(profile, existingProfile as Record<string, unknown>);
+
+  console.log('');
+  console.log(chalk.green(`  ✓ Operator "${name || defaultName}" added to profile "${profile}"`));
+  console.log(`    appSecret:  ${maskMiddle(appSecret)}`);
+  if (domain) console.log(`    domain:     ${domain}`);
+  else console.log(`    domain:     (none — will use intent recognition)`);
+  console.log('');
+  console.log(chalk.dim(`  Run \`bam setup operator\` again to add more operators.\n`));
 }
 
 // ---------------------------------------------------------------------------

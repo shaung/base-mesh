@@ -1,6 +1,6 @@
 {
   "name": "@base-mesh/cli",
-  "version": "0.0.2",
+  "version": "0.0.5",
   "description": "Asynchronous human-AI collaboration on Lark Bitable",
   "type": "module",
   "main": "./dist/cli.js",

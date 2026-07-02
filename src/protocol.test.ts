@@ -104,6 +104,7 @@ function makeConfig(overrides?: Partial<Config>): Config {
         human: 'f_human', deliveryOwner: 'f_delivery_owner',
         deliveryLeaseAt: 'f_delivery_lease_at', createdAt: 'f_created_at',
         notified: 'f_notified', metadata: 'f_metadata', updatedAt: 'f_updated_at',
+        appId: 'f_app_id',
       },
       roster: {
         identity: 'f_identity', nickname: 'f_nickname', kind: 'f_kind',
@@ -118,7 +119,8 @@ function makeConfig(overrides?: Partial<Config>): Config {
         ticketRecordId: 'f_r_ticket_id', status: 'f_r_status',
         executor: 'f_r_executor', reviewer: 'f_r_reviewer',
         reviewComment: 'f_r_review_comment', supplementPrompt: 'f_r_supplement_prompt',
-        result: 'f_r_result', createdAt: 'f_r_created_at', updatedAt: 'f_r_updated_at',
+        result: 'f_r_result', input: 'f_r_input', createdAt: 'f_r_created_at',
+        updatedAt: 'f_r_updated_at', appId: 'f_r_app_id',
       },
     },
     statuses: {
@@ -696,11 +698,11 @@ describe('Session — Round lifecycle', () => {
       const ticket = await createTestTicket(session, cfg);
       const round = await session.createRound(ticket.record_id!);
 
-      await session.setRoundSupplement(round.record_id!, 'Check this.', 'ou_reviewer');
+      await session.setRoundSupplement(round.record_id!, 'Check this.', '7d6f5g4h_reviewer');
 
       const updated = await session.getRound(round.record_id!);
       const reviewer = (updated?.fields as any)[cfg.fields.round.reviewer];
-      expect(reviewer).toEqual([{ id: 'ou_reviewer' }]);
+      expect(reviewer).toEqual([{ id: '7d6f5g4h_reviewer' }]);
     });
   });
 

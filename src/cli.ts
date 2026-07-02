@@ -68,8 +68,10 @@ async function ensureLogin(cfg: ReturnType<typeof loadConfig>, profile: string):
   if (stored?.userId) {
     const raw = readProfile(profile) || {};
     raw.ownerOpenId = stored.userId;
+    if (stored.unionId) raw.ownerUnionId = stored.unionId;
     saveProfile(profile, raw);
     console.log(`✓ ownerOpenId saved to profile "${profile}"`);
+    if (stored.unionId) console.log(`✓ ownerUnionId saved to profile "${profile}"`);
   }
   console.log('✓ Login complete.\n');
   return true;
@@ -139,10 +141,12 @@ export async function main(): Promise<void> {
 
   // `bam setup [channel|agent]` — interactive guided setup wizard
   if (cmd === 'setup') {
-    const { interactiveSetup } = await import('./setup.js');
+    const { interactiveSetup, setupOperator } = await import('./setup.js');
     // If subcommand given, pass it as mode
     const sub = positional[1];
-    if (sub === 'channel' || sub === 'agent') {
+    if (sub === 'operator') {
+      await setupOperator(profile);
+    } else if (sub === 'channel' || sub === 'agent') {
       await interactiveSetup(profile, sub);
     } else if (sub === 'executor') {
       console.warn('[deprecated] Use `setup agent` instead.');
@@ -468,6 +472,7 @@ export async function main(): Promise<void> {
   console.log('  setup             — interactive config wizard (prompts for mode)');
   console.log('  setup channel     — configure as Channel server (Feishu + Bitable)');
   console.log('  setup agent       — configure as Agent client (connect to Channel)');
+  console.log('  setup operator    — add a multi-operator bot account');
   console.log('');
   console.log('Auth commands:');
   console.log('  login             — OAuth PKCE authorization');

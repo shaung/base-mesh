@@ -2,27 +2,29 @@
 
 # base-mesh
 
-Asynchronous human-AI collaboration on Lark (Feishu) Bitable.
+Human-AI collaboration on Lark (Feishu) Bitable.
 
-> **⚠️ Disclaimer**: This project is in early development. It is not suitable for production use. APIs may change, and data safety and stability have not been fully validated.
+> **⚠️ Disclaimer**: This project is in early development. It is not suitable for production use. APIs may change and unexpected behavior may occur.
 
 ---
 
 ## Overview
 
-base-mesh turns a Lark Bitable spreadsheet into a ticketing system for asynchronous collaboration. Users send messages to a Feishu bot, which persists them as tickets in Bitable. AI agents (Claude Code) process the tickets and reply back through the bot — all asynchronously.
+base-mesh turns a Lark Bitable spreadsheet into a ticketing system for human-AI collaboration. Users send messages to a Lark bot, which creates tickets persisted in Bitable. Executors (agents) pick up the tickets, process them with an agent CLI, and reply back — all through the same chat thread.
 
 Two processes work together:
 
-- **Channel** — runs as a Feishu bot. Listens for incoming messages, creates tickets, dispatches work via WebSocket to agents, and delivers replies back to IM.
-- **Agent** — connects to the Channel via WebSocket, receives tickets, runs Claude Code to process them, and sends results back. No direct Bitable or Feishu credentials needed.
+- **Channel** — a server that connects to Lark's Bitable and IM APIs. Manages tickets, dispatches work to executors via WebSocket, and delivers replies.
+- **Executor (agent)** — connects to the Channel via WebSocket, receives tickets, runs an agent CLI, and returns results. No direct Lark credentials needed.
+
+For different problem domains, additional **Operator** bots can join the group chat, each optionally bound to a specific domain to handle specialized tickets without intent recognition.
 
 ---
 
 ## Prerequisites
 
 - Node.js >= 18
-- Claude Code CLI installed on agent machines
+- The agent CLI (e.g. [Claude Code](https://docs.anthropic.com/en/docs/claude-code)) installed on executor machines
 - A Lark/Feishu account
 
 ---
@@ -37,43 +39,17 @@ npm install -g @base-mesh/cli
 
 ## Quick Start
 
-These steps will get you from zero to your first ticket processed.
-
 ### 1. Set Up the Channel
 
 ```bash
 bam setup
 ```
 
-The wizard asks you to select a mode — choose **Channel mode**.
+Choose **Channel mode**. The wizard walks through three steps:
 
-#### App Credentials
-
-**Option A: Create via QR Code (recommended)**
-
-The wizard displays a QR code. Scan it with your Feishu/Lark app to instantly create a bot app. After the app is created, open the [Developer Console](https://open.feishu.cn/app) and:
-
-- Under **Permissions**, add **Bitable** (`bitable:app`)
-- Under **Bot**, enable the Bot capability, add permissions `im:message` and `im:message:send_as_bot`, and subscribe to the event `im.message.receive_v1`
-- (Optional) Add **Drive** permission `drive:drive` and subscribe to `drive.file.bitable_record_changed_v1` for event-driven updates
-
-The `appId` and `appSecret` are saved automatically.
-
-**Option B: Manual (existing app)**
-
-Enter your existing app's `appId` and `appSecret` directly. Ensure the app has Bitable permission and Bot capability enabled in the Developer Console before proceeding.
-
-#### OAuth Authorization
-
-The wizard shows a URL. Open it in your browser to authorize. This records your identity (`open_id`) for granting Bitable access and registering you as a human participant.
-
-> **Agent PKCE login**: Add `http://localhost:21721/callback` to the app's
-> **Redirect URLs** settings in the [Developer Console](https://open.feishu.cn/app).
-
-#### Bitable Configuration
-
-- **Create new** — the wizard creates a base with all required tables (Tickets, Turns, Roster, Rounds, Domains, Configs), seeds default config values, and grants you edit access.
-- **Use existing** — paste a Bitable URL; the wizard auto-maps tables by name.
+- **App credentials** — scan QR code (recommended) or enter existing appId/appSecret
+- **Authorization** — open the URL in your browser to log in
+- **Bitable** — create a new base, or paste an existing Bitable URL
 
 When it finishes, your profile is saved to `~/.bam/profiles/default.toml`.
 
@@ -83,36 +59,35 @@ When it finishes, your profile is saved to `~/.bam/profiles/default.toml`.
 bam channel
 ```
 
-This starts the IM bot, subscribes to Bitable events, and launches the WebSocket server that agents connect to.
+### 3. Set Up an Executor (Agent)
 
-### 3. Set Up an Agent
-
-An Agent is a machine that runs Claude Code to process tickets. It connects to the Channel over WebSocket — no direct Bitable or Feishu credentials needed.
-
-On a separate machine (or a second terminal):
+On a separate machine (or a second terminal), run:
 
 ```bash
 bam setup agent
 ```
 
-The wizard asks for:
+Enter the WebSocket URL (e.g. `ws://192.168.1.100:8765`), an identity, and the domains this executor handles.
 
-1. **WebSocket URL** — the Channel's address (e.g. `ws://192.168.1.100:8765`)
-2. **Identity** — a unique name for this agent (e.g. `agent-prod-1`)
-3. **Domains** — a comma-separated list of domains this agent handles (e.g. `general, tech_support`)
-4. **HITL policy** — optional human-in-the-loop approval requirement
-
-### 4. Start the Agent
+### 4. Start the Executor
 
 ```bash
 bam join
 ```
 
-The agent connects to the Channel, registers itself, and waits for work. Check the Channel logs for `push executor connected: agent-prod-1` to confirm.
+Wait for `push executor connected: <identity>` in the Channel logs.
 
 ### 5. Send Your First Message
 
-Talk to your bot in Feishu/Lark. The bot creates a ticket in Bitable, dispatches it to the connected agent, the agent processes it with Claude Code, and the reply is delivered back to the chat thread.
+Talk to your bot in Lark. A ticket is created, dispatched to an executor, processed, and replied back.
+
+### 6. Add Operator Bots (Optional)
+
+```bash
+bam setup operator
+```
+
+Each operator bot gets its own Lark credentials (scan QR code or enter manually). All configuration is automatic.
 
 
 ---
@@ -134,7 +109,7 @@ configsTableId = "tbl..."
 
 All other table IDs and runtime settings are loaded from the Configs table.
 
-### Minimal Agent Profile
+### Minimal Executor Profile
 
 ```toml
 [executor]
@@ -179,13 +154,15 @@ bam channel --lite
 
 ## Features
 
-Human-in-the-Loop (HITL): Processing rounds can require human approval. Configure per-agent in the Roster table (hitl and hitlPolicy fields).
+Multi-Operator Support: Run multiple Lark bots in the same group chat, each optionally bound to a specific domain. Thread replies without @-mention are captured by the last operator bot for that ticket, preventing duplicate turns while ensuring no message is silently lost — even if the last operator is temporarily offline.
+
+Human-in-the-Loop (HITL): Processing rounds can require human approval. Configure per-executor in the Roster table (hitl and hitlPolicy fields).
 
 Agent-to-Agent (A2A) Interop: When enabled, the Channel exposes REST endpoints for external AI agents: POST /a2a/tasks, GET /a2a/tasks/:id, POST /a2a/tasks/:id/cancel, GET /.well-known/agent.json. Supports S3 file sharing.
 
 Intent Recognition (Optional): Configure an LLM provider (Anthropic, OpenAI, or DeepSeek) in the Configs table to automatically classify incoming messages by domain, check completeness, and generate summaries.
 
-Dashboard: The agent starts a web dashboard on port 3456 showing per-ticket Claude execution traces. Requires sessionDir to be set.
+Dashboard: The executor starts a web dashboard on port 3456 showing per-ticket execution traces. Requires sessionDir to be set.
 
 ---
 
@@ -206,8 +183,8 @@ bam [options] <command>
 
 | Command | Description |
 |:---|:---|
-| `channel [--lite]` | Start the Channel (IM bot + coordinator; `--lite` = IM only) |
-| `join` | Start agent process |
+| `channel [--lite]` | Start the Channel (coordinator + IM; `--lite` = IM only) |
+| `join` | Start executor process |
 
 ### Setup
 
@@ -215,7 +192,7 @@ bam [options] <command>
 |:---|:---|
 | `setup` | Interactive setup wizard |
 | `setup channel` | Configure as Channel server |
-| `setup agent` | Configure as Agent client |
+| `setup agent` | Configure as executor (agent) |
 | `login` | OAuth PKCE authorization |
 
 ### Ticket Management

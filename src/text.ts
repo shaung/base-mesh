@@ -16,13 +16,14 @@ export function extractText(v: unknown): string {
   return String(v ?? '');
 }
 
-/** Extract user open_ids from a Feishu Person field (type 11) or Lookup
- *  field wrapping a Person field.
+/** Extract user IDs from a Feishu Person field (type 11) or Lookup
+ *  field wrapping a Person field. IDs can be open_id, union_id, or
+ *  user_id depending on the user_id_type used when writing.
  *
  *  Person field value:        [{ id: "ou_xxx", name: "...", ... }]
  *  Lookup wrapping Person:    { type: 11, value: [{ id: "ou_xxx", name: "...", ... }] }
  *
- *  Returns comma-separated open_ids, or empty string. */
+ *  Returns comma-separated IDs, or empty string. */
 export function extractUserIds(v: unknown): string {
   if (!v) return '';
   if (typeof v === 'object' && !Array.isArray(v)) {

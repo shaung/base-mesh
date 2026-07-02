@@ -109,8 +109,12 @@ export class Session {
       [this.rf.nickname]: this.nickname,
       [this.rf.lastSeenAt]: nowMs,
     };
-    // Write owner as Roster.human so turns can CC them
-    if (this.cfg.ownerOpenId) {
+    // Write owner to Roster.human so turns can CC them.
+    // Use union_id for Person field (cross-app resolvable).
+    const ownerHasPersonField = !!(this.cfg.ownerUnionId || this.cfg.ownerOpenId);
+    if (this.cfg.ownerUnionId) {
+      rosterFields[this.rf.human] = [{ id: this.cfg.ownerUnionId }];
+    } else if (this.cfg.ownerOpenId) {
       rosterFields[this.rf.human] = [{ id: this.cfg.ownerOpenId }];
     }
 
@@ -121,7 +125,8 @@ export class Session {
       if (storedNickname) this.nickname = storedNickname;
       this.log(`register: found identity=${this.identity} nickname=${this.nickname}`);
 
-      await this.bitable.updateRecord(this.cfg.rosterTableId, this.rosterRecordId, rosterFields);
+      // Pass union_id type for Person field (cross-app resolvable)
+      await this.bitable.updateRecord(this.cfg.rosterTableId, this.rosterRecordId, rosterFields, ownerHasPersonField ? 'union_id' : undefined);
     } else {
       this.log(`register: new identity=${this.identity} nickname=${this.nickname}`);
       rosterFields[this.rf.identity] = this.identity;
@@ -133,7 +138,7 @@ export class Session {
         hostname: hostname(), user: process.env.USER ?? 'unknown', pid: process.pid,
       });
       rosterFields[this.rf.registeredAt] = nowMs;
-      const record = await this.bitable.createRecord(this.cfg.rosterTableId, rosterFields);
+      const record = await this.bitable.createRecord(this.cfg.rosterTableId, rosterFields, ownerHasPersonField ? 'union_id' : undefined);
       this.rosterRecordId = record.record_id;
     }
   }
@@ -489,7 +494,7 @@ export class Session {
    *  existing one instead of creating a duplicate. This prevents duplicate
    *  Round creation from Bitable event races regardless of the trigger path.
    *  @param abilities — required ability labels stored in Round.required_abilities */
-  async createRound(ticketRecordId: string, domains?: string[]): Promise<BitableRecord> {
+  async createRound(ticketRecordId: string, domains?: string[], appId?: string, input?: string): Promise<BitableRecord> {
     // In-memory guard: check if we already started creating a round for this ticket.
     // Verifies via Bitable so a terminal round doesn't block a new one.
     const inFlight = this.creatingRounds.get(ticketRecordId);
@@ -525,6 +530,12 @@ export class Session {
     };
     if (domains && domains.length > 0) {
       roundFields[this.rfRound.domains] = JSON.stringify(domains);
+    }
+    if (appId) {
+      roundFields[this.rfRound.appId] = appId;
+    }
+    if (input) {
+      roundFields[this.rfRound.input] = input;
     }
     const round = await this.bitable.createRecord(this.cfg.roundsTableId!, roundFields);
     // Register in in-memory dedup map for eventual-consistency resilience
@@ -706,17 +717,19 @@ export class Session {
     }
   }
 
-  /** Write supplement prompt and reviewer to a Round (after approval). */
-  async setRoundSupplement(roundId: string, prompt: string, reviewerOpenId?: string): Promise<void> {
+  /** Write supplement prompt and reviewer to a Round (after approval).
+   *  @param reviewerUnionId — union_id for Person field (cross-app resolvable). */
+  async setRoundSupplement(roundId: string, prompt: string, reviewerUnionId?: string): Promise<void> {
     const update: Record<string, unknown> = {
       [this.rfRound.supplementPrompt]: prompt,
       [this.rfRound.updatedAt]: Date.now(),
     };
-    if (reviewerOpenId) {
-      update[this.rfRound.reviewer] = [{ id: reviewerOpenId }];
+    const hasReviewer = !!reviewerUnionId;
+    if (reviewerUnionId) {
+      update[this.rfRound.reviewer] = [{ id: reviewerUnionId }];
     }
     try {
-      await this.bitable.updateRecord(this.cfg.roundsTableId!, roundId, update);
+      await this.bitable.updateRecord(this.cfg.roundsTableId!, roundId, update, hasReviewer ? 'union_id' : undefined);
     } catch (err) {
       this.log(`setRoundSupplement failed ${roundId}:`, err);
     }
@@ -732,6 +745,33 @@ export class Session {
     });
   }
 
+  /** Get the appId of the last operator bot that interacted with this ticket.
+   *  Checks rounds first (most recent round's appId), then falls back to turns.
+   *  Returns null when no previous operator can be determined. */
+  async getLastOperatorAppId(ticketRecordId: string): Promise<string | null> {
+    try {
+      // Rounds are the most reliable indicator — the bot that created the last
+      // round is the one that last processed this ticket.
+      const rounds = await this.getRoundsByTicket(ticketRecordId);
+      if (rounds.length > 0) {
+        const newest = rounds[rounds.length - 1];
+        const appId = extractText(newest.fields[this.rfRound.appId] ?? '');
+        if (appId) return appId;
+      }
+      // Fall back to the most recent turn's appId (e.g. for draft tickets
+      // where no round has been created yet).
+      const turns = await this.getTurns(ticketRecordId);
+      if (turns.length > 0) {
+        const newest = turns[turns.length - 1];
+        const appId = extractText(newest.fields[this.nf.appId] ?? '');
+        if (appId) return appId;
+      }
+    } catch {
+      // best effort — caller handles null
+    }
+    return null;
+  }
+
   /** Find turns associated with a specific Round. */
   async getTurnsByRound(roundId: string): Promise<BitableRecord[]> {
     return this.bitable.searchRecords(this.cfg.turnsTableId, {
@@ -742,13 +782,20 @@ export class Session {
     });
   }
 
-  /** Assign unowned Turns to a Round (set their roundId field). Returns count assigned. */
-  async assignTurnsToRound(ticketRecordId: string, roundId: string): Promise<number> {
+  /** Assign unowned Turns to a Round (set their roundId field). Returns count assigned.
+   *  @param appId — if provided, only assign turns whose appId matches (prevents
+   *                 cross-operator turn merging in multi-operator mode). */
+  async assignTurnsToRound(ticketRecordId: string, roundId: string, appId?: string): Promise<number> {
     const turns = await this.getTurns(ticketRecordId);
     let assigned = 0;
     for (const turn of turns) {
       const existingRoundId = String(turn.fields[this.nf.roundId] ?? '');
       if (!existingRoundId && turn.record_id) {
+        // Skip turns from other operators to prevent cross-operator merging
+        if (appId) {
+          const turnAppId = extractText(turn.fields[this.nf.appId]) || '';
+          if (turnAppId && turnAppId !== appId) continue;
+        }
         try {
           await this.bitable.updateRecord(this.cfg.turnsTableId, turn.record_id, {
             [this.nf.roundId]: roundId,
@@ -985,6 +1032,7 @@ export class Session {
     roundId?: string,
     parts?: Part[],
     notified?: number,
+    appId?: string,
   ): Promise<string | null> {
     // Dedup check
     if (dedupKey) {
@@ -1022,6 +1070,7 @@ export class Session {
     if (turnStatus) fields[this.nf.status] = turnStatus;
     if (roundId) fields[this.nf.roundId] = roundId;
     if (parts && parts.length > 0) fields[this.nf.parts] = JSON.stringify(parts);
+    if (appId) fields[this.nf.appId] = appId;
 
     const record = await this.bitable.createRecord(this.cfg.turnsTableId, fields);
     return record.record_id;

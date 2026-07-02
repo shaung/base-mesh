@@ -116,6 +116,7 @@ const DEFAULT_FIELDS: FieldMapping = {
     notified: 'notified',
     metadata: 'metadata',
     updatedAt: 'updated_at',
+    appId: 'app_id',
   },
   round: {
     ticketRecordId: 'ticket_record_id',
@@ -127,8 +128,10 @@ const DEFAULT_FIELDS: FieldMapping = {
     supplementPrompt: 'supplement_prompt',
     result: 'result',
     artifacts: 'artifacts',
+    input: 'input',
     createdAt: 'created_at',
     updatedAt: 'updated_at',
+    appId: 'app_id',
   },
   roster: {
     identity: 'identity',
@@ -202,13 +205,22 @@ export function saveProfile(name: string, data: Record<string, unknown>): void {
   // Order top-level keys sensibly
   const topKeys = ['mode', 'appId', 'identity', 'nickname', 'openApiDomain', 'appToken',
     'ticketsTableId', 'turnsTableId', 'rosterTableId', 'roundsTableId', 'domainsTableId',
-    'ownerOpenId', 'peakInterval', 'offPeakInterval', 'nightInterval',
+    'ownerOpenId', 'ownerUnionId', 'peakInterval', 'offPeakInterval', 'nightInterval',
     'heartbeatIntervalSeconds', 'errorRetrySeconds', 'leaseDuration',
     'claudeTimeout', 'maxRetries', 'prompt'];
   for (const k of topKeys) if (k in data) out[k] = data[k];
   // sub-tables
   for (const k of ['fields', 'statuses', 'round_statuses', 'messages', 'channel', 'executor']) {
     if (data[k]) out[k] = data[k];
+  }
+  // operators array
+  if (Array.isArray(data.operators) && data.operators.length > 0) {
+    out.operators = data.operators.map((op: import('./types.js').BotConfig) => ({
+      name: op.name,
+      appId: op.appId,
+      appSecret: op.appSecret,
+      domain: op.domain,
+    }));
   }
   // any remaining keys
   for (const k of Object.keys(data)) {
@@ -384,6 +396,27 @@ export function loadConfig(profile = 'default'): Config {
   const nickname = String(raw.nickname ?? '') || randomNickname();
   const ch = (raw as any).channel;
 
+  // Parse operators list from TOML [[operators]] sections
+  const rawOperators = Array.isArray((raw as any).operators) ? (raw as any).operators : [];
+  const operators: import('./types.js').BotConfig[] = rawOperators
+    .filter((op: any) => op && typeof op === 'object' && op.appId)
+    .map((op: any) => ({
+      name: String(op.name ?? ''),
+      appId: String(op.appId ?? ''),
+      appSecret: String(op.appSecret ?? '') || undefined,
+      domain: String(op.domain ?? '') || undefined,
+    }));
+  // Ensure "default" operator from channel credentials is first
+  const defaultAppId = String(ch?.appId ?? raw.appId ?? '');
+  const hasDefault = operators.some((op) => op.appId === defaultAppId);
+  if (!hasDefault && defaultAppId) {
+    operators.unshift({
+      name: 'default',
+      appId: defaultAppId,
+      appSecret: String(ch?.appSecret ?? raw.appSecret ?? '') || undefined,
+    });
+  }
+
   return {
     appId: String(ch?.appId ?? raw.appId ?? ''),
     appSecret: String(ch?.appSecret ?? raw.appSecret ?? '') || undefined,
@@ -396,6 +429,7 @@ export function loadConfig(profile = 'default'): Config {
     domainsTableId: String(ch?.domainsTableId ?? raw.domainsTableId ?? '') || undefined,
     configsTableId: String(ch?.configsTableId ?? raw.configsTableId ?? '') || undefined,
     ownerOpenId: String(ch?.ownerOpenId ?? raw.ownerOpenId ?? '') || g('OWNER_OPEN_ID') || undefined,
+    ownerUnionId: String(ch?.ownerUnionId ?? raw.ownerUnionId ?? '') || undefined,
     fields,
     statuses,
     roundStatuses,
@@ -424,6 +458,7 @@ export function loadConfig(profile = 'default'): Config {
         }
       : undefined,
     domains: parseDomainMap((raw as any).domain),
+    operators: operators.length > 0 ? operators : undefined,
   };
 }
 

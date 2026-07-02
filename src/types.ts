@@ -48,6 +48,8 @@ export interface TurnFieldMapping {
   notified: string;
   metadata: string;
   updatedAt: string;
+  /** Bot appId that produced this turn (multi-operator). */
+  appId: string;
 }
 
 export interface RoundFieldMapping {
@@ -62,8 +64,12 @@ export interface RoundFieldMapping {
   result: string;
   /** A2A-compatible Artifact array as JSON string */
   artifacts: string;
+  /** Full user input sent to the executor (conversation text). */
+  input: string;
   createdAt: string;
   updatedAt: string;
+  /** Bot appId that owns this round (multi-operator). */
+  appId: string;
 }
 
 export interface RosterFieldMapping {
@@ -172,8 +178,23 @@ export interface StoredTokens {
   expiresAt: number;      // epoch ms
   scope?: string;
   userId?: string;         // open_id from OAuth response
+  unionId?: string;        // tenant/developer-wide union_id
   userName?: string;       // display name from OAuth response
   openApiDomain?: string;  // the open API host when this token was created
+}
+
+// ---- Multi-operator support --------------------------------------------
+
+/** Configuration for a single operator (bot account). */
+export interface BotConfig {
+  /** Operator identifier, e.g. "default", "tech-support-bot". */
+  name: string;
+  /** Lark appId for this operator. */
+  appId: string;
+  /** Lark appSecret for this operator. */
+  appSecret?: string;
+  /** Optional bound domain. If set, skip intent recognition. */
+  domain?: string;
 }
 
 // ---- Config -------------------------------------------------------------
@@ -317,6 +338,8 @@ export interface Config {
   appId: string;
   appSecret?: string;        // optional — PKCE mode doesn't need it
   openApiDomain?: string;    // e.g. "open.feishu.cn" or "open.larksuite.com"
+  /** Multi-operator bot configurations. First entry is the "default" operator. */
+  operators?: BotConfig[];
   /** Bitable app token. Empty string in agent mode. */
   appToken: string;
   /** Tickets table ID. Empty string in agent mode. */
@@ -341,8 +364,10 @@ export interface Config {
   };
   /** Per-domain config overrides (from TOML [domain.xxx] sections). */
   domains?: Record<string, DomainConfig>;
-  /** Optional — owner's Feishu open_id, written to Roster.human on register. */
+  /** Optional — owner's Feishu open_id, used for IM notifications. */
   ownerOpenId?: string;
+  /** Optional — owner's union_id, used for Person field writes (cross-app resolvable). */
+  ownerUnionId?: string;
   fields: FieldMapping;
   statuses: StatusMapping;
   /** Round state machine status mapping. Required when roundsTableId is set. */

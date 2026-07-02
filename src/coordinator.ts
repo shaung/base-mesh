@@ -6,7 +6,7 @@ import { logger } from './log.js';
 import { createServer } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { Client } from '@larksuiteoapi/node-sdk';
-import { Config, BitableRecord, Part, RoundStatusMapping } from './types.js';
+import { BotConfig, Config, BitableRecord, Part, RoundStatusMapping } from './types.js';
 import { BitableClient } from './bitable.js';
 import { Session } from './protocol.js';
 import { extractText, extractUserIds } from './text.js';
@@ -22,12 +22,14 @@ export class Coordinator {
   private executors = new Map<string, PushExecutor>();
   private bitable: BitableClient;
   private session: Session;
-  private client: Client;
+  private client: Client;           // primary channel-credential Client
+  /** Per-operator Lark Clients for multi-credential IM sending. */
+  private operatorClients = new Map<string, Client>();
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private roundPollTimer: ReturnType<typeof setInterval> | null = null;
   private inflightRounds = new Map<string, Promise<void>>();
-  /** Streaming card state per ticket (cardId + sequence). */
-  private streamingCards = new Map<string, { cardId: string; seq: number }>();
+  /** Streaming card state per ticket (cardId + sequence + appId for credential routing). */
+  private streamingCards = new Map<string, { cardId: string; seq: number; appId?: string }>();
   /** Buffered content for cards being created (key → pending updates). */
   private streamBuffer = new Map<string, Array<{ content: string; type: string }>>();
   /** Accumulated thinking content per card key (for final result update). */
@@ -39,6 +41,28 @@ export class Coordinator {
     this.session = new Session('channel', 'Channel', cfg, this.bitable);
     const dc = getDomainConfig(cfg.openApiDomain);
     this.client = new Client({ appId: cfg.appId, appSecret: cfg.appSecret || 'unused', domain: dc.sdkBaseUrl, loggerLevel: 2 });
+    // Initialize per-operator Clients for multi-credential IM sending
+    if (cfg.operators) {
+      for (const op of cfg.operators) {
+        if (op.appId && op.appSecret && op.appId !== cfg.appId) {
+          try {
+            const opClient = new Client({ appId: op.appId, appSecret: op.appSecret, domain: dc.sdkBaseUrl, loggerLevel: 2 });
+            this.operatorClients.set(op.appId, opClient);
+          } catch (err) {
+            logger.error(`[coordinator] failed to init operator client "${op.name}":`, err);
+          }
+        }
+      }
+    }
+  }
+
+  /** Get the Lark IM Client for a given appId, falling back to the primary client. */
+  private getClient(appId?: string): Client {
+    if (appId) {
+      const c = this.operatorClients.get(appId);
+      if (c) return c;
+    }
+    return this.client;
   }
 
   private running = true;
@@ -161,13 +185,22 @@ export class Coordinator {
           const content = msg.content as string || '';
           const rootMsgId = msg.root_msg_id as string;
           const contentType = msg.content_type as string || 'message';
+          // Determine operator appId from round for credential routing
+          let streamAppId: string | undefined;
+          if (roundId && this.cfg.roundsTableId) {
+            try {
+              const r = await this.session.getRound(roundId);
+              if (r) streamAppId = extractText(r.fields[this.cfg.fields.round.appId]) || undefined;
+            } catch {}
+          }
+          const streamClient = this.getClient(streamAppId);
           if (!this.streamingCards.has(cardKey) && rootMsgId) {
             // Buffer content and set placeholder so stream_end can find us
             const buf = this.streamBuffer.get(cardKey) || [];
             buf.push({ content, type: contentType });
             this.streamBuffer.set(cardKey, buf);
             if (buf.length > 1) return;
-            this.streamingCards.set(cardKey, { cardId: '', seq: 0 });
+            this.streamingCards.set(cardKey, { cardId: '', seq: 0, appId: streamAppId });
             try {
               const cardSpec = {
                 schema: '2.0',
@@ -178,10 +211,10 @@ export class Coordinator {
                   { tag: 'markdown', element_id: 'stream_stats', content: '', text_size: 'body' },
                 ] },
               };
-              const cardResp = await this.client.cardkit.v1.card.create({ data: { type: 'card_json', data: JSON.stringify(cardSpec) } }) as any;
+              const cardResp = await streamClient.cardkit.v1.card.create({ data: { type: 'card_json', data: JSON.stringify(cardSpec) } }) as any;
               const cardId = cardResp?.data?.card_id;
               if (!cardId) { this.streamingCards.delete(cardKey); this.streamBuffer.delete(cardKey); return; }
-              const sendResp = await this.client.im.v1.message.reply({ path: { message_id: rootMsgId }, data: { msg_type: 'interactive', content: JSON.stringify({ type: 'card', data: { card_id: cardId } }), reply_in_thread: true } as any }) as any;
+              const sendResp = await streamClient.im.v1.message.reply({ path: { message_id: rootMsgId }, data: { msg_type: 'interactive', content: JSON.stringify({ type: 'card', data: { card_id: cardId } }), reply_in_thread: true } as any }) as any;
               if (!sendResp?.data?.message_id) { this.streamingCards.delete(cardKey); this.streamBuffer.delete(cardKey); return; }
               // Update placeholder with real cardId
               const st = this.streamingCards.get(cardKey);
@@ -204,11 +237,11 @@ export class Coordinator {
               const st2 = this.streamingCards.get(cardKey);
               if (thinkingFull && st2) {
                 st2.seq++;
-                try { await this.client.cardkit.v1.cardElement.content({ path: { card_id: cardId, element_id: 'stream_thinking' }, data: { content: thinkingFull, sequence: st2.seq, uuid: `t_${cardId}_${st2.seq}` } }); } catch {}
+                try { await streamClient.cardkit.v1.cardElement.content({ path: { card_id: cardId, element_id: 'stream_thinking' }, data: { content: thinkingFull, sequence: st2.seq, uuid: `t_${cardId}_${st2.seq}` } }); } catch {}
               }
               if (answerFull && st2) {
                 st2.seq++;
-                try { await this.client.cardkit.v1.cardElement.content({ path: { card_id: cardId, element_id: 'stream_answer' }, data: { content: answerFull, sequence: st2.seq, uuid: `a_${cardId}_${st2.seq}` } }); } catch {}
+                try { await streamClient.cardkit.v1.cardElement.content({ path: { card_id: cardId, element_id: 'stream_answer' }, data: { content: answerFull, sequence: st2.seq, uuid: `a_${cardId}_${st2.seq}` } }); } catch {}
               }
               this.streamThinkingAccumulated.set(cardKey, thinkingFull);
               this.streamAnswerAccumulated.set(cardKey, answerFull);
@@ -224,14 +257,14 @@ export class Coordinator {
               const full = prev + sep + display;
               this.streamThinkingAccumulated.set(cardKey, full);
               s.seq++;
-              try { await this.client.cardkit.v1.cardElement.content({ path: { card_id: s.cardId, element_id: 'stream_thinking' }, data: { content: full, sequence: s.seq, uuid: `st_${s.cardId}_${s.seq}` } }); } catch {}
+              try { await streamClient.cardkit.v1.cardElement.content({ path: { card_id: s.cardId, element_id: 'stream_thinking' }, data: { content: full, sequence: s.seq, uuid: `st_${s.cardId}_${s.seq}` } }); } catch {}
             } else {
               const prev = this.streamAnswerAccumulated.get(cardKey) || '';
               const sep = prev && !prev.endsWith('\n') ? '\n' : '';
               const full = prev + sep + content;
               this.streamAnswerAccumulated.set(cardKey, full);
               s.seq++;
-              try { await this.client.cardkit.v1.cardElement.content({ path: { card_id: s.cardId, element_id: 'stream_answer' }, data: { content: full, sequence: s.seq, uuid: `sa_${s.cardId}_${s.seq}` } }); } catch {}
+              try { await streamClient.cardkit.v1.cardElement.content({ path: { card_id: s.cardId, element_id: 'stream_answer' }, data: { content: full, sequence: s.seq, uuid: `sa_${s.cardId}_${s.seq}` } }); } catch {}
             }
           }
           return;
@@ -252,17 +285,18 @@ export class Coordinator {
           }
           if (s && s.cardId) {
             // Finalize both elements, then close streaming mode.
+            const streamClient = this.getClient(s.appId);
             const thinkingContent = this.streamThinkingAccumulated.get(cardKey) || '';
             const answerContent = this.streamAnswerAccumulated.get(cardKey) || content;
             if (thinkingContent) {
               s.seq++;
-              try { await this.client.cardkit.v1.cardElement.content({ path: { card_id: s.cardId, element_id: 'stream_thinking' }, data: { content: thinkingContent, sequence: s.seq, uuid: `ft_${s.cardId}_${s.seq}` } }); } catch { /* best-effort */ }
+              try { await streamClient.cardkit.v1.cardElement.content({ path: { card_id: s.cardId, element_id: 'stream_thinking' }, data: { content: thinkingContent, sequence: s.seq, uuid: `ft_${s.cardId}_${s.seq}` } }); } catch { /* best-effort */ }
             }
             if (answerContent) {
               s.seq++;
-              try { await this.client.cardkit.v1.cardElement.content({ path: { card_id: s.cardId, element_id: 'stream_answer' }, data: { content: answerContent, sequence: s.seq, uuid: `fa_${s.cardId}_${s.seq}` } }); } catch { /* best-effort */ }
+              try { await streamClient.cardkit.v1.cardElement.content({ path: { card_id: s.cardId, element_id: 'stream_answer' }, data: { content: answerContent, sequence: s.seq, uuid: `fa_${s.cardId}_${s.seq}` } }); } catch { /* best-effort */ }
             }
-            // Append stats line (token usage + duration) in a separate element
+            // Append stats line
             const statsParts: string[] = [];
             if (tokenUsage) {
               const total = (tokenUsage.input || 0) + (tokenUsage.output || 0);
@@ -274,7 +308,7 @@ export class Coordinator {
             if (statsParts.length > 0) {
               s.seq++;
               const statsText = `— *${statsParts.join(' · ')}* —`;
-              try { await this.client.cardkit.v1.cardElement.content({ path: { card_id: s.cardId, element_id: 'stream_stats' }, data: { content: statsText, sequence: s.seq, uuid: `ss_${s.cardId}_${s.seq}` } }); } catch { /* best-effort */ }
+              try { await streamClient.cardkit.v1.cardElement.content({ path: { card_id: s.cardId, element_id: 'stream_stats' }, data: { content: statsText, sequence: s.seq, uuid: `ss_${s.cardId}_${s.seq}` } }); } catch { /* best-effort */ }
             }
             try {
               const settingsData = {
@@ -287,7 +321,7 @@ export class Coordinator {
                   uuid: `c_${s.cardId}_${s.seq}`,
                 },
               };
-              await this.client.cardkit.v1.card.settings(settingsData);
+              await streamClient.cardkit.v1.card.settings(settingsData);
             } catch { /* best-effort */ }
             this.streamingCards.delete(cardKey);
             this.streamThinkingAccumulated.delete(cardKey);
@@ -305,14 +339,53 @@ export class Coordinator {
           const reassignTo = msg.reassignTo as { roles?: string[]; kind?: string } | undefined;
           const parts = Array.isArray(msg.parts) ? msg.parts as Part[] : undefined;
 
-          console.log(`[coordinator] result from ${identity} ticket=${ticketId} answer=${answer.slice(0, 60)}${parts ? ` parts=${parts.length}` : ''}`);
+          // Determine operator appId: replies use round's appId, reactions use
+          // the user turn's appId (source of truth for cross-operator reactions).
+          let resultAppId: string | undefined;
+          let reactionAppId: string | undefined;
+          if (roundId && this.cfg.roundsTableId) {
+            try {
+              const round = await this.session.getRound(roundId);
+              if (round) {
+                resultAppId = extractText(round.fields[this.cfg.fields.round.appId]) || undefined;
+              }
+            } catch { /* ignore */ }
+          }
+          // Parse reaction appId from the user turn's appId field or dedupKey
+          if (ticketId) {
+            try {
+              const resultTurns = await this.session.getTurns(ticketId);
+              for (const t of resultTurns) {
+                const role = extractText(t.fields[this.cfg.fields.turn.role]);
+                if (role === 'user') {
+                  const fieldVal = extractText(t.fields[this.cfg.fields.turn.appId]);
+                  if (fieldVal) { reactionAppId = fieldVal; break; }
+                  const dedupKey = extractText(t.fields[this.cfg.fields.turn.dedupKey]);
+                  if (dedupKey) {
+                    const colonIdx = dedupKey.indexOf(':');
+                    if (colonIdx > 0) {
+                      reactionAppId = dedupKey.slice(0, colonIdx);
+                      break;
+                    }
+                  }
+                }
+              }
+            } catch { /* ignore */ }
+          }
+          // Fallback: if no round-based appId, use turn-derived for replies too
+          if (!resultAppId) resultAppId = reactionAppId;
+
+          console.log(`[coordinator] result from ${identity} ticket=${ticketId} answer=${answer.slice(0, 60)}${parts ? ` parts=${parts.length}` : ''} roundAppId=${resultAppId || 'none'} reactionAppId=${reactionAppId || 'none'} using=${resultAppId || reactionAppId || 'primary'}`);
           console.log(`[coordinator] writing agent turn for ticket=${ticketId}`);
           try {
-            const turnId = await this.session.appendTurn(ticketId, 'agent', answer, `${ticketId}_${Date.now()}`, identity, 'answered', rootMsgId, roundId, parts, 1);
+            // Prefix dedupKey with appId so Channel's getAppIdFromTurn fallback
+            // (dedupKey parsing) works even if the app_id column is missing.
+            const agentDedupKey = resultAppId ? `${resultAppId}:${ticketId}_${Date.now()}` : `${ticketId}_${Date.now()}`;
+            const turnId = await this.session.appendTurn(ticketId, 'agent', answer, agentDedupKey, identity, 'answered', rootMsgId, roundId, parts, 1, resultAppId);
             console.log(`[coordinator] agent turn written ticket=${ticketId} turnId=${turnId}`);
             if (answer && rootMsgId && !msg.streamed) {
               try {
-                await this.notifyIM(rootMsgId, answer);
+                await this.notifyIM(rootMsgId, answer, resultAppId);
               } catch (imErr) {
                 logger.error(`[coordinator] direct IM delivery failed ticket=${ticketId}:`, imErr instanceof Error ? imErr.message : imErr);
                 if (turnId) try { await this.bitable.updateRecord(this.cfg.turnsTableId, turnId, { [this.cfg.fields.turn.notified]: 0 }); } catch { /* */ }
@@ -371,7 +444,7 @@ export class Coordinator {
           try {
             const resultTurns = await this.session.getTurns(ticketId);
             const latestId = latestTurnMessageId(resultTurns, this.cfg.fields.turn.role, this.cfg.fields.turn.dedupKey);
-            if (latestId) await this.removeReaction(latestId, 'OneSecond');
+            if (latestId) await this.removeReaction(latestId, 'OneSecond', reactionAppId);
           } catch { /* */ }
 
           const ex = this.executors.get(identity);
@@ -433,6 +506,22 @@ export class Coordinator {
   private async dispatchTask(ex: PushExecutor, ticket: BitableRecord, recordId: string): Promise<void> {
     ex.activeTicketId = recordId;
     const turns = await this.session.getTurns(recordId);
+    // Determine appId from the first user turn's field or dedupKey
+    const appId = (() => {
+      for (const t of turns) {
+        const role = extractText(t.fields[this.cfg.fields.turn.role]);
+        if (role === 'user') {
+          const fieldVal = extractText(t.fields[this.cfg.fields.turn.appId]);
+          if (fieldVal) return fieldVal;
+          const dedupKey = extractText(t.fields[this.cfg.fields.turn.dedupKey]);
+          if (dedupKey) {
+            const colonIdx = dedupKey.indexOf(':');
+            if (colonIdx > 0) return dedupKey.slice(0, colonIdx);
+          }
+        }
+      }
+      return undefined;
+    })();
     ex.ws.send(JSON.stringify({
       type: 'task', ticket: { record_id: recordId, fields: ticket.fields },
       turns: turns.map(t => ({ record_id: t.record_id, fields: t.fields })),
@@ -444,10 +533,10 @@ export class Coordinator {
     // React to the latest user turn message, not the thread root
     const latestMsgId = latestTurnMessageId(turns, this.cfg.fields.turn.role, this.cfg.fields.turn.dedupKey);
     if (latestMsgId) {
-      try { await this.removeReaction(latestMsgId, 'OneSecond'); } catch { /* */ }
-      try { await this.reactToMessage(latestMsgId, 'OnIt'); } catch { /* */ }
-}
-    console.log(`[coordinator] ticket ${recordId} assigned to ${ex.identity}`);
+      try { await this.removeReaction(latestMsgId, 'OneSecond', appId); } catch { /* */ }
+      try { await this.reactToMessage(latestMsgId, 'OnIt', appId); } catch { /* */ }
+    }
+    console.log(`[coordinator] ticket ${recordId} assigned to ${ex.identity} appId=${appId || 'primary'}`);
   }
 
   canHandle(_ticket: BitableRecord): boolean {
@@ -716,6 +805,24 @@ export class Coordinator {
 
     const turns = await this.session.getTurns(recordId);
     const supplementPrompt = String(round.fields[this.cfg.fields.round.supplementPrompt] ?? '');
+    const roundAppId = extractText(round.fields[this.cfg.fields.round.appId]) || undefined;
+    // Reactions should use user turn's appId (reliable source of truth).
+    // Parse from the first user turn's appId field or dedupKey.
+    const turnAppId = (() => {
+      for (const t of turns) {
+        const role = extractText(t.fields[this.cfg.fields.turn.role]);
+        if (role === 'user') {
+          const fieldVal = extractText(t.fields[this.cfg.fields.turn.appId]);
+          if (fieldVal) return fieldVal;
+          const dedupKey = extractText(t.fields[this.cfg.fields.turn.dedupKey]);
+          if (dedupKey) {
+            const colonIdx = dedupKey.indexOf(':');
+            if (colonIdx > 0) return dedupKey.slice(0, colonIdx);
+          }
+        }
+      }
+      return undefined;
+    })();
 
     ex.ws.send(JSON.stringify({
       type: 'task',
@@ -734,10 +841,10 @@ export class Coordinator {
     // React to the latest user turn message, not the thread root
     const latestMsgId = latestTurnMessageId(turns, this.cfg.fields.turn.role, this.cfg.fields.turn.dedupKey);
     if (latestMsgId) {
-      try { await this.removeReaction(latestMsgId, 'OneSecond'); } catch { /* */ }
-      try { await this.reactToMessage(latestMsgId, 'OnIt'); } catch { /* */ }
-}
-    console.log(`[coordinator] round ${round.record_id!} dispatched to ${ex.identity}`);
+      try { await this.removeReaction(latestMsgId, 'OneSecond', turnAppId); } catch { /* */ }
+      try { await this.reactToMessage(latestMsgId, 'OnIt', turnAppId); } catch { /* */ }
+    }
+    console.log(`[coordinator] round ${round.record_id!} dispatched to ${ex.identity} turnAppId=${turnAppId || '?'} roundAppId=${roundAppId || '?'}`);
   }
 
   /** Send cancel to a push executor assigned to this Round. Returns true if sent. */
@@ -752,6 +859,14 @@ export class Coordinator {
       if (!ex || !ex.ws) return false;
       ex.ws.send(JSON.stringify({ type: 'cancel', round_id: roundId }));
       console.log(`[coordinator] sent cancel to ${identity} for round ${roundId}`);
+      // Clear activeTicketId so the executor can be reassigned to the next
+      // round. Guard by ticket match to prevent races: only clear when the
+      // executor's current ticket matches this round's ticket, so a stale
+      // result from an aborted round cannot orphan a newly assigned ticket.
+      const ticketId = String(round.fields[this.cfg.fields.round.ticketRecordId] ?? '');
+      if (ticketId && ex.activeTicketId === ticketId) {
+        ex.activeTicketId = undefined;
+      }
       return true;
     } catch (err) {
       logger.error(`[coordinator] dispatchCancelToExecutor failed:`, err);
@@ -914,23 +1029,43 @@ export class Coordinator {
   }
 
   // -- IM helpers ------------------------------------------------------------
-  private async reactToMessage(messageId: string, emojiType: string) {
-    if (!this.cfg.appSecret) return;
-    await this.client.im.v1.messageReaction.create({
-      path: { message_id: messageId },
-      data: { reaction_type: { emoji_type: emojiType } },
-    });
+  private async reactToMessage(messageId: string, emojiType: string, appId?: string) {
+    if (!this.cfg.appSecret && !appId) return;
+    const client = this.getClient(appId);
+    try {
+      await client.im.v1.messageReaction.create({
+        path: { message_id: messageId },
+        data: { reaction_type: { emoji_type: emojiType } },
+      });
+    } catch { /* best effort */ }
   }
 
-  /** Find and remove a reaction by emoji type. Silently handles not-found. */
-  private async removeReaction(messageId: string, emojiType: string) {
-    if (!this.cfg.appSecret) return;
+  /** Find and remove a reaction by emoji type. Silently handles not-found
+   *  and permission errors (231007 = reaction added by another bot). */
+  private async removeReaction(messageId: string, emojiType: string, appId?: string) {
+    if (!this.cfg.appSecret && !appId) return;
+    const client = this.getClient(appId);
     try {
-      const list = await this.client.im.v1.messageReaction.list({ path: { message_id: messageId } }) as any;
+      const list = await client.im.v1.messageReaction.list({ path: { message_id: messageId } }) as any;
       const items = list?.data?.items || [];
       for (const r of items) {
         if (r.reaction_type?.emoji_type === emojiType && r.reaction_id) {
-          await this.client.im.v1.messageReaction.delete({ path: { message_id: messageId, reaction_id: r.reaction_id } });
+          // Skip reactions added by other apps (multi-operator: each bot
+          // can only remove its own reactions)
+          const opType = r.operator?.operator_type;
+          const opId = r.operator?.operator_id;
+          if (opType === 'app' && opId && appId && !appId.endsWith(opId)) {
+            continue;
+          }
+          try {
+            await client.im.v1.messageReaction.delete({ path: { message_id: messageId, reaction_id: r.reaction_id } });
+          } catch (err: any) {
+            // 231007 = no permission to delete (reaction added by another bot).
+            // Swallow silently — SDK's internal logger may still print it,
+            // but our business logic treats it as expected.
+            const apiCode = err?.response?.data?.code ?? err?.code;
+            if (apiCode !== 231007) throw err;
+          }
           return;
         }
       }
@@ -938,11 +1073,12 @@ export class Coordinator {
   }
 
   // -- One-time IM notification (not recorded as Turn) ----------------------
-  private async notifyIM(rootMsgId: string, text: string) {
-    if (!text.trim() || !this.cfg.appSecret) return;
+  private async notifyIM(rootMsgId: string, text: string, appId?: string) {
+    if (!text.trim() || (!this.cfg.appSecret && !appId)) return;
+    const client = this.getClient(appId);
     const card = { schema: '2.0', body: { elements: [{ tag: 'markdown', content: text }] } };
     try {
-      await this.client.im.v1.message.reply({
+      await client.im.v1.message.reply({
         path: { message_id: rootMsgId },
         data: { msg_type: 'interactive', content: JSON.stringify(card), reply_in_thread: true } as any,
       });
@@ -950,7 +1086,7 @@ export class Coordinator {
       // Card may fail if markdown has too many tables — fall back to plain text
       const apiCode = err?.response?.data?.code ?? err?.code;
       if (apiCode === 230099 || String(err?.message ?? err).includes('card table number over limit')) {
-        await this.client.im.v1.message.reply({
+        await client.im.v1.message.reply({
           path: { message_id: rootMsgId },
           data: { msg_type: 'text', content: JSON.stringify({ text }), reply_in_thread: true } as any,
         });
@@ -1012,13 +1148,18 @@ function parseDomains(v: unknown): string[] {
   }
 }
 
-/** Find the latest user turn's message ID (dedupKey) from the turns list.
+/** Find the latest user turn's message ID from the turns list.
+ *  Handles dedupKey formats: "messageId" (legacy) or "appId:messageId" (multi-operator).
  *  Reacts to the most recent user message rather than the thread root. */
 function latestTurnMessageId(turns: BitableRecord[], roleField: string, dedupKeyField: string): string {
   for (let i = turns.length - 1; i >= 0; i--) {
     const role = extractText(turns[i].fields[roleField]);
     if (role === 'user') {
-      return extractText(turns[i].fields[dedupKeyField]);
+      const raw = extractText(turns[i].fields[dedupKeyField]);
+      if (!raw) return '';
+      // Strip "appId:" prefix if present (multi-operator dedupKey format)
+      const colonIdx = raw.indexOf(':');
+      return colonIdx > 0 ? raw.slice(colonIdx + 1) : raw;
     }
   }
   return '';

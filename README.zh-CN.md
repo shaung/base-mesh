@@ -4,27 +4,27 @@
 
 基于飞书多维表格的异步人机协作系统。
 
-> **⚠️ 免责声明**：本项目处于早期开发阶段，当前版本不适合在生产环境中使用。API 可能变更，数据安全性和稳定性尚未得到充分验证。
+> **⚠️ 免责声明**：本项目处于早期开发阶段，可能存在缺陷，当前版本尚不适合用于正式生产环境。API 可能变更。
 
 ---
 
 ## 简介
 
-base-mesh 将飞书多维表格变成一个工单系统，用于人类和 AI agent 之间的异步协作。用户向飞书机器人发送消息，消息作为工单持久化到多维表格中。AI executor（Claude Code）处理工单并通过机器人回复 — 全异步进行，无需保持在线连接。
+base-mesh 将飞书多维表格变成一个工单系统，用于人类和 AI 之间的协作。用户向飞书机器人发送消息，消息作为工单持久化到多维表格中。Executor（agent）通过 agent CLI 处理工单并通过机器人回复。
 
 两个进程协同工作：
 
-- **Channel** — 作为飞书机器人运行。监听消息、创建工单、投递回复。可选内嵌 coordinator 用于分发任务给 executor。
-- **Executor** — 通过 WebSocket 连接 Channel，接收任务，运行 Claude Code，返回结果。
+- **Channel** — 连接飞书多维表格和 IM API 的服务端。管理工单、通过 WebSocket 分发任务给 executor、投递回复。
+- **Executor** — 通过 WebSocket 连接 Channel，接收任务，运行 agent CLI，返回结果。不需要直接访问飞书 API。
 
-它们可以在同一台或不同机器上运行，只要能够访问飞书 API 即可。
+针对不同的领域，可以添加额外的 **Operator** 机器人与 Channel 共享同一群聊，每个可选绑定特定领域以跳过意图识别，直接处理专业的工单。
 
 ---
 
 ## 前置条件
 
 - Node.js >= 18
-- 已安装 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI
+- agent CLI（如 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)）已安装在 executor 机器上
 - 一个已拥有多维表格 + 机器人能力的飞书**自定义应用**
 
 ---
@@ -45,35 +45,11 @@ npm install -g @base-mesh/cli
 bam setup
 ```
 
-向导会提示选择模式，选择 **Channel 模式**。
+选择 **Channel 模式**。向导依次完成：
 
-#### 应用凭据
-
-**方式 A：通过二维码创建（推荐）**
-
-向导显示二维码，用飞书/Lark 扫描即可创建机器人应用。创建后在[开发者后台](https://open.feishu.cn/app)：
-
-- 添加权限：**多维表格**（`bitable:app`）
-- 添加**机器人**能力，开启 `im:message` 和 `im:message:send_as_bot`，订阅 `im.message.receive_v1`
-- （可选）添加**云文档**权限 `drive:drive`，订阅 `drive.file.bitable_record_changed_v1`
-
-`appId` 和 `appSecret` 会自动保存。
-
-**方式 B：手动输入（已有应用）**
-
-直接输入现有应用的 `appId` 和 `appSecret`。请确保应用已开启多维表格权限和机器人能力。
-
-#### OAuth 授权
-
-向导会输出一个 URL，在浏览器中打开完成授权。授权后记录你的身份（`open_id`），用于多维表格授权和注册为人工参与者。
-
-> **Agent PKCE 登录**：在[开发者后台](https://open.feishu.cn/app)的
-> **安全设置 → 重定向 URL** 中添加 `http://localhost:21721/callback`。
-
-#### 多维表格配置
-
-- **创建新表格** — 向导自动创建包含所有必需表（Tickets、Turns、Roster、Rounds、Domains、Configs）的 Base，写入默认配置并授予编辑权限。
-- **关联已有表格** — 粘贴多维表格 URL，向导按表名自动匹配。
+- **应用凭据** — 扫描二维码（推荐）或输入已有 appId/appSecret
+- **身份授权** — 在浏览器中打开链接完成登录
+- **多维表格** — 创建新 Base，或粘贴已有 Bitable URL
 
 完成后配置保存在 `~/.bam/profiles/default.toml`。
 
@@ -83,11 +59,7 @@ bam setup
 bam channel
 ```
 
-启动 IM 机器人、订阅多维表格事件、启动 WebSocket 服务器供 executor 连接。
-
 ### 3. 设置 Executor（工作节点）
-
-Executor 是运行 Claude Code 处理工单的机器。它通过 WebSocket 连接 Channel，不需要直接访问飞书 API。
 
 在另一台机器或另一个终端中：
 
@@ -95,12 +67,7 @@ Executor 是运行 Claude Code 处理工单的机器。它通过 WebSocket 连�
 bam setup agent
 ```
 
-向导会依次询问：
-
-1. **WebSocket 地址** — Channel 的地址（如 `ws://192.168.1.100:8765`）
-2. **名称** — 该 executor 的唯一标识（如 `agent-prod-1`）
-3. **领域** — 该 executor 能处理的领域列表（如 `general, tech_support`）
-4. **HITL 策略** — 可选的人工审批要求
+输入 WebSocket 地址（如 `ws://192.168.1.100:8765`）、executor 名称和处理的领域。
 
 ### 4. 启动 Executor
 
@@ -108,11 +75,19 @@ bam setup agent
 bam join
 ```
 
-Executor 连接到 Channel 并等待处理工单。在 Channel 日志中看到 `push executor connected: agent-prod-1` 即表示连接成功。
+等待 Channel 日志中出现 `push executor connected: <名称>`。
 
 ### 5. 发送第一条消息
 
-在飞书中与机器人对话。机器人会创建工单、分发给 executor、处理完成后将结果回复到聊天中。
+在飞书中与机器人对话。系统会自动创建工单、分发处理并回复。
+
+### 6. 添加 Operator 机器人（可选）
+
+```bash
+bam setup operator
+```
+
+每个 operator 使用独立的飞书凭据（二维码或手动输入），自动完成配置。
 
 ---
 
@@ -131,7 +106,7 @@ appToken = "QBX..."
 configsTableId = "tbl..."
 ```
 
-### 最小配置（Agent）
+### 最小配置（Executor）
 
 ```toml
 [executor]
@@ -169,7 +144,7 @@ pm2 start ecosystem.config.cjs
 ### 分离部署
 
 1. 在服务器上运行 `bam channel`（IM 机器人 + coordinator）
-2. 在 worker 机器上配置 agent 并运行 `bam join`
+2. 在 worker 机器上配置 executor 并运行 `bam join`
 
 ### Channel Lite 模式
 
@@ -183,13 +158,15 @@ bam channel --lite
 
 ## 特性
 
-**人工审批（HITL）**：处理轮次可要求人工批准。在 Roster 表中按 agent 配置（hitl 和 hitlPolicy 字段）。
+**多机器人支持**：在同一个群聊中运行多个飞书机器人分担负载。用户回复 thread 但未 @-mention 机器人时，由最近处理该工单的机器人写入 turn，避免多 bot 产生重复记录；若最近机器人离线，其他机器人自动兜底写入。
+
+**人工审批（HITL）**：处理轮次可要求人工批准。在 Roster 表中按 executor 配置（hitl 和 hitlPolicy 字段）。
 
 **Agent-to-Agent (A2A) 互通**：启用后 Channel 对外暴露 REST 端点：`POST /a2a/tasks`、`GET /a2a/tasks/:id`、`POST /a2a/tasks/:id/cancel`、`GET /.well-known/agent.json`。支持 S3 文件共享。
 
 **意图识别（可选）**：在 Configs 表中配置 LLM 供应商（Anthropic、OpenAI 或 DeepSeek）后，系统可自动对消息进行分类、检查完整性和生成摘要。
 
-**执行日志看板**：Agent 在 3456 端口启动 Web 看板，展示每个工单的 Claude 执行追踪。需要设置 `sessionDir`。
+**执行日志看板**：Executor 在 3456 端口启动 Web 看板，展示每个工单的执行追踪。需要设置 `sessionDir`。
 
 ---
 
@@ -211,7 +188,7 @@ bam [options] <command>
 | 命令 | 说明 |
 |:---|:---|
 | `channel [--lite]` | 启动 Channel（IM bot + coordinator；`--lite` 仅 IM） |
-| `join` | 启动 Agent 进程 |
+| `join` | 启动 Executor 进程 |
 
 ### 设置命令
 
@@ -219,7 +196,7 @@ bam [options] <command>
 |:---|:---|
 | `setup` | 交互式配置向导 |
 | `setup channel` | 配置为 Channel 服务端 |
-| `setup agent` | 配置为 Agent 客户端 |
+| `setup agent` | 配置为 Executor（agent） |
 | `login` | OAuth PKCE 授权 |
 
 ### 工单管理

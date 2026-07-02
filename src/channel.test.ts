@@ -91,7 +91,7 @@ function makeChannelConfig(): Config {
         agentIdentity: 'f_agent_identity', human: 'f_human', parts: 'f_parts',
         deliveryOwner: 'f_delivery_owner', deliveryLeaseAt: 'f_delivery_lease_at',
         createdAt: 'f_created_at', notified: 'f_notified', metadata: 'f_metadata',
-        updatedAt: 'f_updated_at',
+        updatedAt: 'f_updated_at', appId: 'f_app_id',
       },
       roster: {
         identity: 'f_identity', nickname: 'f_nickname', kind: 'f_kind',
@@ -106,7 +106,8 @@ function makeChannelConfig(): Config {
         ticketRecordId: 'f_r_ticket_id', domains: 'f_r_domains', status: 'f_r_status',
         executor: 'f_r_executor', reviewer: 'f_r_reviewer',
         reviewComment: 'f_r_review_comment', supplementPrompt: 'f_r_supplement_prompt',
-        result: 'f_r_result', createdAt: 'f_r_created_at', updatedAt: 'f_r_updated_at',
+        result: 'f_r_result', input: 'f_r_input', createdAt: 'f_r_created_at',
+        updatedAt: 'f_r_updated_at', appId: 'f_r_app_id',
       },
     },
     statuses: { draft: 'Draft', active: 'Pending', closed: 'Closed' },
@@ -252,9 +253,9 @@ describe('Channel', () => {
     });
   });
 
-  // -- onBotMessage -----------------------------------------------------------
+  // -- onOperatorMessage -------------------------------------------------------
 
-  describe('onBotMessage', () => {
+  describe('onOperatorMessage', () => {
     function makeTextMsg(overrides: Record<string, unknown> = {}) {
       return {
         event: {
@@ -272,7 +273,7 @@ describe('Channel', () => {
     }
 
     it('ignores non-user senders', async () => {
-      await (channel as any)['onBotMessage']({
+      await (channel as any)['onOperatorMessage']('test_app', undefined, {
         event: {
           sender: { sender_id: { open_id: 'ou_test' }, sender_type: 'app' },
           message: { message_id: 'om_msg_456', message_type: 'text', chat_type: 'p2p', content: JSON.stringify({ text: 'test' }) },
@@ -284,7 +285,7 @@ describe('Channel', () => {
     });
 
     it('processes p2p text messages', async () => {
-      await (channel as any)['onBotMessage'](makeTextMsg());
+      await (channel as any)['onOperatorMessage']('test_app', undefined, makeTextMsg());
 
       const bitable = (channel as any).bitable;
       const turns = await bitable.searchRecords(cfg.turnsTableId, {
@@ -294,16 +295,16 @@ describe('Channel', () => {
       expect(turns[0].fields[cfg.fields.turn.content]).toBe('Need help');
     });
 
-    it('deduplicates by message_id', async () => {
+    it('deduplicates by appId:messageId', async () => {
       const bitable = (channel as any).bitable;
       await bitable.createRecord(cfg.turnsTableId, {
-        [cfg.fields.turn.dedupKey]: 'om_msg_123', [cfg.fields.turn.role]: 'user',
+        [cfg.fields.turn.dedupKey]: 'test_app:om_msg_123', [cfg.fields.turn.role]: 'user',
         [cfg.fields.turn.content]: 'original',
       });
-      await (channel as any)['onBotMessage'](makeTextMsg());
+      await (channel as any)['onOperatorMessage']('test_app', undefined, makeTextMsg());
 
       const turns = await bitable.searchRecords(cfg.turnsTableId, {
-        conjunction: 'and', conditions: [{ field_name: cfg.fields.turn.dedupKey, operator: 'is', value: ['om_msg_123'] }],
+        conjunction: 'and', conditions: [{ field_name: cfg.fields.turn.dedupKey, operator: 'is', value: ['test_app:om_msg_123'] }],
       });
       expect(turns).toHaveLength(1);
     });

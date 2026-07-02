@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------------------
 // Grant — grant full_access to a Bitable base via Drive permission API.
-// Supports email, open_id, and phone (phone is resolved to open_id first).
+// Supports email, open_id, union_id, and phone (phone is resolved to open_id first).
 // ---------------------------------------------------------------------------
 
 export interface GrantOptions {
@@ -8,7 +8,7 @@ export interface GrantOptions {
   appSecret: string;
   openApiDomain?: string;
   appToken: string;
-  memberType: 'email' | 'openid';
+  memberType: 'email' | 'openid' | 'unionid';
   memberId: string;
 }
 
