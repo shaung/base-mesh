@@ -233,6 +233,7 @@ export async function main(): Promise<void> {
 
     const { Executor } = await import('./executor.js');
     const executor = new Executor(cfg);
+    executor.setProfile(profile);
     await executor.run();
     return;
   }

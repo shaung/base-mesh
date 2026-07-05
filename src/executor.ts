@@ -8,7 +8,7 @@ import { mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import WebSocket from 'ws';
-import { startDashboard } from './dashboard.js';
+import { startDashboard, dashboardState } from './dashboard.js';
 
 // ---------------------------------------------------------------------------
 // Executor — push-mode only. Connects to Channel via WebSocket, receives
@@ -18,9 +18,16 @@ import { startDashboard } from './dashboard.js';
 export class Executor {
   private processor: KekkaiProcessor;
   private running = true;
+  private profile: string;
 
   constructor(private cfg: Config) {
     this.processor = new KekkaiProcessor(cfg);
+    this.profile = '';
+  }
+
+  /** Set the profile name (called from CLI after construction). */
+  setProfile(name: string): void {
+    this.profile = name;
   }
 
   async run(): Promise<void> {
@@ -34,7 +41,8 @@ export class Executor {
 
     const sessionDir = this.cfg.executor?.sessionDir;
     if (sessionDir) {
-      startDashboard(sessionDir, 3456);
+      dashboardState.profile = this.profile || 'default';
+      startDashboard(sessionDir, 3456, dashboardState);
     }
 
     console.log(`[executor] connecting to ${this.cfg.executor.coordinatorUrl}`);
@@ -89,6 +97,8 @@ export class Executor {
       const ws = new WebSocket(wsUrl);
       currentWs = ws;
       ws.on('open', () => {
+        dashboardState.connected = true;
+        dashboardState.connectedAt = Date.now();
         console.log('[executor] connected to Channel');
         if (sessionToken) {
           ws.send(JSON.stringify({ type: 'reauth', session_token: sessionToken, identity, domains: domainsList, description, hitl: this.cfg.executor?.hitl || 'off', hitlPolicy: this.cfg.executor?.hitlPolicy || 'default' }));
@@ -140,6 +150,7 @@ export class Executor {
             const ticket = msg.ticket as BitableRecord;
             const recordId = ticket.record_id as string;
             if (!recordId) return;
+            dashboardState.activeTicket = recordId;
             console.log(`[executor] received task ${recordId}`);
             const rootMsgId = extractText(ticket.fields[FLD.rootMsgId]);
             const turns = (msg.turns as any[])?.map((t: any) => ({ record_id: t.record_id, fields: t.fields || {} })) || [];
@@ -169,6 +180,8 @@ export class Executor {
               console.log(`[executor] prompt: global=${!!globalPrompt} system=${!!this.cfg.executor?.prompt} turns=${turns.length}${currentRoundId ? ` round=${currentRoundId}` : ''}`);
               console.log(`[executor] processing ticket=${recordId} streamOutput=${streamOutput}`);
               const result = await this.processor.process(ctx);
+              dashboardState.ticketsProcessed++;
+              dashboardState.activeTicket = null;
               console.log(`[executor] done ticket=${recordId} answer=${(result?.answer || '').slice(0, 60)}`);
               const finalAnswer = result?.answer || '(processing error)';
               // Send stream_end to close the typewriter card (with error content if failed)
@@ -206,6 +219,8 @@ export class Executor {
 
       ws.on('close', () => {
         clearInterval(heartbeatTimer);
+        dashboardState.connected = false;
+        dashboardState.activeTicket = null;
         if (this.running) {
           console.log('[executor] disconnected, reconnecting in 5s');
           setTimeout(connect, 5000);
