@@ -1,9 +1,9 @@
-import { logger } from './log.js';
-import { Config, Part, FilePart, BitableRecord, S3Config, RoundStatusMapping } from './types.js';
-import { Session } from './protocol.js';
-import { extractText } from './text.js';
-import { BitableClient } from './bitable.js';
-import { getDomainConfig } from './domain.js';
+import { logger } from '../lib/log.js';
+import { Config, Part, FilePart, BitableRecord, S3Config, RoundStatusMapping } from '../lib/types.js';
+import { Session } from '../lib/bitable/protocol.js';
+import { extractText } from '../lib/messaging/text.js';
+import { BitableClient } from '../lib/bitable/client.js';
+import { getDomainConfig } from '../lib/bitable/domain.js';
 
 // =============================================================================
 // A2A Protocol implementation
@@ -199,7 +199,7 @@ export async function handleA2ACreateTask(
       fields[cfg.fields.turn.parts] = JSON.stringify(resolvedParts);
     }
 
-    const { BitableClient } = await import('./bitable.js');
+    const { BitableClient } = await import('../lib/bitable/client.js');
     const bitable = new BitableClient(cfg);
     await bitable.createRecord(turnsTableId, fields);
   }
@@ -295,7 +295,7 @@ export async function handleA2ACancelTask(
   try {
     const ticket = await session.getTicket(taskId);
     if (ticket?.record_id) {
-      const { BitableClient } = await import('./bitable.js');
+      const { BitableClient } = await import('../lib/bitable/client.js');
       const bitable = new BitableClient(cfg);
       await bitable.updateRecord(cfg.ticketsTableId, taskId, {
         [cfg.fields.ticket.status]: cfg.statuses.closed,

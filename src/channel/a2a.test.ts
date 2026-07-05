@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { Config, RoundStatusMapping } from './types.js';
+import { Config, RoundStatusMapping } from '../lib/types.js';
 import {
   roundStatusToA2A,
   buildAgentCard,
@@ -10,7 +10,7 @@ import {
   type A2ACreateTaskRequest,
   type A2ACreateTaskResponse,
   type AgentCard,
-} from './a2a.js';
+} from '../channel/a2a.js';
 
 // ---------------------------------------------------------------------------
 // Mock Config
@@ -350,7 +350,7 @@ describe('sendToExternalAgent', () => {
     });
     vi.stubGlobal('fetch', mockFetch);
 
-    const { sendToExternalAgent } = await import('./a2a.js');
+    const { sendToExternalAgent } = await import('../channel/a2a.js');
     const task: A2ATask = { id: 'local_1', status: 'submitted', messages: [{ role: 'user', parts: [{ kind: 'text', text: 'Hello' }] }] };
     const result = await sendToExternalAgent('http://external-agent:8080', task);
 
@@ -372,7 +372,7 @@ describe('sendToExternalAgent', () => {
     });
     vi.stubGlobal('fetch', mockFetch);
 
-    const { sendToExternalAgent } = await import('./a2a.js');
+    const { sendToExternalAgent } = await import('../channel/a2a.js');
     await expect(sendToExternalAgent('http://ext:8080', { id: 't1', status: 'submitted' }))
       .rejects.toThrow('A2A client error 401');
 
@@ -386,7 +386,7 @@ describe('sendToExternalAgent', () => {
     });
     vi.stubGlobal('fetch', mockFetch);
 
-    const { sendToExternalAgent } = await import('./a2a.js');
+    const { sendToExternalAgent } = await import('../channel/a2a.js');
     await sendToExternalAgent('http://ext:8080', { id: 't1', status: 'submitted' }, 'my_token');
 
     expect(mockFetch).toHaveBeenCalledWith(
@@ -405,7 +405,7 @@ describe('cancelExternalTask', () => {
     const mockFetch = vi.fn().mockResolvedValue({ ok: true });
     vi.stubGlobal('fetch', mockFetch);
 
-    const { cancelExternalTask } = await import('./a2a.js');
+    const { cancelExternalTask } = await import('../channel/a2a.js');
     const result = await cancelExternalTask('http://ext:8080', 'task_1');
 
     expect(result).toBe(true);
@@ -421,7 +421,7 @@ describe('cancelExternalTask', () => {
     const mockFetch = vi.fn().mockRejectedValue(new Error('network error'));
     vi.stubGlobal('fetch', mockFetch);
 
-    const { cancelExternalTask } = await import('./a2a.js');
+    const { cancelExternalTask } = await import('../channel/a2a.js');
     const result = await cancelExternalTask('http://ext:8080', 'task_1');
     expect(result).toBe(false);
 

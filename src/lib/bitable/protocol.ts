@@ -1,14 +1,14 @@
 import { appendFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { hostname, homedir } from 'node:os';
-import { Config, BitableRecord, ROUND_TRANSITIONS, Part } from './types.js';
-import { BitableClient } from './bitable.js';
-import { logger } from './log.js';
-import { formatMessage } from './messages.js';
+import { Config, BitableRecord, ROUND_TRANSITIONS, Part } from '../../lib/types.js';
+import { BitableClient } from '../../lib/bitable/client.js';
+import { logger } from '../../lib/log.js';
+import { formatMessage } from '../../lib/messaging/messages.js';
 
-import { extractText, extractUserIds } from './text.js';
+import { extractText, extractUserIds } from '../../lib/messaging/text.js';
 // Re-export text utilities for backward compatibility
-export { extractText, extractUserIds }; // satisfies users of `from './protocol.js'`
+export { extractText, extractUserIds }; // satisfies users of `from '../../lib/bitable/protocol.js'`
 
 // ---------------------------------------------------------------------------
 // BAM protocol operations — fully driven by user config, no hardcoded
@@ -38,29 +38,29 @@ export class Session {
 
   // -- config shortcuts ---------------------------------------------------
 
-  private get tf(): import('./types.js').TicketFieldMapping {
+  private get tf(): import('../../lib/types.js').TicketFieldMapping {
     return this.cfg.fields.ticket;
   }
 
-  private get nf(): import('./types.js').TurnFieldMapping {
+  private get nf(): import('../../lib/types.js').TurnFieldMapping {
     return this.cfg.fields.turn;
   }
 
-  private get rf(): import('./types.js').RosterFieldMapping {
+  private get rf(): import('../../lib/types.js').RosterFieldMapping {
     return this.cfg.fields.roster;
   }
 
-  private get sv(): import('./types.js').StatusMapping {
+  private get sv(): import('../../lib/types.js').StatusMapping {
     return this.cfg.statuses;
   }
 
   /** Round field mapping getter. */
-  private get rfRound(): import('./types.js').RoundFieldMapping {
+  private get rfRound(): import('../../lib/types.js').RoundFieldMapping {
     return this.cfg.fields.round;
   }
 
   /** Round status mapping getter. */
-  private get rsv(): import('./types.js').RoundStatusMapping {
+  private get rsv(): import('../../lib/types.js').RoundStatusMapping {
     return this.cfg.roundStatuses;
   }
 
@@ -676,7 +676,7 @@ export class Session {
   async searchRoundsByStatusAndDomains(status: string, domains: string[]): Promise<BitableRecord[]> {
     const rounds = await this.searchRoundsByStatus(status);
     if (domains.length === 0) return rounds;
-    const { PrefixMatcher } = await import('./matcher.js');
+    const { PrefixMatcher } = await import('../../lib/messaging/matcher.js');
     const matcher = new PrefixMatcher();
     return rounds.filter(r => {
       const raw = String(r.fields[this.rfRound.domains] ?? '');

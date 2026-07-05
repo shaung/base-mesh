@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { loadConfig, validateConfig, profilePath, readProfile, saveProfile } from './config.js';
-import { setLogLevel, logger } from './log.js';
+import { loadConfig, validateConfig, profilePath, readProfile, saveProfile } from '../lib/config.js';
+import { setLogLevel, logger } from '../lib/log.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -52,7 +52,7 @@ function parseArgs(): { profile: string; positional: string[]; verbosity: number
  * Returns true if login was performed.
  */
 async function ensureLogin(cfg: ReturnType<typeof loadConfig>, profile: string): Promise<boolean> {
-  const { UserTokenProvider, loadStoredTokens } = await import('./auth.js');
+  const { UserTokenProvider, loadStoredTokens } = await import('../lib/auth/oauth.js');
   if (UserTokenProvider.fromStore(cfg.appId)) return false;
 
   if (!cfg.appId) {
@@ -99,7 +99,7 @@ async function ensureSetup(profile: string, modeHint?: 'channel' | 'agent'): Pro
     process.exit(1);
   }
 
-  const { interactiveSetup } = await import('./setup.js');
+  const { interactiveSetup } = await import('../cli/setup.js');
   await interactiveSetup(profile, modeHint);
   return profile;
 }
@@ -122,7 +122,7 @@ export async function main(): Promise<void> {
       process.exit(1);
     }
     console.log('Starting Feishu OAuth authorization (PKCE mode)...\n');
-    const { UserTokenProvider, loadStoredTokens } = await import('./auth.js');
+    const { UserTokenProvider, loadStoredTokens } = await import('../lib/auth/oauth.js');
     await UserTokenProvider.login(cfg.appId, cfg.openApiDomain);
 
     const stored = loadStoredTokens(cfg.appId);
@@ -141,7 +141,7 @@ export async function main(): Promise<void> {
 
   // `bam setup [channel|agent]` — interactive guided setup wizard
   if (cmd === 'setup') {
-    const { interactiveSetup, setupOperator } = await import('./setup.js');
+    const { interactiveSetup, setupOperator } = await import('../cli/setup.js');
     // If subcommand given, pass it as mode
     const sub = positional[1];
     if (sub === 'operator') {
@@ -158,12 +158,12 @@ export async function main(): Promise<void> {
     return;
   }
   if (cmd === 'setup-channel') {
-    const { interactiveSetup } = await import('./setup.js');
+    const { interactiveSetup } = await import('../cli/setup.js');
     await interactiveSetup(profile, 'channel');
     return;
   }
   if (cmd === 'setup-agent') {
-    const { interactiveSetup } = await import('./setup.js');
+    const { interactiveSetup } = await import('../cli/setup.js');
     await interactiveSetup(profile, 'agent');
     return;
   }
@@ -174,7 +174,7 @@ export async function main(): Promise<void> {
     await ensureSetup(profile);
     const cfg = loadConfig(profile);
     validateConfig(cfg);
-    const { Channel } = await import('./channel.js');
+    const { Channel } = await import('../channel/channel.js');
     await new Channel(cfg, true).run();
     return;
   }
@@ -185,7 +185,7 @@ export async function main(): Promise<void> {
     await ensureSetup(profile);
     const cfg = loadConfig(profile);
     validateConfig(cfg);
-    const { Coordinator } = await import('./coordinator.js');
+    const { Coordinator } = await import('../channel/coordinator.js');
     new Coordinator(cfg).start();
     await new Promise(() => {});
   }
@@ -195,12 +195,12 @@ export async function main(): Promise<void> {
     await ensureSetup(profile);
     const cfg = loadConfig(profile);
     // Load table IDs and runtime config from Bitable before validation
-    const { enrichConfigFromBitable } = await import('./config.js');
+    const { enrichConfigFromBitable } = await import('../lib/config.js');
     await enrichConfigFromBitable(cfg);
     validateConfig(cfg);
 
     const lite = process.argv.includes('--lite');
-    const { Channel } = await import('./channel.js');
+    const { Channel } = await import('../channel/channel.js');
     await new Channel(cfg, lite).run();
     return;
   }
@@ -212,7 +212,7 @@ export async function main(): Promise<void> {
     const cfg = loadConfig(profile);
     validateConfig(cfg);
 
-    const { Channel } = await import('./channel.js');
+    const { Channel } = await import('../channel/channel.js');
     const channel = new Channel(cfg);
     await channel.run();
     return;
@@ -231,7 +231,7 @@ export async function main(): Promise<void> {
 
     validateConfig(cfg, 'agent');
 
-    const { Executor } = await import('./executor.js');
+    const { Executor } = await import('../executor/executor.js');
     const executor = new Executor(cfg);
     executor.setProfile(profile);
     await executor.run();
@@ -244,8 +244,8 @@ export async function main(): Promise<void> {
   if (cmd === 'ticket' && positional[1] === 'create') {
     await ensureSetup(profile);
     const cfg = loadConfig(profile);
-    const { Session } = await import('./protocol.js');
-    const { BitableClient } = await import('./bitable.js');
+    const { Session } = await import('../lib/bitable/protocol.js');
+    const { BitableClient } = await import('../lib/bitable/client.js');
     const bitable = new BitableClient(cfg);
     const session = new Session(cfg.identity, cfg.nickname, cfg, bitable);
     await session.register();
@@ -264,8 +264,8 @@ export async function main(): Promise<void> {
   if (cmd === 'ticket' && positional[1] === 'reassign') {
     await ensureSetup(profile);
     const cfg = loadConfig(profile);
-    const { Session } = await import('./protocol.js');
-    const { BitableClient } = await import('./bitable.js');
+    const { Session } = await import('../lib/bitable/protocol.js');
+    const { BitableClient } = await import('../lib/bitable/client.js');
     const bitable = new BitableClient(cfg);
     const session = new Session(cfg.identity, cfg.nickname, cfg, bitable);
     await session.register();
@@ -282,8 +282,8 @@ export async function main(): Promise<void> {
   if (cmd === 'produce') {
     await ensureSetup(profile);
     const cfg = loadConfig(profile);
-    const { Session } = await import('./protocol.js');
-    const { BitableClient } = await import('./bitable.js');
+    const { Session } = await import('../lib/bitable/protocol.js');
+    const { BitableClient } = await import('../lib/bitable/client.js');
     const bitable = new BitableClient(cfg);
     const session = new Session(cfg.identity, cfg.nickname, cfg, bitable);
     await session.register();
@@ -301,8 +301,8 @@ export async function main(): Promise<void> {
   if (cmd === 'claim') {
     await ensureSetup(profile);
     const cfg = loadConfig(profile);
-    const { Session } = await import('./protocol.js');
-    const { BitableClient } = await import('./bitable.js');
+    const { Session } = await import('../lib/bitable/protocol.js');
+    const { BitableClient } = await import('../lib/bitable/client.js');
     const bitable = new BitableClient(cfg);
     const session = new Session(cfg.identity, cfg.nickname, cfg, bitable);
     await session.register();
@@ -321,8 +321,8 @@ export async function main(): Promise<void> {
   if (cmd === 'complete') {
     await ensureSetup(profile);
     const cfg = loadConfig(profile);
-    const { Session } = await import('./protocol.js');
-    const { BitableClient } = await import('./bitable.js');
+    const { Session } = await import('../lib/bitable/protocol.js');
+    const { BitableClient } = await import('../lib/bitable/client.js');
     const bitable = new BitableClient(cfg);
     const session = new Session(cfg.identity, cfg.nickname, cfg, bitable);
     await session.register();
@@ -355,7 +355,7 @@ export async function main(): Promise<void> {
       process.exit(1);
     }
 
-    const { grantBitableAccess, resolvePhoneToOpenId } = await import('./bitable-auth.js');
+    const { grantBitableAccess, resolvePhoneToOpenId } = await import('../lib/bitable/auth.js');
 
     if (phone) {
       const openId = await resolvePhoneToOpenId(phone, cfg.appId, cfg.appSecret, cfg.openApiDomain);
@@ -396,7 +396,7 @@ export async function main(): Promise<void> {
     const name = getFlag('--name') || positional[2] || 'bam';
     const email = getFlag('--email') || getFlag('-e') || '';
 
-    const { getDomainConfig } = await import('./domain.js');
+    const { getDomainConfig } = await import('../lib/bitable/domain.js');
     const dc = getDomainConfig(cfg.openApiDomain);
 
     // Get app access token
@@ -426,7 +426,7 @@ export async function main(): Promise<void> {
     console.log(`✓ Created: ${appUrl}`);
 
     // Create tables via setup.ts
-    const { createBaseMesh } = await import('./setup.js');
+    const { createBaseMesh } = await import('../cli/setup.js');
     const mesh = await createBaseMesh({
       appId: cfg.appId, appSecret: cfg.appSecret!, openApiDomain: cfg.openApiDomain,
       appName: name, existingAppToken: appToken,
@@ -434,7 +434,7 @@ export async function main(): Promise<void> {
     console.log(`✓ Tables created: Tickets, Turns, Roster, Roles`);
 
     // Update profile
-    const { readProfile, saveProfile: saveProf } = await import('./config.js');
+    const { readProfile, saveProfile: saveProf } = await import('../lib/config.js');
     const existing = readProfile(profile) || {};
     existing.appToken = appToken as string;
     existing.ticketsTableId = mesh.ticketsTableId;
@@ -446,7 +446,7 @@ export async function main(): Promise<void> {
 
     // Grant edit permission
     if (email) {
-      const { grantBitableAccess } = await import('./bitable-auth.js');
+      const { grantBitableAccess } = await import('../lib/bitable/auth.js');
       const ok = await grantBitableAccess({
         appId: cfg.appId, appSecret: cfg.appSecret, openApiDomain: cfg.openApiDomain,
         appToken, memberType: 'email', memberId: email,

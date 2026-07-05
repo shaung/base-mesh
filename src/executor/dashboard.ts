@@ -8,8 +8,8 @@
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { logger } from './log.js';
-import { readProfile, saveProfile } from './config.js';
+import { logger } from '../lib/log.js';
+import { readProfile, saveProfile } from '../lib/config.js';
 
 // ---------------------------------------------------------------------------
 // Dashboard state — shared between executor.ts and this module.

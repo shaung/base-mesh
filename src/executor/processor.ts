@@ -2,10 +2,10 @@ import { Kekkai } from '@typooo/kekkai';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { logger } from './log.js';
-import { Config, DomainConfig, Processor, ProcessContext, ProcessResult, Part } from './types.js';
-import { extractText } from './text.js';
-import { FLD } from './fields.js';
+import { logger } from '../lib/log.js';
+import { Config, DomainConfig, Processor, ProcessContext, ProcessResult, Part } from '../lib/types.js';
+import { extractText } from '../lib/messaging/text.js';
+import { FLD } from '../lib/bitable/fields.js';
 
 // ---------------------------------------------------------------------------
 // Output schema for structured output

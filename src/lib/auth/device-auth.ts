@@ -1,6 +1,6 @@
 // Device-code OAuth flow — user scans QR code to create a new bot app.
 // Uses /oauth/v1/app/registration (same endpoint as openclaw-lark-tools).
-import { saveStoredTokens } from './auth.js';
+import { saveStoredTokens } from '../../lib/auth/oauth.js';
 import chalk from 'chalk';
 import qrcode from 'qrcode-terminal';
 

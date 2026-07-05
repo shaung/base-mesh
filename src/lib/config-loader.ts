@@ -11,9 +11,9 @@
 //   type   (SingleSelect)  — "string" | "number" | "boolean"
 // ---------------------------------------------------------------------------
 
-import { BitableClient } from './bitable.js';
-import { extractText } from './text.js';
-import type { Config } from './types.js';
+import { BitableClient } from '../lib/bitable/client.js';
+import { extractText } from '../lib/messaging/text.js';
+import type { Config } from '../lib/types.js';
 
 // ---------------------------------------------------------------------------
 // Types

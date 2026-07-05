@@ -3,7 +3,8 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const distPath = join(__dirname, '..', 'dist', 'cli.js');
+// Structured under dist/cli/cli.js; also kept at dist/cli.js for backward compat
+const distPath = join(__dirname, '..', 'dist', 'cli', 'cli.js');
 
 import(distPath).then((mod) => {
   mod.main().catch((err) => {

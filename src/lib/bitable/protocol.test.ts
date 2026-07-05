@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { ROUND_TRANSITIONS, type Config, type BitableRecord } from './types.js';
-import { Session, RETRY_OWNER_PREFIX } from './protocol.js';
+import { ROUND_TRANSITIONS, type Config, type BitableRecord } from '../../lib/types.js';
+import { Session, RETRY_OWNER_PREFIX } from '../../lib/bitable/protocol.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -790,32 +790,32 @@ describe('Session — Roster HITL fields', () => {
 
 describe('Session — utility functions', () => {
   it('extractText handles plain strings', async () => {
-    const { extractText } = await import('./protocol.js');
+    const { extractText } = await import('../../lib/bitable/protocol.js');
     expect(extractText('hello')).toBe('hello');
     expect(extractText('')).toBe('');
   });
 
   it('extractText handles multiline objects', async () => {
-    const { extractText } = await import('./protocol.js');
+    const { extractText } = await import('../../lib/bitable/protocol.js');
     const ml = [{ text: 'Line 1' }, { text: 'Line 2' }];
     expect(extractText(ml)).toBe('Line 1Line 2');
   });
 
   it('extractText falls back to String() for other types', async () => {
-    const { extractText } = await import('./protocol.js');
+    const { extractText } = await import('../../lib/bitable/protocol.js');
     expect(extractText(42)).toBe('42');
     expect(extractText(null)).toBe('');
     expect(extractText(undefined)).toBe('');
   });
 
   it('extractUserIds extracts user IDs from Person field', async () => {
-    const { extractUserIds } = await import('./protocol.js');
+    const { extractUserIds } = await import('../../lib/bitable/protocol.js');
     const result = extractUserIds([{ id: 'ou_abc' }, { id: 'ou_def' }]);
     expect(result).toBe('ou_abc,ou_def');
   });
 
   it('extractUserIds handles empty input', async () => {
-    const { extractUserIds } = await import('./protocol.js');
+    const { extractUserIds } = await import('../../lib/bitable/protocol.js');
     expect(extractUserIds(null)).toBe('');
     expect(extractUserIds(undefined)).toBe('');
     expect(extractUserIds([])).toBe('');

@@ -1,4 +1,4 @@
-import { logger } from './log.js';
+import { logger } from '../lib/log.js';
 import { Client } from '@larksuiteoapi/node-sdk';
 import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -7,9 +7,9 @@ import { fileURLToPath } from 'node:url';
 import { input, select, confirm } from '@inquirer/prompts';
 import chalk from 'chalk';
 import ora from 'ora';
-import { getDomainConfig } from './domain.js';
-import { UserTokenProvider, loadStoredTokens } from './auth.js';
-import { MESSAGES, type SetupLang, type SetupMessages, detectLang } from './setup-i18n.js';
+import { getDomainConfig } from '../lib/bitable/domain.js';
+import { UserTokenProvider, loadStoredTokens } from '../lib/auth/oauth.js';
+import { MESSAGES, type SetupLang, type SetupMessages, detectLang } from '../cli/setup-i18n.js';
 
 // ---------------------------------------------------------------------------
 // Bitable field type constants
@@ -482,7 +482,7 @@ export async function createBaseMesh(opts: SetupOptions): Promise<SetupResult> {
 
   const ownerMemberId = opts.ownerUnionId || opts.ownerOpenId;
   if (ownerMemberId) {
-    const { grantBitableAccess } = await import('./bitable-auth.js');
+    const { grantBitableAccess } = await import('../lib/bitable/auth.js');
     const ok = await grantBitableAccess({
       appId: opts.appId, appSecret: opts.appSecret, openApiDomain: opts.openApiDomain,
       appToken, memberType: opts.ownerUnionId ? 'unionid' : 'openid', memberId: ownerMemberId,
@@ -569,7 +569,7 @@ export async function interactiveSetup(profile = 'default', mode?: 'channel' | '
 async function setupChannel(profile = 'default', lang?: SetupLang): Promise<void> {
   const msg: SetupMessages = MESSAGES[lang || detectLang()];
   // Load existing profile for defaults
-  const { readProfile: readExistingProfile } = await import('./config.js');
+  const { readProfile: readExistingProfile } = await import('../lib/config.js');
   let existingProfile: Record<string, unknown> = {};
   try { existingProfile = readExistingProfile(profile) || {}; } catch { /* ok */ }
   const def = (key: string, fallback = ''): string => {
@@ -617,7 +617,7 @@ async function setupChannel(profile = 'default', lang?: SetupLang): Promise<void
     if (credentialMode === 'qr') {
       const spinner = ora(msg.step2WaitingQR).start();
       try {
-        const { createAppViaQR, sendProbe } = await import('./device-auth.js');
+        const { createAppViaQR, sendProbe } = await import('../lib/auth/device-auth.js');
         const result = await createAppViaQR({ openApiDomain });
         appId = result.appId;
         appSecret = result.appSecret;
@@ -675,7 +675,7 @@ async function setupChannel(profile = 'default', lang?: SetupLang): Promise<void
     console.log(`  ✓ ${msg.step3Already} ${ownerOpenId}`);
   } else {
     try {
-      const { deviceGrantLogin } = await import('./device-auth.js');
+      const { deviceGrantLogin } = await import('../lib/auth/device-auth.js');
       ownerOpenId = await deviceGrantLogin(appId, appSecret, openApiDomain);
       const updatedTokens = loadStoredTokens(appId);
       if (updatedTokens?.unionId) ownerUnionId = updatedTokens.unionId;
@@ -819,7 +819,7 @@ async function setupChannel(profile = 'default', lang?: SetupLang): Promise<void
     },
     executor: { ...((base.executor ?? {}) as object), ...((existingProfile.executor ?? {}) as object) },
   };
-  const { saveProfile, profilePath } = await import('./config.js');
+  const { saveProfile, profilePath } = await import('../lib/config.js');
   saveProfile(profile, config);
   const savedPath = profilePath(profile);
   console.log(`  ✓ Profile saved to ${savedPath}`);
@@ -855,7 +855,7 @@ async function setupChannel(profile = 'default', lang?: SetupLang): Promise<void
   // Notify owner via Lark IM
   if (ownerOpenId && appSecret) {
     try {
-      const { getDomainConfig } = await import('./domain.js');
+      const { getDomainConfig } = await import('../lib/bitable/domain.js');
       const dc = getDomainConfig(openApiDomain || 'open.larksuite.com');
       const tokenResp = await fetch(`${dc.sdkBaseUrl}/open-apis/auth/v3/app_access_token/internal`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -905,7 +905,7 @@ interface AppConfigResult {
  */
 async function configureApp(appId: string, appSecret: string, openApiDomain?: string, operator?: boolean): Promise<AppConfigResult> {
   const result: AppConfigResult = { ability: false, scope: false, redirectUrl: false };
-  const { getDomainConfig } = await import('./domain.js');
+  const { getDomainConfig } = await import('../lib/bitable/domain.js');
   const dc = getDomainConfig(openApiDomain || 'open.larksuite.com');
 
   let token: string;
@@ -988,7 +988,7 @@ async function configureApp(appId: string, appSecret: string, openApiDomain?: st
 async function setupAgent(profile = 'default', lang?: SetupLang): Promise<void> {
   const msg: SetupMessages = MESSAGES[lang || detectLang()];
   // Load existing profile for defaults
-  const { readProfile: readExistingProfile } = await import('./config.js');
+  const { readProfile: readExistingProfile } = await import('../lib/config.js');
   let existingProfile: Record<string, unknown> = {};
   try { existingProfile = readExistingProfile(profile) || {}; } catch { /* ok */ }
   const existingExecutor = existingProfile.executor as Record<string, unknown> | undefined;
@@ -1084,7 +1084,7 @@ async function setupAgent(profile = 'default', lang?: SetupLang): Promise<void> 
     }
   }
 
-  const { saveProfile, profilePath } = await import('./config.js');
+  const { saveProfile, profilePath } = await import('../lib/config.js');
   saveProfile(profile, config);
   const savedPath = profilePath(profile);
   console.log(`  ✓ Profile saved to ${savedPath}`);
@@ -1106,7 +1106,7 @@ async function setupAgent(profile = 'default', lang?: SetupLang): Promise<void> 
 /** Interactive multi-operator setup. Adds one operator to the profile.
  *  Can be run multiple times to add multiple operators. */
 export async function setupOperator(profile = 'default'): Promise<void> {
-  const { readProfile, saveProfile, profilePath } = await import('./config.js');
+  const { readProfile, saveProfile, profilePath } = await import('../lib/config.js');
   const existingProfile = readProfile(profile);
   if (!existingProfile) {
     logger.error(chalk.red(`\n  Profile "${profile}" not found. Run \`bam setup channel\` first.\n`));
@@ -1133,7 +1133,7 @@ export async function setupOperator(profile = 'default'): Promise<void> {
   if (credentialMode === 'qr') {
     const spinner = ora('Waiting for QR scan...').start();
     try {
-      const { createAppViaQR, sendProbe } = await import('./device-auth.js');
+      const { createAppViaQR, sendProbe } = await import('../lib/auth/device-auth.js');
       const result = await createAppViaQR({ openApiDomain: undefined });
       appId = result.appId;
       appSecret = result.appSecret;

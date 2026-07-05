@@ -1,13 +1,13 @@
-import { logger } from './log.js';
+import { logger } from '../lib/log.js';
 import { Client, WSClient, EventDispatcher } from '@larksuiteoapi/node-sdk';
-import { Config, BitableRecord, Part, BotConfig } from './types.js';
-import { parsePostToParts } from './message-parser.js';
-import { BitableClient } from './bitable.js';
-import { Session } from './protocol.js';
-import { extractText, extractUserIds } from './text.js';
-import { getDomainConfig } from './domain.js';
-import { formatMessage } from './messages.js';
-import { Coordinator } from './coordinator.js';
+import { Config, BitableRecord, Part, BotConfig } from '../lib/types.js';
+import { parsePostToParts } from '../lib/messaging/message-parser.js';
+import { BitableClient } from '../lib/bitable/client.js';
+import { Session } from '../lib/bitable/protocol.js';
+import { extractText, extractUserIds } from '../lib/messaging/text.js';
+import { getDomainConfig } from '../lib/bitable/domain.js';
+import { formatMessage } from '../lib/messaging/messages.js';
+import { Coordinator } from '../channel/coordinator.js';
 
 const DEFAULT_EMOJI = 'OneSecond';
 
@@ -52,7 +52,7 @@ export class Channel {
   private deliveredTurnIds = new Set<string>();
   private deliveryInFlight = new Set<string>();
   private lite: boolean;
-  private cachedDomains: import('./intent.js').Domain[] | null = null;
+  private cachedDomains: import('../lib/messaging/intent.js').Domain[] | null = null;
 
   constructor(private cfg: Config, lite = false) {
     this.lite = lite;
@@ -64,22 +64,22 @@ export class Channel {
       appId: cfg.appId,
       appSecret: cfg.appSecret || 'unused',
       domain: dc.sdkBaseUrl,
-      loggerLevel: 2, // warn
+      loggerLevel: 3,
     });
   }
 
   async run(): Promise<void> {
-    const { enableFileLogging } = await import('./log.js');
+    const { enableFileLogging } = await import('../lib/log.js');
     enableFileLogging();
 
     process.on('SIGTERM', () => { this.stop(); process.exit(0); });
     process.on('SIGINT', () => { this.stop(); process.exit(0); });
 
     const label = this.lite ? 'channel-lite' : 'channel';
-    console.log(`[${label}] started`);
+    logger.info(`[${label}] started`);
 
     // Load runtime config from Configs Bitable table if configured
-    const { enrichConfigFromBitable } = await import('./config.js');
+    const { enrichConfigFromBitable } = await import('../lib/config.js');
     await enrichConfigFromBitable(this.cfg);
 
     // Start coordinator (push executor WS server) unless in lite mode
@@ -106,7 +106,7 @@ export class Channel {
     }
 
     this.cleanup();
-    console.log('[channel] stopped');
+    logger.info('[channel] stopped');
     process.exit(0);
   }
 
@@ -154,7 +154,7 @@ export class Channel {
     setTimeout(() => this.recentEvents.delete(key), 10_000);
     // Skip log for Roster heartbeat noise
     if (tableId !== this.cfg.rosterTableId) {
-      console.log(`[channel] bitable event: ${tableId}/${recordId} ${action?.action}`);
+      logger.info(`[channel] bitable event: ${tableId}/${recordId} ${action?.action}`);
     }
 
     // Dispatch by table
@@ -244,7 +244,7 @@ export class Channel {
       const rawBody = await resp.text();
       let body: Record<string, unknown> = {};
       try { body = JSON.parse(rawBody); } catch { /* not JSON */ }
-      if (body.code === 0) console.log('[channel] subscribed to bitable events');
+      if (body.code === 0) logger.info('[channel] subscribed to bitable events');
       else console.warn(`[channel] subscribe failed (HTTP ${resp.status}):`, rawBody.slice(0, 500));
     } catch (err: any) {
       console.warn(`[channel] subscribe failed: ${err.message}`);
@@ -282,7 +282,7 @@ export class Channel {
   private async connectOneOperator(bot: BotConfig): Promise<void> {
     if (this.operatorClients.has(bot.appId)) return;
     if (!bot.appSecret) {
-      console.log(`[channel] operator "${bot.name}" (${bot.appId}): appSecret required for WS, skipping`);
+      logger.info(`[channel] operator "${bot.name}" (${bot.appId}): appSecret required for WS, skipping`);
       return;
     }
 
@@ -301,10 +301,10 @@ export class Channel {
         domain: dc.sdkBaseUrl,
         loggerLevel: 2,
         autoReconnect: true,
-        onReady: () => console.log(`[channel] WS connected: ${bot.name} (${bot.appId})`),
+        onReady: () => logger.info(`[channel] WS connected: ${bot.name} (${bot.appId})`),
         onError: (err) => logger.error(`[channel] WS error ${bot.name}: ${err.message}`),
-        onReconnecting: () => console.log(`[channel] WS reconnecting: ${bot.name}`),
-        onReconnected: () => console.log(`[channel] WS reconnected: ${bot.name}`),
+        onReconnecting: () => logger.info(`[channel] WS reconnecting: ${bot.name}`),
+        onReconnected: () => logger.info(`[channel] WS reconnected: ${bot.name}`),
       });
 
       const dispatcher = new EventDispatcher({});
@@ -319,6 +319,8 @@ export class Channel {
         'card.action.trigger': async (data: any) => {
           try { await this.onCardAction(data); } catch (err) { logger.error(`[channel] onCardAction crashed: ${bot.name}`, err); }
         },
+        'im.message.reaction.created_v1': async () => {},
+        'im.message.reaction.deleted_v1': async () => {},
       });
 
       await wsClient.start({ eventDispatcher: dispatcher });
@@ -338,7 +340,7 @@ export class Channel {
             headers: { Authorization: `Bearer ${tk}` },
           });
           const bd = await br.json() as any;
-          console.log(`[channel] bot/v3/info for "${bot.name}": ${JSON.stringify(bd).slice(0, 300)}`);
+          logger.info(`[channel] bot/v3/info for "${bot.name}": ${JSON.stringify(bd).slice(0, 300)}`);
           if (bd?.code === 0) botOpenId = bd?.bot?.open_id as string | undefined;
         } else {
           console.warn(`[channel] app_token failed "${bot.name}": ${JSON.stringify(td).slice(0,150)}`);
@@ -357,7 +359,7 @@ export class Channel {
         botOpenId,
       });
 
-      console.log(`[channel] operator "${bot.name}" (${bot.appId}) ${domain ? `domain="${domain}" ` : ''}${botOpenId ? 'botOpenId cached' : ''} connected`);
+      logger.info(`[channel] operator "${bot.name}" (${bot.appId}) ${domain ? `domain="${domain}" ` : ''}${botOpenId ? 'botOpenId cached' : ''} connected`);
     } catch (err: any) {
       console.warn(`[channel] WS init failed for "${bot.name}" (${bot.appId}): ${err.message}`);
     }
@@ -370,10 +372,10 @@ export class Channel {
   private async onOperatorMessage(appId: string, domain: string | undefined, raw: any): Promise<void> {
     const data = raw.event ?? raw;
     const msg = data.message;
-    console.log(`[channel] IM event type=${msg?.message_type} chat=${msg?.chat_type} operator=${appId}`);
+    logger.info(`[channel] IM event type=${msg?.message_type} chat=${msg?.chat_type} operator=${appId}`);
 
     if (!msg) {
-      console.log(`[channel] no message in event, raw=${JSON.stringify(raw).slice(0, 500)}`);
+      logger.info(`[channel] no message in event, raw=${JSON.stringify(raw).slice(0, 500)}`);
       return;
     }
 
@@ -396,7 +398,7 @@ export class Channel {
     // when this bot was not @-mentioned. Thread replies (root_id present)
     // need to pass through so the last-operator bot can capture the turn.
     if (msg.chat_type === 'group' && !botMentioned && !msg.root_id) {
-      console.log(`[channel] skip: non-mentioned group msg (op=${appId}...)`);
+      logger.info(`[channel] skip: non-mentioned group msg (op=${appId}...)`);
       return;
     }
 
@@ -409,7 +411,7 @@ export class Channel {
         await this.reply(msg.message_id, '⚠️ No configs table configured.', true, appId);
       } else {
         try {
-          const { enrichConfigFromBitable } = await import('./config.js');
+          const { enrichConfigFromBitable } = await import('../lib/config.js');
           await enrichConfigFromBitable(this.cfg);
           await this.reply(msg.message_id, '✅ Configs reloaded from Bitable.', true, appId);
         } catch (err: any) {
@@ -425,21 +427,21 @@ export class Channel {
     if (msg.message_type === 'post') {
       try {
         const parsed = JSON.parse(msg.content);
-        console.log(`[channel] post raw=${msg.content}`);
+        logger.info(`[channel] post raw=${msg.content}`);
         content = extractPostText(parsed);
         const parsedParts = parsePostToParts(msg.content);
         parts = parsedParts.parts;
-        if (!parts.length) console.log(`[channel] parsePostToParts returned empty parts, raw=${msg.content.slice(0, 300)}`);
-        if (!content) console.log(`[channel] post content empty, raw=${JSON.stringify(parsed).slice(0, 300)}`);
+        if (!parts.length) logger.info(`[channel] parsePostToParts returned empty parts, raw=${msg.content.slice(0, 300)}`);
+        if (!content) logger.info(`[channel] post content empty, raw=${JSON.stringify(parsed).slice(0, 300)}`);
       } catch (err) {
-        console.log(`[channel] post parse failed raw=${String(msg.content).slice(0, 300)} err=${(err as Error).message}`);
+        logger.info(`[channel] post parse failed raw=${String(msg.content).slice(0, 300)} err=${(err as Error).message}`);
         content = '';
       }
     } else if (msg.message_type === 'interactive') {
       try {
         content = extractCardText(JSON.parse(msg.content));
       } catch (err) {
-        console.log(`[channel] interactive parse failed raw=${String(msg.content).slice(0, 300)} err=${(err as Error).message}`);
+        logger.info(`[channel] interactive parse failed raw=${String(msg.content).slice(0, 300)} err=${(err as Error).message}`);
         content = '';
       }
     } else if (msg.message_type === 'text') {
@@ -470,11 +472,11 @@ export class Channel {
           content = `> ${parentText.replace(/\n/g, '\n> ')}\n\n${content}`;
         }
       } catch (err) {
-        console.log(`[channel] fetch parent message failed id=${msg.parent_id} err=${(err as Error).message}`);
+        logger.info(`[channel] fetch parent message failed id=${msg.parent_id} err=${(err as Error).message}`);
       }
     }
 
-    console.log(`[channel] DM from ${senderId}: ${content} (op=${appId})`);
+    logger.info(`[channel] DM from ${senderId}: ${content} (op=${appId})`);
 
     // Acknowledge receipt — only when bot is @mentioned
     if (botMentioned) {
@@ -500,7 +502,7 @@ export class Channel {
         ],
       });
       if (existing.length > 0) {
-        console.log(`[channel] dedup: ${dedupKey.slice(0, 30)} already processed, skipping`);
+        logger.info(`[channel] dedup: ${dedupKey.slice(0, 30)} already processed, skipping`);
         return;
       }
     } catch { /* best effort */ }
@@ -515,10 +517,10 @@ export class Channel {
     // --- Thread reply ────────────────────────────────────────────────
 
     if (rootId) {
-      console.log(`[channel] thread reply lookup rootId=${rootId} botMentioned=${botMentioned}`);
+      logger.info(`[channel] thread reply lookup rootId=${rootId} botMentioned=${botMentioned}`);
       let ticket = await this.session.findByThreadRoot(rootId);
       if (!ticket || !ticket.record_id) {
-        console.log(`[channel] thread root not found, fallback by chat_id=${chatId}`);
+        logger.info(`[channel] thread root not found, fallback by chat_id=${chatId}`);
         const recent = await this.bitable.searchRecords(this.cfg.ticketsTableId, {
           conjunction: 'and',
           conditions: [
@@ -527,11 +529,11 @@ export class Channel {
         });
         recent.sort((a, b) => Number(b.fields[this.cfg.fields.ticket.updatedAt] ?? 0) - Number(a.fields[this.cfg.fields.ticket.updatedAt] ?? 0));
         ticket = recent[0] ?? null;
-        if (ticket) console.log(`[channel] fallback found ticket ${ticket.record_id}`);
-        else console.log('[channel] no ticket found for this chat');
+        if (ticket) logger.info(`[channel] fallback found ticket ${ticket.record_id}`);
+        else logger.info('[channel] no ticket found for this chat');
       }
       if (ticket?.record_id) {
-        console.log(`[channel] thread reply → ticket ${ticket.record_id} mentioned=${botMentioned}`);
+        logger.info(`[channel] thread reply → ticket ${ticket.record_id} mentioned=${botMentioned}`);
         await this.handleThreadReply(ticket, content, messageId, senderId, parts, botMentioned, appId);
         return;
       }
@@ -551,7 +553,7 @@ export class Channel {
       let resolvedParts = parts;
       let attachmentTokens: string[] = [];
       if (msg.message_type === 'post' && parts.some(p => p.kind === 'file')) {
-        const { resolveImageParts } = await import('./a2a.js');
+        const { resolveImageParts } = await import('../channel/a2a.js');
         const result = await resolveImageParts(parts, this.cfg, messageId);
         resolvedParts = result.parts;
         attachmentTokens = result.attachmentTokens;
@@ -611,10 +613,10 @@ export class Channel {
         // handle the turn. If they're offline, fall through so any
         // available operator captures the turn as a best-effort fallback.
         if (this.operatorClients.has(lastAppId)) {
-          console.log(`[channel] thread reply: ticket=${recordId.slice(0,12)} lastOp=${lastAppId} online, deferring`);
+          logger.info(`[channel] thread reply: ticket=${recordId.slice(0,12)} lastOp=${lastAppId} online, deferring`);
           return;
         }
-        console.log(`[channel] thread reply: ticket=${recordId.slice(0,12)} lastOp=${lastAppId} offline, fallback`);
+        logger.info(`[channel] thread reply: ticket=${recordId.slice(0,12)} lastOp=${lastAppId} offline, fallback`);
       }
     }
 
@@ -623,7 +625,7 @@ export class Channel {
     let resolvedReplyParts = parts;
     let replyAttachTokens: string[] = [];
     if (parts.some(p => p.kind === 'file')) {
-      const { resolveImageParts } = await import('./a2a.js');
+      const { resolveImageParts } = await import('../channel/a2a.js');
       const result = await resolveImageParts(parts, this.cfg, messageId);
       resolvedReplyParts = result.parts;
       replyAttachTokens = result.attachmentTokens;
@@ -655,7 +657,7 @@ export class Channel {
       return;
     }
 
-    console.log(`[channel] thread reply: ticket=${recordId.slice(0,12)} status=${status} mentioned=${mentioned}`);
+    logger.info(`[channel] thread reply: ticket=${recordId.slice(0,12)} status=${status} mentioned=${mentioned}`);
     if (!mentioned) return;
 
     if (status === this.cfg.statuses.active) {
@@ -666,14 +668,14 @@ export class Channel {
           const terminal = [this.cfg.roundStatuses.done, this.cfg.roundStatuses.failed, this.cfg.roundStatuses.cancelled];
           const nonPendingActive = [this.cfg.roundStatuses.pendingApproval, this.cfg.roundStatuses.approved, this.cfg.roundStatuses.executing];
           if (roundStatus === this.cfg.roundStatuses.pending) {
-            console.log(`[channel] pending round ${currentRound.record_id}, cancelling and creating new round`);
+            logger.info(`[channel] pending round ${currentRound.record_id}, cancelling and creating new round`);
             await this.session.transitionRound(currentRound.record_id, this.cfg.roundStatuses.cancelled);
             const domains = await this.runIntent(ticket, content, recordId, appId);
             const round = await this.session.createRound(recordId, domains, appId, content);
-            console.log(`[channel] created round ${round.record_id!} with domains=${domains}`);
+            logger.info(`[channel] created round ${round.record_id!} with domains=${domains}`);
             await this.session.assignTurnsToRound(recordId, round.record_id!, appId);
           } else if (nonPendingActive.includes(roundStatus)) {
-            console.log(`[channel] revert round ${currentRound.record_id} (${roundStatus}) for new reply`);
+            logger.info(`[channel] revert round ${currentRound.record_id} (${roundStatus}) for new reply`);
             await this.session.transitionRound(currentRound.record_id, this.cfg.roundStatuses.pending);
             await this.session.releaseRound(currentRound.record_id);
             if (roundStatus === this.cfg.roundStatuses.executing && this.coordinator) {
@@ -683,16 +685,16 @@ export class Channel {
             // picks it up when it dispatches this round to an executor.
             await this.session.assignTurnsToRound(recordId, currentRound.record_id, appId);
           } else if (terminal.includes(roundStatus)) {
-            console.log(`[channel] prev round ${currentRound.record_id} done, creating new round`);
+            logger.info(`[channel] prev round ${currentRound.record_id} done, creating new round`);
             const domains = await this.runIntent(ticket, content, recordId, appId);
             const round = await this.session.createRound(recordId, domains, appId, content);
-            console.log(`[channel] created round ${round.record_id!} with domains=${domains}`);
+            logger.info(`[channel] created round ${round.record_id!} with domains=${domains}`);
             await this.session.assignTurnsToRound(recordId, round.record_id!, appId);
           }
         } else {
           const domains = await this.runIntent(ticket, content, recordId, appId);
           const round = await this.session.createRound(recordId, domains, appId, content);
-          console.log(`[channel] created round ${round.record_id!} with domains=${domains}`);
+          logger.info(`[channel] created round ${round.record_id!} with domains=${domains}`);
           await this.session.assignTurnsToRound(recordId, round.record_id!, appId);
         }
       }
@@ -705,7 +707,7 @@ export class Channel {
         const domains = await this.runIntent(ticket, content, recordId, appId);
         try {
           const round = await this.session.createRound(recordId, domains, appId, content);
-          console.log(`[channel] created round ${round.record_id!} for reopened ticket ${recordId}`);
+          logger.info(`[channel] created round ${round.record_id!} for reopened ticket ${recordId}`);
           if (round.record_id) {
             await this.session.assignTurnsToRound(recordId, round.record_id, appId);
           }
@@ -727,7 +729,7 @@ export class Channel {
         const domains = await this.runIntent(ticket, content, recordId, appId);
         try {
           const round = await this.session.createRound(recordId, domains, appId, content);
-          console.log(`[channel] created round ${round.record_id!} for reactivated ticket ${recordId}`);
+          logger.info(`[channel] created round ${round.record_id!} for reactivated ticket ${recordId}`);
           if (round.record_id) {
             await this.session.assignTurnsToRound(recordId, round.record_id, appId);
           }
@@ -745,25 +747,25 @@ export class Channel {
     if (appId) {
       const oc = this.operatorClients.get(appId);
       if (oc?.domain) {
-        console.log(`[channel] domain override for operator ${appId}: "${oc.domain}"`);
+        logger.info(`[channel] domain override for operator ${appId}: "${oc.domain}"`);
         return [oc.domain];
       }
     }
 
     // Check for explicit #domain tag first
-    const { parseDomainTag } = await import('./intent.js');
+    const { parseDomainTag } = await import('../lib/messaging/intent.js');
     const loadedDomains = await this.loadDomains();
     const tagResult = parseDomainTag(content, loadedDomains);
     if (tagResult) {
-      console.log(`[channel] domain tag override: ${tagResult.tag}`);
+      logger.info(`[channel] domain tag override: ${tagResult.tag}`);
       return [tagResult.tag];
     }
     if (!this.cfg.intent) return ['general'];
-    const { processMessage } = await import('./intent.js');
+    const { processMessage } = await import('../lib/messaging/intent.js');
     const turns = await this.session.getTurns(recordId);
     const conversation = turns.map(t => `[${t.fields[this.cfg.fields.turn.role]}]\n${t.fields[this.cfg.fields.turn.content]}`).join('\n');
     const result = await processMessage(content, loadedDomains, conversation, this.cfg.intent);
-    console.log(`[channel] intent: domains=${result.domains} isComplete=${result.isComplete}`);
+    logger.info(`[channel] intent: domains=${result.domains} isComplete=${result.isComplete}`);
     return result.domains.length > 0 ? result.domains : ['general'];
   }
 
@@ -785,7 +787,7 @@ export class Channel {
         const ok = await this.session.transitionRound(round.record_id, this.cfg.roundStatuses.cancelled);
         if (ok) {
           await this.reply(messageId, '✅ Processing cancelled.', true, appId);
-          console.log(`[channel] cancelled round ${round.record_id} for ticket ${ticket.record_id!}`);
+          logger.info(`[channel] cancelled round ${round.record_id} for ticket ${ticket.record_id!}`);
           if (this.coordinator) {
             await this.coordinator.dispatchCancelToExecutor(round.record_id);
           }
@@ -816,41 +818,41 @@ export class Channel {
     // If operator has a bound domain, skip intent entirely
     if (domain) {
       domains = [domain];
-      console.log(`[channel] processDraft domain override: "${domain}"`);
+      logger.info(`[channel] processDraft domain override: "${domain}"`);
     } else if (this.cfg.intent) {
-      const { processMessage } = await import('./intent.js');
+      const { processMessage } = await import('../lib/messaging/intent.js');
       const turns = await this.session.getTurns(ticket.record_id!);
       const conversation = turns.map(t => `[${t.fields[this.cfg.fields.turn.role]}]\n${t.fields[this.cfg.fields.turn.content]}`).join('\n');
       const result = await processMessage(content, loadedDomains, conversation, this.cfg.intent);
       domains = result.domains;
       summary = result.summary || content;
-      console.log(`[channel] intent: domains=${result.domains} isComplete=${result.isComplete} summary=${result.summary.slice(0,40)}`);
+      logger.info(`[channel] intent: domains=${result.domains} isComplete=${result.isComplete} summary=${result.summary.slice(0,40)}`);
 
       if (!result.isComplete) {
         const question = result.missingFields.length > 0
           ? `Please provide: ${result.missingFields.join(', ')}`
           : (this.cfg.messages?.clarifyQuestion || 'Could you please provide more details?');
         await this.reply(messageId, question, true, appId);
-        console.log(`[channel] clarification asked for ticket ${ticket.record_id!}: missing=${result.missingFields}`);
+        logger.info(`[channel] clarification asked for ticket ${ticket.record_id!}: missing=${result.missingFields}`);
         return;
       }
     }
 
-    const { parseDomainTag } = await import('./intent.js');
+    const { parseDomainTag } = await import('../lib/messaging/intent.js');
     const tagResult = parseDomainTag(summary || content, loadedDomains);
     if (tagResult) {
       domains = [tagResult.tag];
       summary = tagResult.cleaned;
-      console.log(`[channel] domain tag override: ${tagResult.tag}`);
+      logger.info(`[channel] domain tag override: ${tagResult.tag}`);
     }
 
     await this.session.promoteToPending(ticket.record_id!, summary);
-    console.log(`[channel] ticket ${ticket.record_id!} promoted to pending`);
+    logger.info(`[channel] ticket ${ticket.record_id!} promoted to pending`);
 
     if (this.cfg.roundsTableId && ticket.record_id) {
       try {
         const round = await this.session.createRound(ticket.record_id, domains.length > 0 ? domains : undefined, appId, content);
-        console.log(`[channel] created round ${round.record_id!} for ticket ${ticket.record_id} with domains=${domains}`);
+        logger.info(`[channel] created round ${round.record_id!} for ticket ${ticket.record_id} with domains=${domains}`);
       } catch (err) {
         logger.error('[channel] createRound failed:', err);
       }
@@ -871,7 +873,7 @@ export class Channel {
       const turns = await this.session.searchNotifiableTurns();
       if (turns.length === 0) return;
 
-      console.log(`[channel] deliverTurns: ${turns.length} turns to deliver`);
+      logger.info(`[channel] deliverTurns: ${turns.length} turns to deliver`);
       for (const turn of turns) {
         if (!this.running) break;
         const turnRecordId = turn.record_id;
@@ -889,7 +891,7 @@ export class Channel {
         const turnAppId = this.getAppIdFromTurn(turn);
 
         if (!content || !rootMsgId) {
-          console.log(`[channel] skip turn ${turnRecordId} (missing content/rootMsgId)`);
+          logger.info(`[channel] skip turn ${turnRecordId} (missing content/rootMsgId)`);
           continue;
         }
 
@@ -907,7 +909,7 @@ export class Channel {
           await this.reply(rootMsgId, finalContent, true, turnAppId);
           this.deliveredTurnIds.add(turnRecordId);
           await this.session.markTurnNotified(turnRecordId);
-          console.log(`[channel] delivered ${status} turn ${turnRecordId} via appId=${turnAppId || 'primary'}`);
+          logger.info(`[channel] delivered ${status} turn ${turnRecordId} via appId=${turnAppId || 'primary'}`);
         } catch (err) {
           logger.error(`[channel] deliver turn failed ${turnRecordId}:`, err);
         }
@@ -982,7 +984,7 @@ export class Channel {
             [this.cfg.fields.turn.dedupKey]: cardDedupKey,
             [this.cfg.fields.turn.createdAt]: Date.now(),
           });
-          console.log(`[channel] approval card sent for round ${round.record_id}`);
+          logger.info(`[channel] approval card sent for round ${round.record_id}`);
         } catch (err) {
           logger.error(`[channel] approval card failed for round ${round.record_id!}:`, err);
         }
@@ -1000,7 +1002,7 @@ export class Channel {
     const decision = action.value.action;
     if (!roundId || !decision) return;
 
-    console.log(`[channel] card action: ${decision} round=${roundId}`);
+    logger.info(`[channel] card action: ${decision} round=${roundId}`);
     try {
       if (decision === 'approve') {
         await this.session.transitionRound(roundId, this.cfg.roundStatuses.approved);
@@ -1039,11 +1041,11 @@ export class Channel {
         }
       }
 
-      if (closed > 0) console.log(`[channel] closed ${closed} stale draft(s)`);
+      if (closed > 0) logger.info(`[channel] closed ${closed} stale draft(s)`);
 
       if (this.deliveredTurnIds.size > 10_000) {
         this.deliveredTurnIds.clear();
-        console.log('[channel] cleared deliveredTurnIds set');
+        logger.info('[channel] cleared deliveredTurnIds set');
       }
     } catch (err) {
       logger.error('[channel] cleanupStaleDrafts error:', err);
@@ -1055,7 +1057,7 @@ export class Channel {
   // -----------------------------------------------------------------------
 
   /** Load enabled capabilities from Domains table (cached). */
-  private async loadDomains(): Promise<import('./intent.js').Domain[]> {
+  private async loadDomains(): Promise<import('../lib/messaging/intent.js').Domain[]> {
     if (this.cachedDomains) return this.cachedDomains;
     if (!this.cfg.domainsTableId) return [];
     try {
@@ -1068,7 +1070,7 @@ export class Channel {
           domain: extractText(r.fields['domain'] ?? r.fields['capability']),
           description: extractText(r.fields['description']),
         }))
-        .filter(d => d.domain.length > 0) as unknown as import('./intent.js').Domain[];
+        .filter(d => d.domain.length > 0) as unknown as import('../lib/messaging/intent.js').Domain[];
       setTimeout(() => { this.cachedDomains = null; }, 60_000);
       return this.cachedDomains;
     } catch {
@@ -1114,18 +1116,18 @@ export class Channel {
     try {
       fields[this.cfg.fields.roster.human] = [{ id: primaryId }];
       await this.bitable.createRecord(this.cfg.rosterTableId, fields, userIdType);
-      console.log(`[channel] created human roster: ${identity}`);
+      logger.info(`[channel] created human roster: ${identity}`);
     } catch (err: any) {
       if (String(err?.code ?? err) === '1254066' || String(err?.message ?? '').includes('UserFieldConvFail')) {
         delete fields[this.cfg.fields.roster.human];
         try {
           await this.bitable.createRecord(this.cfg.rosterTableId, fields);
-          console.log(`[channel] created human roster ${identity} (without Person field)`);
+          logger.info(`[channel] created human roster ${identity} (without Person field)`);
         } catch (retryErr) {
-          console.log('[channel] ensureHumanRoster failed:', retryErr);
+          logger.info('[channel] ensureHumanRoster failed:', retryErr);
         }
       } else {
-        console.log('[channel] ensureHumanRoster failed:', err);
+        logger.info('[channel] ensureHumanRoster failed:', err);
       }
     }
   }
@@ -1179,7 +1181,7 @@ export class Channel {
         if (rootMsgId) {
           await this.reply(rootMsgId, text, true);
         }
-        console.log(`[channel] notified humans for ticket ${ticket.record_id}`);
+        logger.info(`[channel] notified humans for ticket ${ticket.record_id}`);
       }
     } catch (err) {
       logger.error('[channel] notifyHumans error:', err);

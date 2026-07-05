@@ -1,9 +1,9 @@
-import { logger } from './log.js';
+import { logger } from '../lib/log.js';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import { parse as parseToml, stringify as stringifyToml } from 'smol-toml';
-import { Config, FieldMapping, StatusMapping, RoundStatusMapping, ChannelConfig, OperatorConfig, CoordinatorConfig, ExecutorConfig, MessagesConfig, DomainConfig, BackendConfig } from './types.js';
+import { Config, FieldMapping, StatusMapping, RoundStatusMapping, ChannelConfig, OperatorConfig, CoordinatorConfig, ExecutorConfig, MessagesConfig, DomainConfig, BackendConfig } from '../lib/types.js';
 
 // ---------------------------------------------------------------------------
 // Profile path
@@ -215,7 +215,7 @@ export function saveProfile(name: string, data: Record<string, unknown>): void {
   }
   // operators array
   if (Array.isArray(data.operators) && data.operators.length > 0) {
-    out.operators = data.operators.map((op: import('./types.js').BotConfig) => ({
+    out.operators = data.operators.map((op: import('../lib/types.js').BotConfig) => ({
       name: op.name,
       appId: op.appId,
       appSecret: op.appSecret,
@@ -398,7 +398,7 @@ export function loadConfig(profile = 'default'): Config {
 
   // Parse operators list from TOML [[operators]] sections
   const rawOperators = Array.isArray((raw as any).operators) ? (raw as any).operators : [];
-  const operators: import('./types.js').BotConfig[] = rawOperators
+  const operators: import('../lib/types.js').BotConfig[] = rawOperators
     .filter((op: any) => op && typeof op === 'object' && op.appId)
     .map((op: any) => ({
       name: String(op.name ?? ''),
@@ -522,8 +522,8 @@ function parseDomainMap(raw: Record<string, unknown> | undefined): Record<string
 export async function enrichConfigFromBitable(cfg: Config): Promise<void> {
   if (!cfg.configsTableId || !cfg.appToken) return;
   try {
-    const { BitableClient } = await import('./bitable.js');
-    const { loadConfigsFromTable, mergeConfigRows } = await import('./config-loader.js');
+    const { BitableClient } = await import('../lib/bitable/client.js');
+    const { loadConfigsFromTable, mergeConfigRows } = await import('../lib/config-loader.js');
     const bitable = new BitableClient(cfg);
     const rows = await loadConfigsFromTable(cfg.configsTableId, bitable);
     mergeConfigRows(cfg, rows);

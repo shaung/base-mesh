@@ -1,4 +1,4 @@
-import { logger } from './log.js';
+import { logger } from '../lib/log.js';
 // Coordinator — push mode central node. Manages executor registration,
 // routes tasks, proxies Bitable writes, sends one-time IM notifications.
 // In Round-driven mode (cfg.roundsTableId), also drives the Round state machine.
@@ -6,14 +6,14 @@ import { logger } from './log.js';
 import { createServer } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { Client } from '@larksuiteoapi/node-sdk';
-import { BotConfig, Config, BitableRecord, Part, RoundStatusMapping } from './types.js';
-import { BitableClient } from './bitable.js';
-import { Session } from './protocol.js';
-import { extractText, extractUserIds } from './text.js';
-import { createSession, validateSession } from './sessions.js';
-import { getDomainConfig } from './domain.js';
-import { formatMessage } from './messages.js';
-import { routeA2ARequest, verifyA2AAuth } from './a2a.js';
+import { BotConfig, Config, BitableRecord, Part, RoundStatusMapping } from '../lib/types.js';
+import { BitableClient } from '../lib/bitable/client.js';
+import { Session } from '../lib/bitable/protocol.js';
+import { extractText, extractUserIds } from '../lib/messaging/text.js';
+import { createSession, validateSession } from '../lib/sessions.js';
+import { getDomainConfig } from '../lib/bitable/domain.js';
+import { formatMessage } from '../lib/messaging/messages.js';
+import { routeA2ARequest, verifyA2AAuth } from '../channel/a2a.js';
 
 interface PushExecutor { ws: WebSocket; identity: string; domains: string[]; activeTicketId?: string; lastHeartbeat: number; }
 
@@ -40,13 +40,13 @@ export class Coordinator {
     this.bitable = new BitableClient(cfg);
     this.session = new Session('channel', 'Channel', cfg, this.bitable);
     const dc = getDomainConfig(cfg.openApiDomain);
-    this.client = new Client({ appId: cfg.appId, appSecret: cfg.appSecret || 'unused', domain: dc.sdkBaseUrl, loggerLevel: 2 });
+    this.client = new Client({ appId: cfg.appId, appSecret: cfg.appSecret || 'unused', domain: dc.sdkBaseUrl, loggerLevel: 3 });
     // Initialize per-operator Clients for multi-credential IM sending
     if (cfg.operators) {
       for (const op of cfg.operators) {
         if (op.appId && op.appSecret && op.appId !== cfg.appId) {
           try {
-            const opClient = new Client({ appId: op.appId, appSecret: op.appSecret, domain: dc.sdkBaseUrl, loggerLevel: 2 });
+            const opClient = new Client({ appId: op.appId, appSecret: op.appSecret, domain: dc.sdkBaseUrl, loggerLevel: 3 });
             this.operatorClients.set(op.appId, opClient);
           } catch (err) {
             logger.error(`[coordinator] failed to init operator client "${op.name}":`, err);
@@ -69,7 +69,7 @@ export class Coordinator {
 
   start() {
     const port = this.cfg.coordinator?.port || 0;
-    if (!port) { console.log('[coordinator] port not configured, skipping'); return; }
+    if (!port) { logger.info('[coordinator] port not configured, skipping'); return; }
 
     const fileProxyEnabled = this.cfg.coordinator?.fileProxyEnabled !== false;
     const a2aEnabled = this.cfg.coordinator?.a2a?.enabled === true;
@@ -95,7 +95,7 @@ export class Coordinator {
     });
     this.wss = new WebSocketServer({ server });
     this.wss.on('connection', (ws, req) => this.handleConnection(ws, req));
-    server.listen(port, () => console.log(`[coordinator] listening on :${port}`));
+    server.listen(port, () => logger.info(`[coordinator] listening on :${port}`));
 
     const interval = (this.cfg.coordinator?.heartbeatSeconds ?? 60) * 1000;
     this.heartbeatTimer = setInterval(() => this.heartbeatAll(), interval);
@@ -125,7 +125,7 @@ export class Coordinator {
 
         if (type === 'auth') {
           identity = msg.identity as string || '';
-          console.log(`[coordinator] auth requested for ${identity}, sending app credentials`);
+          logger.info(`[coordinator] auth requested for ${identity}, sending app credentials`);
           ws.send(JSON.stringify({
             type: 'auth_required',
             appId: this.cfg.appId,
@@ -151,11 +151,11 @@ export class Coordinator {
           this.executors.set(identity, { ws, identity, domains, lastHeartbeat: Date.now() });
           try {
             await this.upsertRoster(identity, domains, msg);
-            console.log(`[coordinator] roster upserted for ${identity}`);
+            logger.info(`[coordinator] roster upserted for ${identity}`);
           } catch (err: any) {
             logger.error(`[coordinator] roster upsert failed: ${err.message}`, err);
           }
-          console.log(`[coordinator] push executor connected: ${identity} domains=[${domains}]`);
+          logger.info(`[coordinator] push executor connected: ${identity} domains=[${domains}]`);
           ws.send(JSON.stringify({ type: 'auth_ok', session_token: sessionToken }));
           this.tryAssignPendingToExecutor(identity, domains).catch(() => {});
           return;
@@ -169,7 +169,7 @@ export class Coordinator {
           this.executors.set(identity, { ws, identity, domains, lastHeartbeat: Date.now() });
           try {
             await this.upsertRoster(identity, domains, msg);
-            console.log(`[coordinator] roster upserted (reauth) for ${identity}`);
+            logger.info(`[coordinator] roster upserted (reauth) for ${identity}`);
           } catch (err: any) {
             logger.error(`[coordinator] roster upsert failed: ${err.message}`, err);
           }
@@ -219,7 +219,7 @@ export class Coordinator {
               // Update placeholder with real cardId
               const st = this.streamingCards.get(cardKey);
               if (st) st.cardId = cardId;
-              console.log(`[coordinator] stream: created card ${cardId} for ${roundId ? `round ${roundId}` : `ticket ${ticketId}`}`);
+              logger.info(`[coordinator] stream: created card ${cardId} for ${roundId ? `round ${roundId}` : `ticket ${ticketId}`}`);
               // Flush buffered content to respective elements
               const pending = this.streamBuffer.get(cardKey) || [];
               this.streamBuffer.delete(cardKey);
@@ -375,14 +375,14 @@ export class Coordinator {
           // Fallback: if no round-based appId, use turn-derived for replies too
           if (!resultAppId) resultAppId = reactionAppId;
 
-          console.log(`[coordinator] result from ${identity} ticket=${ticketId} answer=${answer.slice(0, 60)}${parts ? ` parts=${parts.length}` : ''} roundAppId=${resultAppId || 'none'} reactionAppId=${reactionAppId || 'none'} using=${resultAppId || reactionAppId || 'primary'}`);
-          console.log(`[coordinator] writing agent turn for ticket=${ticketId}`);
+          logger.info(`[coordinator] result from ${identity} ticket=${ticketId} answer=${answer.slice(0, 60)}${parts ? ` parts=${parts.length}` : ''} roundAppId=${resultAppId || 'none'} reactionAppId=${reactionAppId || 'none'} using=${resultAppId || reactionAppId || 'primary'}`);
+          logger.info(`[coordinator] writing agent turn for ticket=${ticketId}`);
           try {
             // Prefix dedupKey with appId so Channel's getAppIdFromTurn fallback
             // (dedupKey parsing) works even if the app_id column is missing.
             const agentDedupKey = resultAppId ? `${resultAppId}:${ticketId}_${Date.now()}` : `${ticketId}_${Date.now()}`;
             const turnId = await this.session.appendTurn(ticketId, 'agent', answer, agentDedupKey, identity, 'answered', rootMsgId, roundId, parts, 1, resultAppId);
-            console.log(`[coordinator] agent turn written ticket=${ticketId} turnId=${turnId}`);
+            logger.info(`[coordinator] agent turn written ticket=${ticketId} turnId=${turnId}`);
             if (answer && rootMsgId && !msg.streamed) {
               try {
                 await this.notifyIM(rootMsgId, answer, resultAppId);
@@ -407,13 +407,13 @@ export class Coordinator {
           // ticket→done would see pending and create a duplicate Round.
           const needsReassign = reassignTo && reassignTo.roles && reassignTo.roles.length > 0;
           if (needsReassign) {
-            console.log(`[coordinator] reassigning ticket=${ticketId} to roles=${reassignTo!.roles}`);
+            logger.info(`[coordinator] reassigning ticket=${ticketId} to roles=${reassignTo!.roles}`);
             await this.session.release(ticketId, this.cfg.statuses.active);
           } else {
-            console.log(`[coordinator] writeResult ticket=${ticketId}`);
+            logger.info(`[coordinator] writeResult ticket=${ticketId}`);
             try {
               await this.session.writeResult(ticketId, answer, (msg.newSummary as string) || '');
-              console.log(`[coordinator] writeResult done ticket=${ticketId}`);
+              logger.info(`[coordinator] writeResult done ticket=${ticketId}`);
             } catch (err: any) {
               logger.error(`[coordinator] writeResult failed: ${err.message}`, err);
             }
@@ -440,11 +440,11 @@ export class Coordinator {
             }
         }
 
-          // Remove OneSecond emoji from the latest user turn
+          // Remove OnIt emoji from the latest user turn (agent finished)
           try {
             const resultTurns = await this.session.getTurns(ticketId);
             const latestId = latestTurnMessageId(resultTurns, this.cfg.fields.turn.role, this.cfg.fields.turn.dedupKey);
-            if (latestId) await this.removeReaction(latestId, 'OneSecond', reactionAppId);
+            if (latestId) await this.removeReaction(latestId, 'OnIt', reactionAppId);
           } catch { /* */ }
 
           const ex = this.executors.get(identity);
@@ -455,29 +455,29 @@ export class Coordinator {
       } catch (err) { logger.error('[coordinator] message error:', err); }
     });
 
-    ws.on('close', () => console.log(`[coordinator] push executor disconnected: ${identity}`));
+    ws.on('close', () => logger.info(`[coordinator] push executor disconnected: ${identity}`));
     ws.on('error', () => { /* */ });
   }
 
   // -- Task routing ---------------------------------------------------------
   async tryRoute(ticket: BitableRecord): Promise<boolean> {
-    const recordId = ticket.record_id; if (!recordId) { console.log('[coordinator] tryRoute: no record_id'); return false; }
+    const recordId = ticket.record_id; if (!recordId) { logger.info('[coordinator] tryRoute: no record_id'); return false; }
     const status = String(ticket.fields[this.cfg.fields.ticket.status] ?? '');
-    console.log(`[coordinator] tryRoute ticket=${recordId.slice(0,12)} status=${status} roundMode=${!!this.cfg.roundsTableId} executors=${this.executors.size}`);
+    logger.info(`[coordinator] tryRoute ticket=${recordId.slice(0,12)} status=${status} roundMode=${!!this.cfg.roundsTableId} executors=${this.executors.size}`);
 
     // In Round-driven mode, tryRoute NEVER creates Rounds. Rounds are created
     // by handleThreadReply (Channel). The Round creation event drives processing
     // via processRound. tryRoute only nudges existing active Rounds.
     if (this.cfg.roundsTableId) {
       const currentRound = await this.session.getCurrentRound(recordId);
-      console.log(`[coordinator] tryRoute roundMode: currentRound=${currentRound?.record_id?.slice(0,12) || 'none'}`);
+      logger.info(`[coordinator] tryRoute roundMode: currentRound=${currentRound?.record_id?.slice(0,12) || 'none'}`);
       if (currentRound) {
         await this.processRound(currentRound.record_id!);
       }
       return true;
     }
     // Non-round path (legacy): use empty domains, match any executor
-    console.log(`[coordinator] tryRoute legacy (no round mode) executorCount=${this.executors.size}`);
+    logger.info(`[coordinator] tryRoute legacy (no round mode) executorCount=${this.executors.size}`);
 
     const rawLastOwner = String(ticket.fields[this.cfg.fields.ticket.lastOwner] ?? '');
     const lastOwnerIdentity = rawLastOwner.includes('#') ? rawLastOwner.split('#').pop()! : rawLastOwner;
@@ -536,7 +536,7 @@ export class Coordinator {
       try { await this.removeReaction(latestMsgId, 'OneSecond', appId); } catch { /* */ }
       try { await this.reactToMessage(latestMsgId, 'OnIt', appId); } catch { /* */ }
     }
-    console.log(`[coordinator] ticket ${recordId} assigned to ${ex.identity} appId=${appId || 'primary'}`);
+    logger.info(`[coordinator] ticket ${recordId} assigned to ${ex.identity} appId=${appId || 'primary'}`);
   }
 
   canHandle(_ticket: BitableRecord): boolean {
@@ -590,10 +590,10 @@ export class Coordinator {
   /** Start polling loop for Round state machine. No-op if round mode not active. */
   private startRoundCoordination(): void {
     if (!this.cfg.roundsTableId) {
-      console.log('[coordinator] round mode not enabled (no roundsTableId)');
+      logger.info('[coordinator] round mode not enabled (no roundsTableId)');
       return;
     }
-    console.log('[coordinator] round state machine started');
+    logger.info('[coordinator] round state machine started');
     const interval = (this.cfg.coordinator?.pollIntervalSeconds ?? 10) * 1000;
     this.roundPollTimer = setInterval(() => {
       this.roundCoordinationCycle().catch((err) =>
@@ -658,13 +658,13 @@ export class Coordinator {
     const needsApproval = await this.checkHitlRequired(domains);
 
     if (needsApproval) {
-      console.log(`[coordinator] round ${roundId} → pending_approval`);
+      logger.info(`[coordinator] round ${roundId} → pending_approval`);
       const ok = await this.session.transitionRound(roundId, this.cfg.roundStatuses.pendingApproval);
       if (!ok) {
-        console.log(`[coordinator] round ${roundId} transition to pending_approval failed`);
+        logger.info(`[coordinator] round ${roundId} transition to pending_approval failed`);
       }
     } else {
-      console.log(`[coordinator] round ${roundId} → executing (direct)`);
+      logger.info(`[coordinator] round ${roundId} → executing (direct)`);
       await this.assignRoundToExecutor(round, ticket);
     }
   }
@@ -678,7 +678,7 @@ export class Coordinator {
     const createdAt = Number(round.fields[this.cfg.fields.round.createdAt] ?? 0);
     const timeoutMs = (this.cfg.executor?.approvalTimeoutMinutes ?? 30) * 60 * 1000;
     if (createdAt > 0 && Date.now() - createdAt > timeoutMs) {
-      console.log(`[coordinator] round ${roundId} approval timeout, reverting to pending`);
+      logger.info(`[coordinator] round ${roundId} approval timeout, reverting to pending`);
       await this.session.transitionRound(roundId, this.cfg.roundStatuses.pending);
     }
   }
@@ -693,7 +693,7 @@ export class Coordinator {
     const ticket = await this.session.getTicket(ticketId);
     if (!ticket) return;
 
-    console.log(`[coordinator] round ${roundId} approved, assigning executor`);
+    logger.info(`[coordinator] round ${roundId} approved, assigning executor`);
     await this.assignRoundToExecutor(round, ticket);
   }
 
@@ -708,7 +708,7 @@ export class Coordinator {
         ],
       });
 
-      const { PrefixMatcher } = await import('./matcher.js');
+      const { PrefixMatcher } = await import('../lib/messaging/matcher.js');
       const matcher = new PrefixMatcher();
 
       for (const agent of agents) {
@@ -737,7 +737,7 @@ export class Coordinator {
 
     const domains = parseDomains(round.fields[this.cfg.fields.round.domains]);
 
-    const { PrefixMatcher } = await import('./matcher.js');
+    const { PrefixMatcher } = await import('../lib/messaging/matcher.js');
     const matcher = new PrefixMatcher();
 
     // Phase 1: Try affinity — assign to last known owner
@@ -768,7 +768,7 @@ export class Coordinator {
     }
 
     // No executor available — leave round pending for later assignment
-    console.log(`[coordinator] no executor for round ${roundId} with domains=${domains}, waiting`);
+    logger.info(`[coordinator] no executor for round ${roundId} with domains=${domains}, waiting`);
   }
 
   /** After a new executor connects, try assigning it to any pending round. */
@@ -777,7 +777,7 @@ export class Coordinator {
     const ex = this.executors.get(identity);
     if (!ex || ex.activeTicketId) return;
     const pending = await this.session.searchRoundsByStatus(this.cfg.roundStatuses.pending);
-    const { PrefixMatcher } = await import('./matcher.js');
+    const { PrefixMatcher } = await import('../lib/messaging/matcher.js');
     const matcher = new PrefixMatcher();
     for (const round of pending) {
       const domains = parseDomains(round.fields[this.cfg.fields.round.domains]);
@@ -789,7 +789,7 @@ export class Coordinator {
       const ticket = await this.session.getTicket(ticketId);
       if (!ticket) continue;
       await this.dispatchRoundToExecutor(ex, round, ticket);
-      console.log(`[coordinator] assigned pending round ${round.record_id!} to ${identity}`);
+      logger.info(`[coordinator] assigned pending round ${round.record_id!} to ${identity}`);
       return;
     }
   }
@@ -844,7 +844,7 @@ export class Coordinator {
       try { await this.removeReaction(latestMsgId, 'OneSecond', turnAppId); } catch { /* */ }
       try { await this.reactToMessage(latestMsgId, 'OnIt', turnAppId); } catch { /* */ }
     }
-    console.log(`[coordinator] round ${round.record_id!} dispatched to ${ex.identity} turnAppId=${turnAppId || '?'} roundAppId=${roundAppId || '?'}`);
+    logger.info(`[coordinator] round ${round.record_id!} dispatched to ${ex.identity} turnAppId=${turnAppId || '?'} roundAppId=${roundAppId || '?'}`);
   }
 
   /** Send cancel to a push executor assigned to this Round. Returns true if sent. */
@@ -858,7 +858,7 @@ export class Coordinator {
       const ex = this.executors.get(identity);
       if (!ex || !ex.ws) return false;
       ex.ws.send(JSON.stringify({ type: 'cancel', round_id: roundId }));
-      console.log(`[coordinator] sent cancel to ${identity} for round ${roundId}`);
+      logger.info(`[coordinator] sent cancel to ${identity} for round ${roundId}`);
       // Clear activeTicketId so the executor can be reassigned to the next
       // round. Guard by ticket match to prevent races: only clear when the
       // executor's current ticket matches this round's ticket, so a stale
@@ -892,7 +892,7 @@ export class Coordinator {
     const executorField = String(round.fields[this.cfg.fields.round.executor] ?? '');
     const identity = executorField.includes('#') ? executorField.split('#').pop()! : executorField;
     if (identity && this.executors.has(identity)) {
-      console.log(`[coordinator] round ${roundId} executor ${identity} still connected, skip stuck check`);
+      logger.info(`[coordinator] round ${roundId} executor ${identity} still connected, skip stuck check`);
       return;
     }
     // Round is executing but no executor found — re-read to guard against
@@ -904,12 +904,12 @@ export class Coordinator {
         const freshField = String(fresh.fields[this.cfg.fields.round.executor] ?? '');
         const freshIdentity = freshField.includes('#') ? freshField.split('#').pop()! : freshField;
         if (freshIdentity && this.executors.has(freshIdentity)) {
-          console.log(`[coordinator] round ${roundId} re-read: executor ${freshIdentity} present, skip stuck check`);
+          logger.info(`[coordinator] round ${roundId} re-read: executor ${freshIdentity} present, skip stuck check`);
           return;
         }
       }
     }
-    console.log(`[coordinator] stuck round ${roundId}, reverting to pending`);
+    logger.info(`[coordinator] stuck round ${roundId}, reverting to pending`);
     // Clear the executor's activeTicketId so the round can be re-dispatched
     // when a fresh assignRoundToExecutor cycle runs.
     if (identity) {
@@ -1029,6 +1029,11 @@ export class Coordinator {
   }
 
   // -- IM helpers ------------------------------------------------------------
+  private logSDKError(label: string, appId: string | undefined, err: any): void {
+    const summary = err?.response?.data ? `status=${err.status || err.code} body=${JSON.stringify(err.response.data).slice(0, 500)}` : err?.message || String(err);
+    logger.error(`[coordinator] ${label} appId=${appId || 'primary'} ${summary}`);
+  }
+
   private async reactToMessage(messageId: string, emojiType: string, appId?: string) {
     if (!this.cfg.appSecret && !appId) return;
     const client = this.getClient(appId);
@@ -1037,7 +1042,9 @@ export class Coordinator {
         path: { message_id: messageId },
         data: { reaction_type: { emoji_type: emojiType } },
       });
-    } catch { /* best effort */ }
+    } catch (err: any) {
+      this.logSDKError('reactToMessage', appId, err);
+    }
   }
 
   /** Find and remove a reaction by emoji type. Silently handles not-found
@@ -1061,15 +1068,20 @@ export class Coordinator {
             await client.im.v1.messageReaction.delete({ path: { message_id: messageId, reaction_id: r.reaction_id } });
           } catch (err: any) {
             // 231007 = no permission to delete (reaction added by another bot).
-            // Swallow silently — SDK's internal logger may still print it,
-            // but our business logic treats it as expected.
             const apiCode = err?.response?.data?.code ?? err?.code;
-            if (apiCode !== 231007) throw err;
+            if (apiCode === 231007) {
+              logger.warn(`[coordinator] removeReaction skip (231007) appId=${appId || 'primary'}`);
+              return;
+            }
+            this.logSDKError('removeReaction.delete', appId, err);
+            throw err;
           }
           return;
         }
       }
-    } catch { /* ignore */ }
+    } catch (err: any) {
+      this.logSDKError('removeReaction.list', appId, err);
+    }
   }
 
   // -- One-time IM notification (not recorded as Turn) ----------------------
@@ -1099,11 +1111,11 @@ export class Coordinator {
   // -- Roster & heartbeat ---------------------------------------------------
   private async upsertRoster(identity: string, domains: string[] | undefined, msg: Record<string, unknown>) {
     const safeDomains = Array.isArray(domains) ? domains : [];
-    console.log(`[coordinator] upsertRoster identity=${identity} domains=${safeDomains}`);
+    logger.info(`[coordinator] upsertRoster identity=${identity} domains=${safeDomains}`);
     const recs = await this.bitable.searchRecords(this.cfg.rosterTableId, {
       conjunction: 'and', conditions: [{ field_name: this.cfg.fields.roster.identity, operator: 'is', value: [identity] }],
     });
-    console.log(`[coordinator] roster search result: ${recs.length} records`);
+    logger.info(`[coordinator] roster search result: ${recs.length} records`);
     const fields = {
       [this.cfg.fields.roster.kind]: 'agent', [this.cfg.fields.roster.domains]: safeDomains.length > 0 ? safeDomains : ['general'],
       [this.cfg.fields.roster.enabled]: true, [this.cfg.fields.roster.description]: (msg.description as string) || '',

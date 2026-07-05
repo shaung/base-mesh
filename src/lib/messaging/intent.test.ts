@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import type { Domain, IntentConfig } from './intent.js';
+import type { Domain, IntentConfig } from '../../lib/messaging/intent.js';
 
 // Import functions under test
 import {
@@ -10,7 +10,7 @@ import {
   recognize,
   processMessage,
   callLLM,
-} from './intent.js';
+} from '../../lib/messaging/intent.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures

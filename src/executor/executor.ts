@@ -1,14 +1,14 @@
-import { logger } from './log.js';
-import { Config, BitableRecord, Part, FilePart, ProcessContext } from './types.js';
-import { extractText } from './text.js';
-import { FLD } from './fields.js';
-import { KekkaiProcessor } from './processor.js';
+import { logger } from '../lib/log.js';
+import { Config, BitableRecord, Part, FilePart, ProcessContext } from '../lib/types.js';
+import { extractText } from '../lib/messaging/text.js';
+import { FLD } from '../lib/bitable/fields.js';
+import { KekkaiProcessor } from '../executor/processor.js';
 import { spawn } from 'node:child_process';
 import { mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import WebSocket from 'ws';
-import { startDashboard, dashboardState } from './dashboard.js';
+import { startDashboard, dashboardState } from '../executor/dashboard.js';
 
 // ---------------------------------------------------------------------------
 // Executor — push-mode only. Connects to Channel via WebSocket, receives
@@ -79,7 +79,7 @@ export class Executor {
   // -----------------------------------------------------------------------
 
   private async pushLoop(): Promise<void> {
-    const { readExecutorToken, writeExecutorToken } = await import('./sessions.js');
+    const { readExecutorToken, writeExecutorToken } = await import('../lib/sessions.js');
 
     const wsUrl = this.cfg.executor?.coordinatorUrl || '';
     const identity = this.cfg.clientId || this.cfg.identity;
@@ -127,7 +127,7 @@ export class Executor {
             storedDomain = msg.openApiDomain as string || '';
             console.log(`[executor] auth required, starting OAuth login for appId=${storedAppId}`);
             try {
-              const { UserTokenProvider, loadStoredTokens } = await import('./auth.js');
+              const { UserTokenProvider, loadStoredTokens } = await import('../lib/auth/oauth.js');
               let provider = UserTokenProvider.fromStore(storedAppId);
               if (!provider) {
                 provider = await UserTokenProvider.login(storedAppId, storedDomain);

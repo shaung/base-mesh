@@ -16,7 +16,7 @@ export interface GrantOptions {
  *  Returns true on success, false on failure. */
 export async function grantBitableAccess(opts: GrantOptions): Promise<boolean> {
   try {
-    const { getDomainConfig } = await import('./domain.js');
+    const { getDomainConfig } = await import('../../lib/bitable/domain.js');
     const dc = getDomainConfig(String(opts.openApiDomain || 'open.larksuite.com'));
     const tokenResp = await fetch(`${dc.sdkBaseUrl}/open-apis/auth/v3/app_access_token/internal`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -44,7 +44,7 @@ export async function resolvePhoneToOpenId(
   openApiDomain?: string,
 ): Promise<string | null> {
   try {
-    const { getDomainConfig } = await import('./domain.js');
+    const { getDomainConfig } = await import('../../lib/bitable/domain.js');
     const dc = getDomainConfig(String(openApiDomain || 'open.larksuite.com'));
     const tokenResp = await fetch(`${dc.sdkBaseUrl}/open-apis/auth/v3/app_access_token/internal`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },

@@ -3,14 +3,14 @@
   "version": "0.0.5",
   "description": "Asynchronous human-AI collaboration on Lark Bitable",
   "type": "module",
-  "main": "./dist/cli.js",
+  "main": "./dist/cli/cli.js",
   "bin": {
     "bam": "./bin/bam.js"
   },
   "scripts": {
     "build": "tsc",
     "start": "node bin/bam.js",
-    "dev": "npx tsx src/cli.ts",
+    "dev": "npx tsx src/cli/cli.ts",
     "prepublishOnly": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest",

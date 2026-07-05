@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { Config, BitableRecord } from './types.js';
+import type { Config, BitableRecord } from '../lib/types.js';
 
 // Mock ws BEFORE importing Coordinator — EventEmitter-like so tests can
 // capture 'message' handlers and trigger them with custom payloads.
@@ -39,13 +39,13 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 }));
 
 // Mock sessions module
-vi.mock('./sessions.js', () => ({
+vi.mock('../lib/sessions.js', () => ({
   createSession: vi.fn(() => 'mock_session_token'),
   validateSession: vi.fn(() => null),
 }));
 
-import { Coordinator } from './coordinator.js';
-import { BitableClient } from './bitable.js';
+import { Coordinator } from '../channel/coordinator.js';
+import { BitableClient } from '../lib/bitable/client.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -54,7 +54,7 @@ import { BitableClient } from './bitable.js';
 const RECORDS = new Map<string, Map<string, BitableRecord>>();
 
 // Override BitableClient mock to provide an in-memory implementation
-vi.mock('./bitable.js', () => ({
+vi.mock('../lib/bitable/client.js', () => ({
   BitableClient: class MockBitableClient {
     constructor(cfg: any) {
       (this as any).cfg = cfg;

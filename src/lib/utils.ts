@@ -1,5 +1,5 @@
-import { Config } from './types.js';
-import { BitableClient } from './bitable.js';
+import { Config } from '../lib/types.js';
+import { BitableClient } from '../lib/bitable/client.js';
 
 /**
  * Create a support ticket from a user message.

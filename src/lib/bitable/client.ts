@@ -1,7 +1,7 @@
 import { Client, withUserAccessToken } from '@larksuiteoapi/node-sdk';
-import { Config, BitableRecord, TokenProvider } from './types.js';
-import { getDomainConfig } from './domain.js';
-import { logger } from './log.js';
+import { Config, BitableRecord, TokenProvider } from '../../lib/types.js';
+import { getDomainConfig } from '../../lib/bitable/domain.js';
+import { logger } from '../../lib/log.js';
 
 // ---------------------------------------------------------------------------
 // Bitable HTTP client — wraps the official Lark SDK.

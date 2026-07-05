@@ -4,8 +4,8 @@ import { homedir, platform } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
-import { StoredTokens, TokenProvider } from './types.js';
-import { getDomainConfig } from './domain.js';
+import { StoredTokens, TokenProvider } from '../../lib/types.js';
+import { getDomainConfig } from '../../lib/bitable/domain.js';
 
 // ---------------------------------------------------------------------------
 // Token storage

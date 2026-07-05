@@ -1,4 +1,4 @@
-import type { Part } from './types.js';
+import type { Part } from '../../lib/types.js';
 
 /**
  * Parse a Feishu post message content into structured parts and text summary.

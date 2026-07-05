@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { Config } from './types.js';
+import type { Config } from '../lib/types.js';
 
 // Mock Feishu SDK BEFORE importing Channel
 vi.mock('@larksuiteoapi/node-sdk', () => ({
@@ -13,7 +13,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
   EventDispatcher: class MockDispatcher { register() {} },
 }));
 
-vi.mock('./sessions.js', () => ({
+vi.mock('../lib/sessions.js', () => ({
   createSession: vi.fn(() => 'mock_session_token'),
   validateSession: vi.fn(() => null),
 }));
@@ -24,7 +24,7 @@ vi.mock('./a2a.js', () => ({
 
 const RECORDS = new Map<string, Map<string, any>>();
 
-vi.mock('./bitable.js', () => ({
+vi.mock('../lib/bitable/client.js', () => ({
   BitableClient: class MockBitableClient {
     constructor(cfg: any) { (this as any).cfg = cfg; }
     async createRecord(tableId: string, fields: Record<string, unknown>) {
@@ -64,7 +64,7 @@ vi.mock('./bitable.js', () => ({
   },
 }));
 
-import { Channel } from './channel.js';
+import { Channel } from '../channel/channel.js';
 
 function makeChannelConfig(): Config {
   return {
