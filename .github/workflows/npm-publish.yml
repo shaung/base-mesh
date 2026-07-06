@@ -1,35 +1,57 @@
-# This workflow will run tests using node and then publish a package to GitHub Packages when a release is created
-# For more information see: https://docs.github.com/en/actions/publishing-packages/publishing-nodejs-packages
+# This workflow will run tests using pnpm and then publish a package to npm.
+# It can also be triggered manually (workflow_dispatch) for testing — pass
+# dry_run: true to run through the full pipeline, including npm publish --dry-run,
+# which validates the package, runs prepublish scripts, and checks auth — without
+# actually publishing to the registry.
 
 name: Node.js Package
 
 on:
   release:
     types: [created]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run the full pipeline with npm publish --dry-run (validate, no actual publish)'
+        type: boolean
+        default: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm ci
-      - run: npm rebuild || true
-      - run: npm test
+          cache: pnpm
+      - run: pnpm i --frozen-lockfile
+      - run: pnpm test
 
   publish-npm:
     needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org/
-      - run: npm ci
-      - run: npm rebuild || true
-      - run: npm publish
+          cache: pnpm
+      - run: pnpm i --frozen-lockfile
+
+      # Use npm publish --dry-run when in dry_run mode.
+      # The --dry-run flag runs full validation (packing, scripts, auth check)
+      # but skips the final registry publish.
+      - name: Publish to npm
+        run: pnpm publish --no-git-checks --access public ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '--dry-run' || '' }}
         env:
           NODE_AUTH_TOKEN: ${{secrets.npm_token}}

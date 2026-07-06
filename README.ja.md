@@ -2,7 +2,7 @@
 
 # base-mesh
 
-Lark Bitable 上での非同期人間-AI コラボレーションシステム。
+Lark Base 上での非同期人間-AI コラボレーションシステム。
 
 > **⚠️ 免責事項**: 本プロジェクトは初期開発段階です。バグが含まれている可能性があり、本番環境での使用には適していません。API は変更される可能性があります。
 
@@ -10,11 +10,11 @@ Lark Bitable 上での非同期人間-AI コラボレーションシステム。
 
 ## 概要
 
-base-mesh は Lark Bitable をチケッティングシステムとして活用し、人間と AI 間のコラボレーションを実現します。ユーザーが Lark ボットにメッセージを送信すると、Bitable 上にチケットとして作成されます。Executor（エージェント）が agent CLI でチケットを処理し、同じチャットスレッドで返信します。
+base-mesh は Lark Base をチケッティングシステムとして活用し、人間と AI 間のコラボレーションを実現します。ユーザーが Lark ボットにメッセージを送信すると、Base 上にチケットとして作成されます。Executor（エージェント）が agent CLI でチケットを処理し、同じチャットスレッドで返信します。
 
 二つのプロセスが連携します：
 
-- **Channel** — Lark の Bitable API と IM API に接続するサーバー。チケット管理、WebSocket 経由のタスク配信、返信の配信を行います。
+- **Channel** — Lark の Base API と IM API に接続するサーバー。チケット管理、WebSocket 経由のタスク配信、返信の配信を行います。
 - **Executor** — WebSocket で Channel に接続し、タスクを受信、agent CLI を実行し、結果を返送します。Lark 認証情報は不要です。
 
 異なる問題ドメインに対応するため、追加の **Operator** ボットをグループチャットに参加させることができます。各ボットはオプションで特定のドメインにバインドされ、インテント認識をスキップして専門的なチケットを直接処理できます。
@@ -25,7 +25,7 @@ base-mesh は Lark Bitable をチケッティングシステムとして活用�
 
 - Node.js >= 18
 - agent CLI（例: [Claude Code](https://docs.anthropic.com/en/docs/claude-code)）が executor マシンにインストールされていること
-- Bitable + Bot 機能を持つ Lark/Feishu **カスタムアプリ**
+- Base + Bot 機能を持つ Lark/Feishu **カスタムアプリ**
 
 ---
 
@@ -49,7 +49,7 @@ bam setup
 
 - **アプリ認証情報** — QR コードをスキャン（推奨）または既存の appId/appSecret を入力
 - **認可** — ブラウザで URL を開いてログイン
-- **Bitable** — 新規作成、または既存の Bitable URL を貼り付け
+- **Base** — 新規作成、または既存の Base URL を貼り付け
 
 設定は `~/.bam/profiles/default.toml` に保存されます。
 
@@ -205,11 +205,11 @@ bam [options] <command>
 | `ticket create --summary <text>` | 下書きチケットを作成 |
 | `ticket reassign --id <id>` | チケットを解放し再割り当て |
 
-### Bitable 管理
+### Base 管理
 
 | コマンド | 説明 |
 |:---|:---|
-| `bitable new [--name <name>]` | 必要なテーブルを持つ新しい Bitable base を作成 |
+| `bitable new [--name <name>]` | 必要なテーブルを持つ新しい Base を作成 |
 | `bitable grant --app-token <token> --email <email>` | メールで編集権限を付与 |
 | `bitable grant --app-token <token> --phone <phone>` | 電話番号で編集権限を付与 |
 

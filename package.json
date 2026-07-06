@@ -11,7 +11,7 @@
     "build": "tsc",
     "start": "node bin/bam.js",
     "dev": "npx tsx src/cli/cli.ts",
-    "prepublishOnly": "npm run build",
+    "prepublishOnly": "pnpm build",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage"
@@ -48,7 +48,11 @@
     "wrangler": "^4.90.0"
   },
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
+    "@inquirer/prompts": "^8.5.2",
     "@larksuiteoapi/node-sdk": "^1.62.1",
     "@types/ws": "^8.18.1",
     "@typooo/kekkai": "^0.0.1",

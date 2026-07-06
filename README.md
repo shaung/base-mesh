@@ -2,7 +2,7 @@
 
 # base-mesh
 
-Human-AI collaboration on Lark (Feishu) Bitable.
+Human-AI collaboration on Lark (Feishu) Base.
 
 > **⚠️ Disclaimer**: This project is in early development. It is not suitable for production use. APIs may change and unexpected behavior may occur.
 
@@ -10,11 +10,11 @@ Human-AI collaboration on Lark (Feishu) Bitable.
 
 ## Overview
 
-base-mesh turns a Lark Bitable spreadsheet into a ticketing system for human-AI collaboration. Users send messages to a Lark bot, which creates tickets persisted in Bitable. Executors (agents) pick up the tickets, process them with an agent CLI, and reply back — all through the same chat thread.
+base-mesh turns a Lark Base spreadsheet into a ticketing system for human-AI collaboration. Users send messages to a Lark bot, which creates tickets persisted in Base. Executors (agents) pick up the tickets, process them with an agent CLI, and reply back — all through the same chat thread.
 
 Two processes work together:
 
-- **Channel** — a server that connects to Lark's Bitable and IM APIs. Manages tickets, dispatches work to executors via WebSocket, and delivers replies.
+- **Channel** — a server that connects to Lark's Base and IM APIs. Manages tickets, dispatches work to executors via WebSocket, and delivers replies.
 - **Executor (agent)** — connects to the Channel via WebSocket, receives tickets, runs an agent CLI, and returns results. No direct Lark credentials needed.
 
 For different problem domains, additional **Operator** bots can join the group chat, each optionally bound to a specific domain to handle specialized tickets without intent recognition.
@@ -49,7 +49,7 @@ Choose **Channel mode**. The wizard walks through three steps:
 
 - **App credentials** — scan QR code (recommended) or enter existing appId/appSecret
 - **Authorization** — open the URL in your browser to log in
-- **Bitable** — create a new base, or paste an existing Bitable URL
+- **Base** — create a new base, or paste an existing Base URL
 
 When it finishes, your profile is saved to `~/.bam/profiles/default.toml`.
 
@@ -121,7 +121,7 @@ selfCheck = true
 
 ### Configs Table (Runtime Settings)
 
-Once the Channel is running, most runtime settings can be changed from the Configs Bitable table without restarting:
+Once the Channel is running, most runtime settings can be changed from the Configs Base table without restarting:
 
 - channel: Poll interval, draft TTL, reaction mode, HITL policy
 - coordinator: WebSocket port, heartbeat interval, session TTL, global prompt
@@ -130,7 +130,7 @@ Once the Channel is running, most runtime settings can be changed from the Confi
 - operator.intent: LLM provider (anthropic/openai/deepseek), model, API key
 - messages: All IM notification templates
 
-Edit the Configs table in your Bitable base, then send /reload to the bot to apply changes.
+Edit the Configs table in your Base, then send /reload to the bot to apply changes.
 
 ---
 
@@ -205,11 +205,11 @@ bam [options] <command>
 | `ticket create --summary <text>` | Create a draft ticket |
 | `ticket reassign --id <id>` | Release and requeue |
 
-### Bitable Admin
+### Base Admin
 
 | Command | Description |
 |:---|:---|
-| `bitable new [--name <name>]` | Create a new Bitable base with required tables |
+| `bitable new [--name <name>]` | Create a new Base with required tables |
 | `bitable grant --app-token <token> --email <email>` | Grant edit access by email |
 | `bitable grant --app-token <token> --phone <phone>` | Grant edit access by phone |
 
