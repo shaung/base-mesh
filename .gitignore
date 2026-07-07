@@ -7,3 +7,5 @@ config.json
 .claude/
 scripts/
 coverage/
+# Cloudflare Workers local development
+.dev.vars
