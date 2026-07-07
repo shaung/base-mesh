@@ -6,7 +6,7 @@
 //
 // Responsibilities:
 //   - Accept WebSocket connections from executors
-//   - Authenticate executors via Feishu OAuth token or session token
+//   - Authenticate executors via Lark OAuth token or session token
 //   - Track executor identity, domains, and heartbeat
 //   - Dispatch tasks to available executors
 //   - Handle streaming updates from executors
@@ -193,12 +193,12 @@ export class ExecutorPool extends DurableObject<Env> {
 
     ws.send(JSON.stringify({
       type: 'auth_required',
-      appId: this.env.FEISHU_APP_ID,
-      openApiDomain: this.env.OPEN_API_DOMAIN || 'open.feishu.cn',
+      appId: this.env.LARK_APP_ID,
+      openApiDomain: this.env.OPEN_API_DOMAIN || 'open.larksuite.com',
     }));
   }
 
-  /** Handle token-based auth: validate Feishu OAuth token. */
+  /** Handle token-based auth: validate Lark OAuth token. */
   private async handleAuthToken(ws: WebSocket, data: Record<string, unknown>): Promise<void> {
     const token = data.token as string;
     const identity = (data.identity as string) || '';
@@ -210,8 +210,8 @@ export class ExecutorPool extends DurableObject<Env> {
       return;
     }
 
-    // Validate token against Feishu Open API
-    const domain = this.env.OPEN_API_DOMAIN || 'open.feishu.cn';
+    // Validate token against Lark Open API
+    const domain = this.env.OPEN_API_DOMAIN || 'open.larksuite.com';
     let valid = false;
     try {
       const resp = await fetch(`https://${domain}/open-apis/authen/v1/user_info`, {
@@ -291,7 +291,7 @@ export class ExecutorPool extends DurableObject<Env> {
   private async handleStreamUpdate(ws: WebSocket, data: Record<string, unknown>): Promise<void> {
     const identity = this.wsToIdentity.get(ws);
     if (!identity) return;
-    // TODO: Forward streaming updates to Feishu card
+    // TODO: Forward streaming updates to Lark card
     console.log(`[executor-pool] stream update from ${identity}: ticket=${data.ticket_id}`);
   }
 

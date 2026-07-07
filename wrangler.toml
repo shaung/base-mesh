@@ -9,8 +9,8 @@ compatibility_flags = ["nodejs_compat"]
 # ── Durable Objects ─────────────────────────────────────────────────────────
 
 [[durable_objects.bindings]]
-name = "FEISHU_CONNECTION"
-class_name = "FeishuConnection"
+name = "LARK_CONNECTION"
+class_name = "LarkConnection"
 
 [[durable_objects.bindings]]
 name = "EXECUTOR_POOL"
@@ -18,12 +18,12 @@ class_name = "ExecutorPool"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["FeishuConnection", "ExecutorPool"]
+new_classes = ["LarkConnection", "ExecutorPool"]
 
 # ── Environment variables ───────────────────────────────────────────────────
 
 [vars]
-FEISHU_APP_ID = ""
+LARK_APP_ID = ""
 BITABLE_APP_TOKEN = ""
 BITABLE_TICKETS_TABLE_ID = ""
 BITABLE_TURNS_TABLE_ID = ""
@@ -31,11 +31,11 @@ BITABLE_ROSTER_TABLE_ID = ""
 BITABLE_ROUNDS_TABLE_ID = ""
 BITABLE_DOMAINS_TABLE_ID = ""
 BITABLE_CONFIGS_TABLE_ID = ""
-OPEN_API_DOMAIN = "open.feishu.cn"
+OPEN_API_DOMAIN = "open.larksuite.com"
 A2A_API_TOKEN = ""
 
 # ── Secrets (set via `wrangler secret put <name>`) ──────────────────────────
-#   FEISHU_APP_SECRET
+#   LARK_APP_SECRET
 #   BITABLE_APP_TOKEN (if overriding vars)
 
 # ── Dev server ──────────────────────────────────────────────────────────────

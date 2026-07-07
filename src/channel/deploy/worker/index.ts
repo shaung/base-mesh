@@ -2,24 +2,24 @@
 // Cloudflare Worker entry point for BAM Channel
 //
 // Routes:
-//   /feishu/ws     → FeishuConnection DO (Feishu WebSocket events)
+//   /lark/ws       → LarkConnection DO (Lark WebSocket events)
 //   /executor/ws   → ExecutorPool DO (Executor WebSocket connections)
 //   /health        → Health check
 // ---------------------------------------------------------------------------
 
-import { FeishuConnection } from './do/feishu-connection.js';
+import { LarkConnection } from './do/lark-connection.js';
 import { ExecutorPool } from './do/executor-pool.js';
 
-export { FeishuConnection, ExecutorPool };
+export { LarkConnection, ExecutorPool };
 
 export interface Env {
   // Durable Object bindings
-  FEISHU_CONNECTION: DurableObjectNamespace<FeishuConnection>;
+  LARK_CONNECTION: DurableObjectNamespace<LarkConnection>;
   EXECUTOR_POOL: DurableObjectNamespace<ExecutorPool>;
 
   // Secrets
-  FEISHU_APP_ID: string;
-  FEISHU_APP_SECRET: string;
+  LARK_APP_ID: string;
+  LARK_APP_SECRET: string;
   BITABLE_APP_TOKEN: string;
   BITABLE_TICKETS_TABLE_ID: string;
   BITABLE_TURNS_TABLE_ID: string;
@@ -28,7 +28,7 @@ export interface Env {
   BITABLE_DOMAINS_TABLE_ID?: string;
   BITABLE_CONFIGS_TABLE_ID?: string;
 
-  // Open API domain (default: open.feishu.cn)
+  // Open API domain (default: open.larksuite.com)
   OPEN_API_DOMAIN?: string;
 
   // A2A API token (optional)
@@ -56,7 +56,6 @@ export interface Env {
   ROUND_STATUSES?: string;
 }
 
-// Use the nodejs_compat compatibility flag for fetch, WebSocket, crypto, etc.
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -64,14 +63,14 @@ export default {
 
     // ── WebSocket upgrade routes ──────────────────────────────────────
 
-    if (path === '/feishu/ws') {
+    if (path === '/lark/ws') {
       const upgrade = request.headers.get('Upgrade');
       if (upgrade !== 'websocket') {
         return new Response('Expected WebSocket upgrade', { status: 426 });
       }
-      // Single DO instance for all Feishu connections (identified by appId)
-      const id = env.FEISHU_CONNECTION.idFromName(env.FEISHU_APP_ID);
-      const stub = env.FEISHU_CONNECTION.get(id);
+      // Single DO instance for all Lark connections (identified by appId)
+      const id = env.LARK_CONNECTION.idFromName(env.LARK_APP_ID);
+      const stub = env.LARK_CONNECTION.get(id);
       return stub.fetch(request);
     }
 
@@ -93,7 +92,7 @@ export default {
     if (path === '/health') {
       return new Response(JSON.stringify({
         ok: true,
-        appId: env.FEISHU_APP_ID,
+        appId: env.LARK_APP_ID,
         mode: 'worker',
         timestamp: Date.now(),
       }), {

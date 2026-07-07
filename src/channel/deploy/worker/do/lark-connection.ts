@@ -1,12 +1,12 @@
 // ---------------------------------------------------------------------------
-// FeishuConnection Durable Object
+// LarkConnection Durable Object
 //
-// Manages the Feishu WebSocket connection for receiving events (messages,
+// Manages the Lark WebSocket connection for receiving events (messages,
 // bitable changes, card actions). Uses WebSocket Hibernation API to stay
 // at zero cost when idle.
 //
 // Lifecycle:
-//   1. Worker entry receives /feishu/ws upgrade → routes to this DO
+//   1. Worker entry receives /lark/ws upgrade → routes to this DO
 //   2. DO accepts WebSocket, registers event handlers
 //   3. Incoming messages processed via core coordinator/operator
 //   4. When idle, DO hibernates (memory freed, no CPU cost)
@@ -18,18 +18,18 @@ import type { Env } from '../index.js';
 
 // ---- Attachment types stored on hibernated WebSockets ---------------------
 
-interface FeishuWsAttachment {
-  type: 'feishu';
+interface LarkWsAttachment {
+  type: 'lark';
   connectedAt: number;
 }
 
 // ---- Durable Object -------------------------------------------------------
 
-export class FeishuConnection extends DurableObject<Env> {
-  /** Primary Feishu event WebSocket. */
-  private feishuWs: WebSocket | null = null;
+export class LarkConnection extends DurableObject<Env> {
+  /** Primary Lark event WebSocket. */
+  private larkWs: WebSocket | null = null;
   /** Track all active sessions. */
-  private sessions = new Map<WebSocket, FeishuWsAttachment>();
+  private sessions = new Map<WebSocket, LarkWsAttachment>();
 
   // ── Constructor ────────────────────────────────────────────────────────
 
@@ -41,10 +41,10 @@ export class FeishuConnection extends DurableObject<Env> {
     // discarded; on next wake-up we reconstruct session tracking from the
     // attachments stored on each WebSocket handle.
     for (const ws of this.ctx.getWebSockets()) {
-      const attachment = ws.deserializeAttachment() as FeishuWsAttachment | null;
-      if (attachment?.type === 'feishu') {
+      const attachment = ws.deserializeAttachment() as LarkWsAttachment | null;
+      if (attachment?.type === 'lark') {
         this.sessions.set(ws, attachment);
-        this.feishuWs = ws;
+        this.larkWs = ws;
       }
     }
 
@@ -61,13 +61,13 @@ export class FeishuConnection extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname === '/feishu/ws') {
+    if (url.pathname === '/lark/ws') {
       return this.handleWebSocketUpgrade(request);
     }
 
     // Internal API: trigger reconnect from alarm
     if (url.pathname === '/__reconnect') {
-      await this.reconnectFeishu();
+      await this.reconnectLark();
       return new Response('OK', { status: 200 });
     }
 
@@ -76,7 +76,7 @@ export class FeishuConnection extends DurableObject<Env> {
 
   // ── WebSocket lifecycle handlers ───────────────────────────────────────
 
-  /** Accept a new Feishu event WebSocket connection. */
+  /** Accept a new Lark event WebSocket connection. */
   private handleWebSocketUpgrade(request: Request): Response {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -87,13 +87,13 @@ export class FeishuConnection extends DurableObject<Env> {
 
     // Store metadata on the connection so we can restore session state
     // after hibernation without calling into user code.
-    const attachment: FeishuWsAttachment = {
-      type: 'feishu',
+    const attachment: LarkWsAttachment = {
+      type: 'lark',
       connectedAt: Date.now(),
     };
     server.serializeAttachment(attachment);
     this.sessions.set(server, attachment);
-    this.feishuWs = server;
+    this.larkWs = server;
 
     return new Response(null, {
       status: 101,
@@ -113,15 +113,15 @@ export class FeishuConnection extends DurableObject<Env> {
     try {
       data = JSON.parse(text);
     } catch {
-      console.warn('[feishu-connection] invalid JSON message');
+      console.warn('[lark-connection] invalid JSON message');
       return;
     }
 
-    // Feishu event dispatcher wraps events in { event: {...} }
+    // Lark event dispatcher wraps events in { event: {...} }
     const event = (data.event ?? data) as Record<string, unknown>;
     if (!event || typeof event !== 'object') return;
 
-    // Feishu WebSocket events come through as typed messages
+    // Lark WebSocket events come through as typed messages
     const header = event.header as Record<string, unknown> | undefined;
     const eventType = header?.event_type as string | undefined;
 
@@ -147,7 +147,7 @@ export class FeishuConnection extends DurableObject<Env> {
         await this.handleCardAction(event);
         break;
       default:
-        console.debug(`[feishu-connection] unhandled event type: ${eventType}`);
+        console.debug(`[lark-connection] unhandled event type: ${eventType}`);
     }
   }
 
@@ -159,9 +159,9 @@ export class FeishuConnection extends DurableObject<Env> {
     _wasClean: boolean,
   ): Promise<void> {
     this.sessions.delete(ws);
-    if (this.feishuWs === ws) {
-      this.feishuWs = null;
-      console.log(`[feishu-connection] Feishu WS closed (code=${code}), scheduling reconnect`);
+    if (this.larkWs === ws) {
+      this.larkWs = null;
+      console.log(`[lark-connection] Lark WS closed (code=${code}), scheduling reconnect`);
       // Schedule reconnection attempt via alarm
       await this.scheduleReconnect();
     }
@@ -169,7 +169,7 @@ export class FeishuConnection extends DurableObject<Env> {
 
   /** Handle WebSocket errors. */
   async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
-    console.warn('[feishu-connection] WebSocket error');
+    console.warn('[lark-connection] WebSocket error');
     // The runtime will call webSocketClose after this
   }
 
@@ -177,9 +177,9 @@ export class FeishuConnection extends DurableObject<Env> {
 
   /** Durable Object alarm — used for scheduled tasks like reconnection. */
   async alarm(): Promise<void> {
-    if (!this.feishuWs) {
+    if (!this.larkWs) {
       // Attempt reconnect
-      await this.reconnectFeishu();
+      await this.reconnectLark();
     }
   }
 
@@ -189,22 +189,22 @@ export class FeishuConnection extends DurableObject<Env> {
     // TODO: Implement message processing via Operator core
     // In the incremental approach, this will delegate to the core Operator class
     // once the refactoring is complete. For now, log and acknowledge.
-    console.log('[feishu-connection] IM message received (handler pending core refactor)');
+    console.log('[lark-connection] IM message received (handler pending core refactor)');
   }
 
   private async handleBitableEvent(_event: Record<string, unknown>): Promise<void> {
     // TODO: Process bitable record changes — route to Coordinator core
-    console.log('[feishu-connection] Bitable event received (handler pending core refactor)');
+    console.log('[lark-connection] Bitable event received (handler pending core refactor)');
   }
 
   private async handleCardAction(_event: Record<string, unknown>): Promise<void> {
     // TODO: Handle card action callbacks (approve/reject)
-    console.log('[feishu-connection] Card action received (handler pending core refactor)');
+    console.log('[lark-connection] Card action received (handler pending core refactor)');
   }
 
   private async handleExecutorResult(_data: Record<string, unknown>): Promise<void> {
     // TODO: Route executor results through Coordinator core
-    console.log('[feishu-connection] Executor result received (handler pending core refactor)');
+    console.log('[lark-connection] Executor result received (handler pending core refactor)');
   }
 
   // ── Connection management ──────────────────────────────────────────────
@@ -224,19 +224,19 @@ export class FeishuConnection extends DurableObject<Env> {
   }
 
   /**
-   * Attempt to reconnect the Feishu WebSocket.
+   * Attempt to reconnect the Lark WebSocket.
    * In a Worker environment, this establishes a new WebSocket connection
-   * to the Feishu WebSocket server using the stored credentials.
+   * to the Lark WebSocket server using the stored credentials.
    *
    * The actual reconnection is handled by the Worker entry point, which
-   * receives a new WebSocket upgrade from the Feishu platform. This DO
+   * receives a new WebSocket upgrade from the Lark platform. This DO
    * just signals readiness.
    */
-  private async reconnectFeishu(): Promise<void> {
-    // The Feishu WebSocket server initiates connections to our worker.
-    // Reconnection is triggered by the Feishu platform itself when it
+  private async reconnectLark(): Promise<void> {
+    // The Lark WebSocket server initiates connections to our worker.
+    // Reconnection is triggered by the Lark platform itself when it
     // detects the connection dropped. This method resets internal state
     // so we're ready to accept a new connection.
-    console.log('[feishu-connection] ready to accept new Feishu connection');
+    console.log('[lark-connection] ready to accept new Lark connection');
   }
 }

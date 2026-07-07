@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
 // Bitable adapter for Cloudflare Workers
 //
-// Implements the BitableAdapter interface using Feishu Open API fetch()
+// Implements the BitableAdapter interface using Lark Open API fetch()
 // calls instead of @larksuiteoapi/node-sdk (which requires Node.js).
 //
 // Subrequest limit: Workers allow 50 subrequests per fetch() invocation.
@@ -11,9 +11,9 @@
 import type { Env } from '../index.js';
 import type { BitableAdapter, TicketRecord } from '../../core/types.js';
 
-/** Base URL for Feishu Open API. */
+/** Base URL for Lark Open API. */
 function baseUrl(env: Env): string {
-  return `https://${env.OPEN_API_DOMAIN || 'open.feishu.cn'}`;
+  return `https://${env.OPEN_API_DOMAIN || 'open.larksuite.com'}`;
 }
 
 /** Get an app_access_token using internal app credentials. */
@@ -23,8 +23,8 @@ async function getAppToken(env: Env): Promise<string | null> {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        app_id: env.FEISHU_APP_ID,
-        app_secret: env.FEISHU_APP_SECRET,
+        app_id: env.LARK_APP_ID,
+        app_secret: env.LARK_APP_SECRET,
       }),
     });
     const data = await resp.json() as Record<string, unknown>;

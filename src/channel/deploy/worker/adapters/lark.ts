@@ -1,18 +1,18 @@
 // ---------------------------------------------------------------------------
-// Feishu IM adapter for Cloudflare Workers
+// Lark IM adapter for Cloudflare Workers
 //
-// Implements the FeishuAdapter interface using fetch() calls directly,
+// Implements the LarkAdapter interface using fetch() calls directly,
 // without the @larksuiteoapi/node-sdk (Node.js only).
 //
 // Handles: reply, react, removeReaction, fetchMessageText, sendMessage
 // ---------------------------------------------------------------------------
 
 import type { Env } from '../index.js';
-import type { FeishuAdapter } from '../../core/types.js';
+import type { FeishuAdapter } from '../../core/types.js';          // interface has generic name
 
-/** Base URL for Feishu Open API. */
+/** Base URL for Lark Open API. */
 function baseUrl(env: Env): string {
-  return `https://${env.OPEN_API_DOMAIN || 'open.feishu.cn'}`;
+  return `https://${env.OPEN_API_DOMAIN || 'open.larksuite.com'}`;
 }
 
 /** Cache for tenant access tokens (keyed by env reference). */
@@ -31,8 +31,8 @@ async function getTenantToken(env: Env): Promise<string | null> {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        app_id: env.FEISHU_APP_ID,
-        app_secret: env.FEISHU_APP_SECRET,
+        app_id: env.LARK_APP_ID,
+        app_secret: env.LARK_APP_SECRET,
       }),
     });
     const data = await resp.json() as Record<string, unknown>;
@@ -42,7 +42,7 @@ async function getTenantToken(env: Env): Promise<string | null> {
     }
     return token;
   } catch (err) {
-    console.error('[worker-feishu] getTenantToken failed:', err);
+    console.error('[worker-lark] getTenantToken failed:', err);
     return null;
   }
 }
@@ -59,7 +59,7 @@ function textCard(text: string): string {
 
 // ---- Adapter ---------------------------------------------------------------
 
-export class WorkerFeishuAdapter implements FeishuAdapter {
+export class WorkerLarkAdapter implements FeishuAdapter {
   constructor(private env: Env) {}
 
   async getTenantToken(): Promise<string | null> {
@@ -108,7 +108,7 @@ export class WorkerFeishuAdapter implements FeishuAdapter {
         }
       }
 
-      console.error(`[worker-feishu] reply failed: ${JSON.stringify(errData).slice(0, 200)}`);
+      console.error(`[worker-lark] reply failed: ${JSON.stringify(errData).slice(0, 200)}`);
       throw new Error(`Reply failed: code=${code}`);
     }
   }
