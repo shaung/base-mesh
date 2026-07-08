@@ -4,6 +4,7 @@
 // Routes:
 //   /lark/ws       → LarkConnection DO (Lark WebSocket events)
 //   /executor/ws   → ExecutorPool DO (Executor WebSocket connections)
+//   /reload        → POST — reload runtime config from Configs table into DO
 //   /health        → Health check
 // ---------------------------------------------------------------------------
 
@@ -35,7 +36,6 @@ export interface Env {
   A2A_API_TOKEN?: string;
 
   // Coordinator config
-  COORDINATOR_PORT?: string;
   COORDINATOR_GLOBAL_PROMPT?: string;
   COORDINATOR_STREAM_OUTPUT?: string;
   COORDINATOR_STREAM_THINKING?: string;
@@ -44,16 +44,6 @@ export interface Env {
 
   // Executor config
   EXECUTOR_APPROVAL_TIMEOUT_MINUTES?: string;
-
-  // Field mappings (JSON-encoded)
-  FIELDS_TICKET?: string;
-  FIELDS_TURN?: string;
-  FIELDS_ROSTER?: string;
-  FIELDS_ROUND?: string;
-
-  // Status mappings (JSON-encoded)
-  STATUSES?: string;
-  ROUND_STATUSES?: string;
 }
 
 export default {
@@ -84,6 +74,18 @@ export default {
       const shardKey = executorId || `anon_${crypto.randomUUID()}`;
       const id = env.EXECUTOR_POOL.idFromName(shardKey);
       const stub = env.EXECUTOR_POOL.get(id);
+      return stub.fetch(request);
+    }
+
+    // ── Config reload ─────────────────────────────────────────────────
+
+    if (path === '/reload') {
+      if (request.method !== 'POST') {
+        return new Response('Method not allowed', { status: 405 });
+      }
+      // Forward to LarkConnection DO which owns the cached config
+      const id = env.LARK_CONNECTION.idFromName(env.LARK_APP_ID);
+      const stub = env.LARK_CONNECTION.get(id);
       return stub.fetch(request);
     }
 

@@ -210,7 +210,7 @@ export function saveProfile(name: string, data: Record<string, unknown>): void {
     'claudeTimeout', 'maxRetries', 'prompt'];
   for (const k of topKeys) if (k in data) out[k] = data[k];
   // sub-tables
-  for (const k of ['fields', 'statuses', 'round_statuses', 'messages', 'channel', 'executor']) {
+  for (const k of ['messages', 'channel', 'executor']) {
     if (data[k]) out[k] = data[k];
   }
   // operators array
@@ -249,16 +249,12 @@ export function loadConfig(profile = 'default'): Config {
   const path = profilePath(profile);
   const raw = existsSync(path) ? loadTOML(path) : {};
 
-  // 3. Merge field mappings
-  const rawFields = raw.fields as Record<string, any> | undefined;
-  const fields: FieldMapping = {
-    ticket: { ...DEFAULT_FIELDS.ticket, ...rawFields?.ticket },
-    turn: { ...DEFAULT_FIELDS.turn, ...rawFields?.turn },
-    roster: { ...DEFAULT_FIELDS.roster, ...rawFields?.roster },
-    round: { ...DEFAULT_FIELDS.round, ...rawFields?.round },
-  };
-  const statuses: StatusMapping = { ...DEFAULT_STATUSES, ...(raw.statuses as Partial<StatusMapping>) };
-  const roundStatuses: RoundStatusMapping = { ...DEFAULT_ROUND_STATUSES, ...(raw.round_statuses as Partial<RoundStatusMapping>) };
+  // 3. Use hardcoded field/status mappings — these are a schema contract,
+  //    not runtime configuration. They MUST stay in sync with the constants
+  //    in src/channel/deploy/worker/config.ts.
+  const fields: FieldMapping = DEFAULT_FIELDS;
+  const statuses: StatusMapping = DEFAULT_STATUSES;
+  const roundStatuses: RoundStatusMapping = DEFAULT_ROUND_STATUSES;
 
   // 4. Operator sub-config
   const rawOperator = raw.operator as Record<string, any> | undefined;
