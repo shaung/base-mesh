@@ -64,10 +64,9 @@ export default {
       if (upgrade !== 'websocket') {
         return new Response('Expected WebSocket upgrade', { status: 426 });
       }
-      // Shard by executor_id: each executor gets its own DO instance
-      const executorId = url.searchParams.get('executor_id');
-      const shardKey = executorId || `anon_${crypto.randomUUID()}`;
-      const id = env.EXECUTOR_POOL.idFromName(shardKey);
+      // All executors connect through a single DO instance. The executor's
+      // identity is established via auth message after the WebSocket is open.
+      const id = env.EXECUTOR_POOL.idFromName('default-pool');
       const stub = env.EXECUTOR_POOL.get(id);
       return stub.fetch(request);
     }
