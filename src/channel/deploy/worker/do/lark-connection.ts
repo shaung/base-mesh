@@ -97,46 +97,35 @@ export class LarkConnection extends DurableObject<Env> {
 
   // ── Config enrichment ─────────────────────────────────────────────────
 
-  /** Load enriched config and start Lark WS connection.
-   *  This is the DO initialization sequence — both config and WS
-   *  connection must complete before we consider the DO "ready".
-   *  Any fetch() that awaits cfgReadyPromise ensures both are done. */
+  /** Load enriched config and start Lark WS connection. */
   private async initConfig(): Promise<void> {
     try {
-      // 1. Try DO storage cache first (survives hibernation).
       const cached = await this.ctx.storage.get<string>('enriched_cfg');
       if (cached) {
         this.enrichedCfg = JSON.parse(cached) as Config;
         this.coordinator = this.buildCoordinator(this.enrichedCfg);
         console.log('[lark-connection] config loaded from DO cache');
-        // Start WS connection; awaited so the DO doesn't hibernate too early
         await this.connectToLark();
         return;
       }
-
-      // 2. Cold start — load from Configs table if configured.
       if (this.baseCfg.configsTableId) {
         await this.loadAndCacheConfig();
       }
     } catch (err) {
       console.error('[lark-connection] config init error (using base config):', err);
     }
-
-    // Start WS connection (even if config loading failed, try with base config)
     await this.connectToLark();
   }
 
   /** Load config from the Bitable Configs table and cache in DO storage. */
   private async loadAndCacheConfig(): Promise<Config> {
     const bitable = new WorkerBitableAdapter(this.env);
-    // Copy base config so enrich mutates a fresh object, not the original.
     const cfg: Config = JSON.parse(JSON.stringify(this.baseCfg));
     await enrichConfigFromTable(cfg, bitable);
 
     this.enrichedCfg = cfg;
     this.coordinator = this.buildCoordinator(cfg);
 
-    // Cache in DO storage for hibernation survival.
     await this.ctx.storage.put('enriched_cfg', JSON.stringify(cfg));
     return cfg;
   }
@@ -146,23 +135,17 @@ export class LarkConnection extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    // POST /reload — force re-read from Configs table
     if (url.pathname === '/reload') {
       return this.handleReload();
     }
 
-    // Alarm-triggered internal request
     if (url.pathname === '/__reconnect') {
       await this.cfgReadyPromise;
-      await this.reconnectLark();
+      await this.connectToLark();
       return new Response('OK', { status: 200 });
     }
 
-    // Ensure enriched config is ready.
     await this.cfgReadyPromise;
-
-    // Ensure Lark WS connection is active (kick off if constructor's
-    // attempt failed before hibernation).
     this.ensureLarkConnected().catch(() => {});
 
     if (url.pathname === '/lark/ws') {
@@ -182,11 +165,9 @@ export class LarkConnection extends DurableObject<Env> {
         headers: { 'Content-Type': 'application/json' },
       });
     }
-
     try {
       await this.loadAndCacheConfig();
       console.log('[lark-connection] config reloaded from Configs table');
-      // Reconnect Lark WS with new config (await so DO stays alive)
       await this.connectToLark();
       return new Response(JSON.stringify({ ok: true, message: 'config reloaded' }), {
         status: 200,
@@ -203,7 +184,6 @@ export class LarkConnection extends DurableObject<Env> {
 
   // ── WebSocket lifecycle handlers ───────────────────────────────────────
 
-  /** Accept a new Lark event WebSocket connection. */
   private handleWebSocketUpgrade(request: Request): Response {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -225,9 +205,6 @@ export class LarkConnection extends DurableObject<Env> {
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    // Ensure config is loaded before processing any event.
-    // On DO wake from hibernation, this awaits the DO storage cache read,
-    // which is fast (typically <10 ms).
     await this.cfgReadyPromise;
 
     const text = typeof message === 'string' ? message : new TextDecoder().decode(message);
@@ -239,7 +216,6 @@ export class LarkConnection extends DurableObject<Env> {
       return;
     }
 
-    // Lark event dispatcher wraps events in { event: {...} }
     const event = (data.event ?? data) as Record<string, unknown>;
     if (!event || typeof event !== 'object') return;
 
@@ -251,7 +227,7 @@ export class LarkConnection extends DurableObject<Env> {
       if (rawType === 'executor_result') {
         await this.handleExecutorResult(data);
       } else if (rawType === 'pong') {
-        // Pong response — nothing to do
+        // nothing
       }
       return;
     }
@@ -271,12 +247,7 @@ export class LarkConnection extends DurableObject<Env> {
     }
   }
 
-  async webSocketClose(
-    ws: WebSocket,
-    code: number,
-    _reason: string,
-    _wasClean: boolean,
-  ): Promise<void> {
+  async webSocketClose(ws: WebSocket, code: number, _reason: string, _wasClean: boolean): Promise<void> {
     this.sessions.delete(ws);
     if (this.larkWs === ws) {
       this.larkWs = null;
@@ -293,7 +264,7 @@ export class LarkConnection extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     if (!this.larkWs) {
-      await this.reconnectLark();
+      await this.connectToLark();
     }
   }
 
@@ -311,10 +282,7 @@ export class LarkConnection extends DurableObject<Env> {
     const action = actionList[0] as Record<string, unknown> | undefined;
     const recordId = action?.record_id as string | undefined;
 
-    if (!tableId || !recordId) {
-      console.log('[lark-connection] bitable event missing table_id or record_id');
-      return;
-    }
+    if (!tableId || !recordId) return;
 
     console.log(`[lark-connection] bitable event: ${tableId}/${recordId}`);
 
@@ -328,10 +296,7 @@ export class LarkConnection extends DurableObject<Env> {
     const roundId = (action?.value as Record<string, unknown> | undefined)?.round_id as string | undefined;
     const decision = (action?.value as Record<string, unknown> | undefined)?.action as string | undefined;
 
-    if (!roundId || !decision) {
-      console.log('[lark-connection] card action missing round_id or decision');
-      return;
-    }
+    if (!roundId || !decision) return;
 
     console.log(`[lark-connection] card action: ${decision} round=${roundId}`);
     try {
@@ -352,10 +317,7 @@ export class LarkConnection extends DurableObject<Env> {
     const answer = (data.answer as string) || '';
     const rootMsgId = (data.root_msg_id as string) || '';
 
-    if (!ticketId || !answer) {
-      console.log('[lark-connection] executor result missing ticket_id or answer');
-      return;
-    }
+    if (!ticketId || !answer) return;
 
     console.log(`[lark-connection] executor result: ticket=${ticketId} answer=${answer.slice(0, 60)}`);
 
@@ -379,69 +341,79 @@ export class LarkConnection extends DurableObject<Env> {
     await this.ctx.storage.setAlarm(Date.now() + 5000);
   }
 
-  private async reconnectLark(): Promise<void> {
-    await this.connectToLark();
+  /** Ensure the Lark WS connection is active. If not, kick off a reconnect. */
+  private async ensureLarkConnected(): Promise<void> {
+    if (this.larkWs) {
+      try {
+        if ((this.larkWs as any).readyState === 1) return;
+      } catch { /* */ }
+    }
+    const existingAlarm = await this.ctx.storage.getAlarm();
+    if (!existingAlarm) {
+      await this.connectToLark();
+    }
   }
 
   // ── Outgoing WebSocket to Lark event service ──────────────────────────
 
-  /** Connect to Lark's WebSocket event push service as a client.
-   *  This is the Worker equivalent of what @larksuiteoapi/node-sdk's
-   *  WSClient does: obtain a ticket, connect, authenticate, receive events. */
+  /** Connect to Lark's WebSocket event push service.
+   *  Matches the @larksuiteoapi/node-sdk WSClient protocol:
+   *  1. POST {domain}/callback/ws/endpoint with AppID + AppSecret
+   *  2. Connect to the returned WebSocket URL
+   *  3. Respond to server ping with pong */
   private async connectToLark(): Promise<void> {
+    const dc = this.env.OPEN_API_DOMAIN || 'open.feishu.cn';
+    const baseUrl = `https://${dc}`;
+
     try {
-      console.log('[lark-connection] starting Lark WS connection...');
-      const token = await this.getTenantTokenForWs();
-      if (!token) {
-        console.warn('[lark-connection] cannot connect: no tenant token');
-        await this.scheduleReconnect();
-        return;
-      }
+      console.log('[lark-connection] fetching WS endpoint...');
 
-      // Get WebSocket ticket from Lark
-      const dc = this.env.OPEN_API_DOMAIN || 'open.feishu.cn';
-      console.log(`[lark-connection] fetching WS ticket from ${dc}...`);
-      const ticketResp = await fetch(`https://${dc}/open-apis/ws/v1/app_ticket`, {
-        headers: { Authorization: `Bearer ${token}` },
+      // Step 1: Get WebSocket endpoint config (matches SDK's pullConnectConfig)
+      const endpointResp = await fetch(`${baseUrl}/callback/ws/endpoint`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          AppID: this.env.LARK_APP_ID,
+          AppSecret: this.env.LARK_APP_SECRET,
+        }),
       });
-      if (!ticketResp.ok) {
-        const errBody = await ticketResp.text().catch(() => '');
-        console.warn(`[lark-connection] failed to get WS ticket: HTTP ${ticketResp.status} ${errBody.slice(0, 200)}`);
-        await this.scheduleReconnect();
-        return;
-      }
-      const ticketData = await ticketResp.json() as Record<string, unknown>;
-      const ticket = (ticketData.data as Record<string, unknown> | undefined)?.ticket as string | undefined;
-      if (!ticket) {
-        console.warn(`[lark-connection] no ticket in response: ${JSON.stringify(ticketData).slice(0, 200)}`);
+
+      if (!endpointResp.ok) {
+        const errBody = await endpointResp.text().catch(() => '');
+        console.warn(`[lark-connection] failed to get WS endpoint: HTTP ${endpointResp.status} ${errBody.slice(0, 200)}`);
         await this.scheduleReconnect();
         return;
       }
 
-      console.log('[lark-connection] got WS ticket, connecting...');
-      // Connect to Lark WebSocket with the ticket
-      const wsUrl = `wss://${dc}/open-apis/ws/v1/app_ticket?ticket=${ticket}`;
-      console.log(`[lark-connection] WS URL: ${wsUrl.replace(ticket, 'TICKET')}`);
+      const endpointData = await endpointResp.json() as Record<string, unknown>;
+      if ((endpointData as any).code !== 0) {
+        console.warn(`[lark-connection] endpoint error: code=${(endpointData as any).code}`);
+        await this.scheduleReconnect();
+        return;
+      }
+
+      const wsData = (endpointData as any).data as { URL: string } | undefined;
+      const connectUrl = wsData?.URL;
+      if (!connectUrl) {
+        console.warn(`[lark-connection] no URL in response: ${JSON.stringify(endpointData).slice(0, 200)}`);
+        await this.scheduleReconnect();
+        return;
+      }
+
+      console.log('[lark-connection] got WS endpoint, connecting...');
+
+      // Step 2: Connect to the WebSocket URL (matches SDK's connect())
       let larkWs: WebSocket;
       try {
-        larkWs = new WebSocket(wsUrl);
+        larkWs = new WebSocket(connectUrl);
       } catch (err) {
-        console.error('[lark-connection] WebSocket constructor FAILED:', err instanceof Error ? err.message : err);
+        console.error('[lark-connection] WebSocket constructor FAILED:', err);
         await this.scheduleReconnect();
         return;
       }
-      console.log('[lark-connection] WebSocket constructor OK');
 
       larkWs.addEventListener('open', () => {
-        console.log('[lark-connection] connected to Lark WS, authenticating');
-
-        // Authenticate with app credentials
-        larkWs.send(JSON.stringify({
-          type: 'auth',
-          app_id: this.env.LARK_APP_ID,
-          app_secret: this.env.LARK_APP_SECRET,
-        }));
-
+        console.log('[lark-connection] connected to Lark WS');
         this.larkWs = larkWs as any;
       });
 
@@ -452,24 +424,14 @@ export class LarkConnection extends DurableObject<Env> {
         let data: Record<string, unknown>;
         try { data = JSON.parse(text); } catch { return; }
 
-        // Handle ping/pong
+        // Handle ping/pong — server pings, client must pong
         if (data.type === 'ping') {
           larkWs.send(JSON.stringify({ type: 'pong' }));
           return;
         }
+        if (data.type === 'pong') return;
 
-        // Handle auth result
-        if (data.type === 'auth_success') {
-          console.log('[lark-connection] Lark WS authenticated successfully');
-          return;
-        }
-        if (data.type === 'auth_failed') {
-          console.error('[lark-connection] Lark WS auth failed:', text);
-          larkWs.close();
-          return;
-        }
-
-        // Route to event handlers (same dispatch as incoming WS connections)
+        // Route event to handler
         await this.cfgReadyPromise;
         const packet = (data.event ?? data) as Record<string, unknown>;
         if (!packet || typeof packet !== 'object') return;
@@ -489,7 +451,7 @@ export class LarkConnection extends DurableObject<Env> {
       });
 
       larkWs.addEventListener('close', (event: CloseEvent) => {
-        console.log(`[lark-connection] Lark WS closed (code=${event.code}), scheduling reconnect`);
+        console.log(`[lark-connection] Lark WS closed (code=${event.code})`);
         this.larkWs = null;
         this.scheduleReconnect();
       });
@@ -500,45 +462,6 @@ export class LarkConnection extends DurableObject<Env> {
     } catch (err) {
       console.error('[lark-connection] connectToLark failed:', err);
       await this.scheduleReconnect();
-    }
-  }
-
-  /** Ensure the Lark WS connection is active. If not, kick off a reconnect. */
-  private async ensureLarkConnected(): Promise<void> {
-    if (this.larkWs) {
-      // Check if the WebSocket is still open (readyState === 1 = OPEN)
-      try {
-        if ((this.larkWs as any).readyState === 1) return;
-      } catch { /* not available */ }
-    }
-    // Not connected — check if we should start one
-    const existingAlarm = await this.ctx.storage.getAlarm();
-    if (!existingAlarm) {
-      await this.connectToLark();
-    }
-  }
-
-  /** Get a tenant_access_token for the WebSocket connection. */
-  private async getTenantTokenForWs(): Promise<string | null> {
-    const dc = this.env.OPEN_API_DOMAIN || 'open.feishu.cn';
-    try {
-      const resp = await fetch(`https://${dc}/open-apis/auth/v3/tenant_access_token/internal`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          app_id: this.env.LARK_APP_ID,
-          app_secret: this.env.LARK_APP_SECRET,
-        }),
-      });
-      const data = await resp.json() as Record<string, unknown>;
-      if (!resp.ok || !data.tenant_access_token) {
-        console.warn(`[lark-connection] getTenantToken failed: HTTP ${resp.status} code=${data.code}`);
-        return null;
-      }
-      return data.tenant_access_token as string;
-    } catch (err) {
-      console.error('[lark-connection] getTenantTokenForWs failed:', err);
-      return null;
     }
   }
 }
