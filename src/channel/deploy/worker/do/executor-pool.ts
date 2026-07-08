@@ -16,6 +16,7 @@
 
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../index.js';
+import type { ExecutorPoolInterface, ExecutorInfo } from '../../core/types.js';
 
 // ---- Types -----------------------------------------------------------------
 
@@ -408,4 +409,60 @@ export class ExecutorPool extends DurableObject<Env> {
       }
     }
   }
+}
+
+// =============================================================================
+// DOExecutorPool — implements ExecutorPoolInterface by calling the ExecutorPool
+// DO via internal fetch. Used by CoreCoordinator running in LarkConnection DO.
+// =============================================================================
+
+/** Resolve the DO stub for a given executor_id. */
+function executorPoolStub(env: Env, executorId: string): DurableObjectStub {
+  const id = env.EXECUTOR_POOL.idFromName(executorId);
+  return env.EXECUTOR_POOL.get(id);
+}
+
+export class DOExecutorPool implements ExecutorPoolInterface {
+  constructor(private env: Env) {}
+
+  getAvailableExecutors(_domains?: string[]): ExecutorInfo[] {
+    // Non-blocking: returns empty list. In practice, executors are spread
+    // across DO shards, so a full listing requires iterating all shards.
+    // Use the /executors endpoint on individual DO stubs for targeted lookups.
+    return [];
+  }
+
+  dispatchTask(executorId: string, payload: unknown): boolean {
+    const stub = executorPoolStub(this.env, executorId);
+    // Fire-and-forget — the DO will handle the dispatch asynchronously.
+    stub.fetch('http://do/dispatch', {
+      method: 'POST',
+      body: JSON.stringify({ identity: executorId, payload }),
+    }).catch(() => {});
+    return true;
+  }
+
+  dispatchCancel(executorId: string, _roundId: string): boolean {
+    const stub = executorPoolStub(this.env, executorId);
+    stub.fetch('http://do/cancel', {
+      method: 'POST',
+      body: JSON.stringify({ identity: executorId, round_id: _roundId }),
+    }).catch(() => {});
+    return true;
+  }
+
+  broadcast(message: string): number {
+    // Broadcasting across all shards is not supported from a single DO.
+    // Each shard's ExecutorPool DO handles broadcast within its shard.
+    return 0;
+  }
+}
+
+/** No-op executor pool — used when no executors are connected or
+ *  when the executor pool is managed by a separate DO. */
+export class NoopExecutorPool implements ExecutorPoolInterface {
+  getAvailableExecutors(): ExecutorInfo[] { return []; }
+  dispatchTask(): boolean { return false; }
+  dispatchCancel(): boolean { return false; }
+  broadcast(): number { return 0; }
 }

@@ -15,6 +15,12 @@
 
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../index.js';
+import { CoreCoordinator } from '../../core/coordinator.js';
+import { WorkerBitableAdapter } from '../adapters/bitable.js';
+import { WorkerLarkAdapter } from '../adapters/lark.js';
+import { WorkerSessionAdapter } from '../session-adapter.js';
+import { buildWorkerConfig } from '../config.js';
+import { DOExecutorPool } from './executor-pool.js';
 
 // ---- Attachment types stored on hibernated WebSockets ---------------------
 
@@ -30,6 +36,9 @@ export class LarkConnection extends DurableObject<Env> {
   private larkWs: WebSocket | null = null;
   /** Track all active sessions. */
   private sessions = new Map<WebSocket, LarkWsAttachment>();
+
+  /** CoreCoordinator instance for round processing and result handling. */
+  private coordinator: CoreCoordinator;
 
   // ── Constructor ────────────────────────────────────────────────────────
 
@@ -54,6 +63,14 @@ export class LarkConnection extends DurableObject<Env> {
     this.ctx.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair('ping', 'pong'),
     );
+
+    // Initialize CoreCoordinator with Worker adapters
+    const cfg = buildWorkerConfig(env);
+    const bitable = new WorkerBitableAdapter(env);
+    const feishu = new WorkerLarkAdapter(env);
+    const sessionAdapter = new WorkerSessionAdapter(bitable, cfg);
+    const executorPool = new DOExecutorPool(env);
+    this.coordinator = new CoreCoordinator(sessionAdapter, executorPool, feishu, cfg, console);
   }
 
   // ── fetch handler — accepts WebSocket upgrades ─────────────────────────
@@ -185,26 +202,85 @@ export class LarkConnection extends DurableObject<Env> {
 
   // ── Event handlers ─────────────────────────────────────────────────────
 
-  private async handleImMessage(_event: Record<string, unknown>): Promise<void> {
-    // TODO: Implement message processing via Operator core
-    // In the incremental approach, this will delegate to the core Operator class
-    // once the refactoring is complete. For now, log and acknowledge.
-    console.log('[lark-connection] IM message received (handler pending core refactor)');
+  private async handleImMessage(event: Record<string, unknown>): Promise<void> {
+    // IM messages are handled by the Channel operator in Node.js.
+    // In the Worker path, this will eventually route to CoreOperator.
+    // For now, log the event for debugging.
+    const eventType = (event.header as Record<string, unknown> | undefined)?.event_type as string ?? 'im.message.receive_v1';
+    console.log(`[lark-connection] ${eventType} — IM message handling pending operator core`);
   }
 
-  private async handleBitableEvent(_event: Record<string, unknown>): Promise<void> {
-    // TODO: Process bitable record changes — route to Coordinator core
-    console.log('[lark-connection] Bitable event received (handler pending core refactor)');
+  private async handleBitableEvent(event: Record<string, unknown>): Promise<void> {
+    // Parse the bitable event to extract table_id and record_id
+    const tableId = event.table_id as string | undefined;
+    const actionList = Array.isArray(event.action_list) ? event.action_list : [];
+    const action = actionList[0] as Record<string, unknown> | undefined;
+    const recordId = action?.record_id as string | undefined;
+
+    if (!tableId || !recordId) {
+      console.log('[lark-connection] bitable event missing table_id or record_id');
+      return;
+    }
+
+    console.log(`[lark-connection] bitable event: ${tableId}/${recordId}`);
+
+    // Route to CoreCoordinator if it's a Round change
+    const cfg = buildWorkerConfig(this.env);
+    if (cfg.roundsTableId && tableId === cfg.roundsTableId) {
+      await this.coordinator.processRound(recordId);
+    }
   }
 
-  private async handleCardAction(_event: Record<string, unknown>): Promise<void> {
-    // TODO: Handle card action callbacks (approve/reject)
-    console.log('[lark-connection] Card action received (handler pending core refactor)');
+  private async handleCardAction(event: Record<string, unknown>): Promise<void> {
+    // Card actions (approve/reject) need to transition the round.
+    // Inline handling for now — eventually delegates to CoreOperator.
+    const action = (event.action ?? event) as Record<string, unknown> | undefined;
+    const roundId = (action?.value as Record<string, unknown> | undefined)?.round_id as string | undefined;
+    const decision = (action?.value as Record<string, unknown> | undefined)?.action as string | undefined;
+
+    if (!roundId || !decision) {
+      console.log('[lark-connection] card action missing round_id or decision');
+      return;
+    }
+
+    console.log(`[lark-connection] card action: ${decision} round=${roundId}`);
+    try {
+      const cfg = buildWorkerConfig(this.env);
+      if (decision === 'approve') {
+        await this.coordinator['session'].transitionRound(roundId, cfg.roundStatuses.approved);
+      } else if (decision === 'reject') {
+        await this.coordinator['session'].transitionRound(roundId, cfg.roundStatuses.rejected);
+      }
+    } catch (err) {
+      console.error(`[lark-connection] card action failed round=${roundId}:`, err);
+    }
   }
 
-  private async handleExecutorResult(_data: Record<string, unknown>): Promise<void> {
-    // TODO: Route executor results through Coordinator core
-    console.log('[lark-connection] Executor result received (handler pending core refactor)');
+  private async handleExecutorResult(data: Record<string, unknown>): Promise<void> {
+    // Route executor results through CoreCoordinator
+    const ticketId = data.ticket_id as string;
+    const roundId = data.round_id as string | undefined;
+    const answer = (data.answer as string) || '';
+    const rootMsgId = (data.root_msg_id as string) || '';
+
+    if (!ticketId || !answer) {
+      console.log('[lark-connection] executor result missing ticket_id or answer');
+      return;
+    }
+
+    console.log(`[lark-connection] executor result: ticket=${ticketId} answer=${answer.slice(0, 60)}`);
+
+    // Use CoreCoordinator to process the result (write turn, update ticket/round)
+    await this.coordinator.processResult('worker-executor', {
+      ticket_id: ticketId,
+      round_id: roundId,
+      answer,
+      root_msg_id: rootMsgId,
+      parts: data.parts as unknown[] | undefined,
+      reassignTo: data.reassignTo as { roles?: string[]; kind?: string } | undefined,
+      streamed: data.streamed as boolean | undefined,
+      newSummary: data.newSummary as string | undefined,
+    });
   }
 
   // ── Connection management ──────────────────────────────────────────────
