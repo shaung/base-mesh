@@ -111,4 +111,17 @@ export default {
 
     return new Response('Not Found', { status: 404 });
   },
+
+  /** Cron trigger — keeps LarkConnection DO alive and WS connected. */
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      env.LARK_CONNECTION.idFromName(env.LARK_APP_ID).fetch(
+        new Request('http://do/__warmup'),
+      ).then(() => {
+        console.log('[worker] cron: LarkConnection DO warmed up');
+      }).catch((err) => {
+        console.warn('[worker] cron: warmup failed:', err instanceof Error ? err.message : err);
+      }),
+    );
+  },
 };
