@@ -116,8 +116,12 @@ export class LarkConnection extends DurableObject<Env> {
       console.error('[lark-connection] config init error (using base config):', err);
     }
 
-    // Start Lark WebSocket connection after config is ready
-    this.connectToLark();
+    // Start Lark WebSocket connection after config is ready.
+    // This runs async in the background — the first fetch() will also
+    // check and retry if the connection failed.
+    this.connectToLark().catch(err =>
+      console.error('[lark-connection] initial connect failed:', err),
+    );
   }
 
   /** Load config from the Bitable Configs table and cache in DO storage. */
@@ -152,9 +156,12 @@ export class LarkConnection extends DurableObject<Env> {
       return new Response('OK', { status: 200 });
     }
 
-    // Ensure enriched config is ready before processing WebSocket upgrades
-    // or other requests.
+    // Ensure enriched config is ready.
     await this.cfgReadyPromise;
+
+    // Ensure Lark WS connection is active (kick off if constructor's
+    // attempt failed before hibernation).
+    this.ensureLarkConnected().catch(() => {});
 
     if (url.pathname === '/lark/ws') {
       return this.handleWebSocketUpgrade(request);
@@ -476,6 +483,21 @@ export class LarkConnection extends DurableObject<Env> {
     } catch (err) {
       console.error('[lark-connection] connectToLark failed:', err);
       await this.scheduleReconnect();
+    }
+  }
+
+  /** Ensure the Lark WS connection is active. If not, kick off a reconnect. */
+  private async ensureLarkConnected(): Promise<void> {
+    if (this.larkWs) {
+      // Check if the WebSocket is still open (readyState === 1 = OPEN)
+      try {
+        if ((this.larkWs as any).readyState === 1) return;
+      } catch { /* not available */ }
+    }
+    // Not connected — check if we should start one
+    const existingAlarm = await this.ctx.storage.getAlarm();
+    if (!existingAlarm) {
+      await this.connectToLark();
     }
   }
 
