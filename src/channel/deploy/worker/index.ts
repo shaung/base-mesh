@@ -42,9 +42,19 @@ export interface Env {
 }
 
 export default {
-  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
+
+    // Eagerly initialize LarkConnection DO on first request so it starts
+    // connecting to the Lark event WebSocket. The DO's constructor calls
+    // connectToLark() as part of initConfig(), but DOs are lazy — they
+    // only spin up when they receive their first request.
+    ctx.waitUntil(
+      env.LARK_CONNECTION.idFromName(env.LARK_APP_ID).fetch(
+        new Request('http://do/__warmup'),
+      ).catch(() => {/* warmup failure is non-fatal */}),
+    );
 
     // ── WebSocket upgrade routes ──────────────────────────────────────
 

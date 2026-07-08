@@ -139,9 +139,9 @@ export class LarkConnection extends DurableObject<Env> {
       return this.handleReload();
     }
 
-    if (url.pathname === '/__reconnect') {
+    if (url.pathname === '/__warmup' || url.pathname === '/__reconnect') {
       await this.cfgReadyPromise;
-      await this.connectToLark();
+      if (!this.larkWs) await this.connectToLark();
       return new Response('OK', { status: 200 });
     }
 
