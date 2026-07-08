@@ -97,7 +97,10 @@ export class LarkConnection extends DurableObject<Env> {
 
   // ── Config enrichment ─────────────────────────────────────────────────
 
-  /** Load enriched config from DO storage (cache) or Configs table. */
+  /** Load enriched config and start Lark WS connection.
+   *  This is the DO initialization sequence — both config and WS
+   *  connection must complete before we consider the DO "ready".
+   *  Any fetch() that awaits cfgReadyPromise ensures both are done. */
   private async initConfig(): Promise<void> {
     try {
       // 1. Try DO storage cache first (survives hibernation).
@@ -106,9 +109,8 @@ export class LarkConnection extends DurableObject<Env> {
         this.enrichedCfg = JSON.parse(cached) as Config;
         this.coordinator = this.buildCoordinator(this.enrichedCfg);
         console.log('[lark-connection] config loaded from DO cache');
-        this.connectToLark().catch(err =>
-          console.error('[lark-connection] connect failed:', err),
-        );
+        // Start WS connection; awaited so the DO doesn't hibernate too early
+        await this.connectToLark();
         return;
       }
 
@@ -120,9 +122,8 @@ export class LarkConnection extends DurableObject<Env> {
       console.error('[lark-connection] config init error (using base config):', err);
     }
 
-    this.connectToLark().catch(err =>
-      console.error('[lark-connection] connect failed:', err),
-    );
+    // Start WS connection (even if config loading failed, try with base config)
+    await this.connectToLark();
   }
 
   /** Load config from the Bitable Configs table and cache in DO storage. */
@@ -185,10 +186,8 @@ export class LarkConnection extends DurableObject<Env> {
     try {
       await this.loadAndCacheConfig();
       console.log('[lark-connection] config reloaded from Configs table');
-      // Reconnect Lark WS with new config
-      this.connectToLark().catch(err =>
-        console.error('[lark-connection] reconnect after reload failed:', err),
-      );
+      // Reconnect Lark WS with new config (await so DO stays alive)
+      await this.connectToLark();
       return new Response(JSON.stringify({ ok: true, message: 'config reloaded' }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
