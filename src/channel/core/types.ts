@@ -2,8 +2,6 @@
 // Adapter interfaces — abstract away deployment environment (Node.js vs Worker)
 // ---------------------------------------------------------------------------
 
-import type { Part } from '../../lib/types.js';
-
 // ---- Records ---------------------------------------------------------------
 
 export interface TicketRecord {
@@ -36,27 +34,17 @@ export interface BitableAdapter {
     conjunction: string;
     conditions: Array<{ field_name: string; operator: string; value: unknown[] }>;
   }): Promise<TicketRecord[]>;
-
-  /** Batch create records (for Workers — reduces subrequest count). */
   batchCreateRecords?(tableId: string, records: Array<Record<string, unknown>>): Promise<TicketRecord[]>;
 }
 
 // ---- Feishu IM operations -------------------------------------------------
 
 export interface FeishuAdapter {
-  reply(
-    messageId: string,
-    content: string,
-    replyInThread?: boolean,
-    msgType?: 'interactive' | 'text',
-  ): Promise<void>;
-
+  reply(messageId: string, content: string, replyInThread?: boolean, msgType?: 'interactive' | 'text'): Promise<void>;
   react(messageId: string, emojiType: string): Promise<void>;
   removeReaction(messageId: string, emojiType: string): Promise<void>;
   fetchMessageText(messageId: string): Promise<string>;
   sendMessage(chatId: string, content: string): Promise<void>;
-
-  /** Get tenant access token. */
   getTenantToken(): Promise<string | null>;
 }
 
@@ -71,15 +59,80 @@ export interface ExecutorInfo {
 }
 
 export interface ExecutorPoolInterface {
-  registerExecutor(identity: string, domains: string[], ws: any): void;
-  unregisterExecutor(identity: string): void;
   getAvailableExecutors(domains?: string[]): ExecutorInfo[];
   dispatchTask(executorId: string, payload: unknown): boolean;
-  broadcastTask(payload: unknown): number;
   dispatchCancel(executorId: string, roundId: string): boolean;
-
-  /** Send a message to all connected executors. */
   broadcast(message: string): number;
+}
+
+// ---- Session adapter — wraps Session operations used by Coordinator --------
+
+export interface SessionAdapter {
+  getTicket(ticketId: string): Promise<TicketRecord | null>;
+  getTurns(ticketId: string): Promise<TurnRecord[]>;
+  getRound(roundId: string): Promise<RoundRecord | null>;
+  getCurrentRound(ticketId: string): Promise<RoundRecord | null>;
+
+  claimRound(round: RoundRecord, identity: string): Promise<boolean>;
+  releaseRound(roundId: string): Promise<void>;
+  claim(ticket: TicketRecord): Promise<boolean>;
+  release(ticketId: string, newStatus: string): Promise<void>;
+
+  transitionRound(roundId: string, newStatus: string): Promise<boolean>;
+  setRoundResult(roundId: string, answer: string): Promise<void>;
+
+  appendTurn(
+    ticketId: string, role: string, content: string, dedupKey: string,
+    agentIdentity: string, status: string, rootMsgId?: string,
+    roundId?: string, parts?: unknown[], notified?: number, appId?: string,
+  ): Promise<string | undefined>;
+
+  writeResult(ticketId: string, answer: string, newSummary?: string): Promise<void>;
+
+  searchRoundsByStatus(status: string): Promise<RoundRecord[]>;
+  searchStuckRounds(stuckTimeoutMs: number): Promise<RoundRecord[]>;
+  registerRoster(identity: string, fields: Record<string, unknown>): Promise<void>;
+}
+
+// ---- Streaming card management -------------------------------------------
+
+export interface StreamCardState {
+  cardId: string;
+  seq: number;
+  appId?: string;
+}
+
+// ---- Executor result payload (from executor WS message) -------------------
+
+export interface ExecutorResultPayload {
+  ticket_id: string;
+  round_id?: string;
+  answer: string;
+  root_msg_id: string;
+  parts?: unknown[];
+  reassignTo?: { roles?: string[]; kind?: string };
+  streamed?: boolean;
+  newSummary?: string;
+  duration_ms?: number;
+  token_usage?: { input?: number; output?: number };
+}
+
+// ---- Streaming update/end payload ----------------------------------------
+
+export interface StreamUpdatePayload {
+  ticket_id: string;
+  round_id?: string;
+  content: string;
+  content_type: string;
+  root_msg_id: string;
+}
+
+export interface StreamEndPayload {
+  ticket_id: string;
+  round_id?: string;
+  content: string;
+  duration_ms?: number;
+  token_usage?: { input?: number; output?: number };
 }
 
 // ---- Scheduler — abstract timers (setInterval vs DO alarms) ---------------
