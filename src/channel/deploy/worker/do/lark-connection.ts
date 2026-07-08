@@ -115,6 +115,9 @@ export class LarkConnection extends DurableObject<Env> {
     } catch (err) {
       console.error('[lark-connection] config init error (using base config):', err);
     }
+
+    // Start Lark WebSocket connection after config is ready
+    this.connectToLark();
   }
 
   /** Load config from the Bitable Configs table and cache in DO storage. */
@@ -366,6 +369,133 @@ export class LarkConnection extends DurableObject<Env> {
   }
 
   private async reconnectLark(): Promise<void> {
-    console.log('[lark-connection] ready to accept new Lark connection');
+    await this.connectToLark();
+  }
+
+  // ── Outgoing WebSocket to Lark event service ──────────────────────────
+
+  /** Connect to Lark's WebSocket event push service as a client.
+   *  This is the Worker equivalent of what @larksuiteoapi/node-sdk's
+   *  WSClient does: obtain a ticket, connect, authenticate, receive events. */
+  private async connectToLark(): Promise<void> {
+    try {
+      const token = await this.getTenantTokenForWs();
+      if (!token) {
+        console.warn('[lark-connection] cannot connect: no tenant token');
+        await this.scheduleReconnect();
+        return;
+      }
+
+      // Get WebSocket ticket from Lark
+      const dc = this.env.OPEN_API_DOMAIN || 'open.feishu.cn';
+      const ticketResp = await fetch(`https://${dc}/open-apis/ws/v1/app_ticket`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!ticketResp.ok) {
+        console.warn(`[lark-connection] failed to get WS ticket: ${ticketResp.status}`);
+        await this.scheduleReconnect();
+        return;
+      }
+      const ticketData = await ticketResp.json() as Record<string, unknown>;
+      const ticket = (ticketData.data as Record<string, unknown> | undefined)?.ticket as string | undefined;
+      if (!ticket) {
+        console.warn('[lark-connection] no ticket in response');
+        await this.scheduleReconnect();
+        return;
+      }
+
+      // Connect to Lark WebSocket with the ticket
+      const wsUrl = `wss://${dc}/open-apis/ws/v1/app_ticket?ticket=${ticket}`;
+      const larkWs = new WebSocket(wsUrl);
+
+      larkWs.addEventListener('open', () => {
+        console.log('[lark-connection] connected to Lark WS, authenticating');
+
+        // Authenticate with app credentials
+        larkWs.send(JSON.stringify({
+          type: 'auth',
+          app_id: this.env.LARK_APP_ID,
+          app_secret: this.env.LARK_APP_SECRET,
+        }));
+
+        this.larkWs = larkWs as any;
+      });
+
+      larkWs.addEventListener('message', async (event: MessageEvent) => {
+        const text = typeof event.data === 'string' ? event.data : '';
+        if (!text) return;
+
+        let data: Record<string, unknown>;
+        try { data = JSON.parse(text); } catch { return; }
+
+        // Handle ping/pong
+        if (data.type === 'ping') {
+          larkWs.send(JSON.stringify({ type: 'pong' }));
+          return;
+        }
+
+        // Handle auth result
+        if (data.type === 'auth_success') {
+          console.log('[lark-connection] Lark WS authenticated successfully');
+          return;
+        }
+        if (data.type === 'auth_failed') {
+          console.error('[lark-connection] Lark WS auth failed:', text);
+          larkWs.close();
+          return;
+        }
+
+        // Route to event handlers (same dispatch as incoming WS connections)
+        await this.cfgReadyPromise;
+        const packet = (data.event ?? data) as Record<string, unknown>;
+        if (!packet || typeof packet !== 'object') return;
+
+        const header = packet.header as Record<string, unknown> | undefined;
+        const eventType = header?.event_type as string | undefined;
+
+        if (eventType === 'im.message.receive_v1') {
+          await this.handleImMessage(packet);
+        } else if (eventType === 'drive.file.bitable_record_changed_v1') {
+          await this.handleBitableEvent(packet);
+        } else if (eventType === 'card.action.trigger') {
+          await this.handleCardAction(packet);
+        } else {
+          console.debug(`[lark-connection] unhandled event: ${eventType || text.slice(0, 100)}`);
+        }
+      });
+
+      larkWs.addEventListener('close', (event: CloseEvent) => {
+        console.log(`[lark-connection] Lark WS closed (code=${event.code}), scheduling reconnect`);
+        this.larkWs = null;
+        this.scheduleReconnect();
+      });
+
+      larkWs.addEventListener('error', () => {
+        console.warn('[lark-connection] Lark WS error');
+      });
+    } catch (err) {
+      console.error('[lark-connection] connectToLark failed:', err);
+      await this.scheduleReconnect();
+    }
+  }
+
+  /** Get a tenant_access_token for the WebSocket connection. */
+  private async getTenantTokenForWs(): Promise<string | null> {
+    const dc = this.env.OPEN_API_DOMAIN || 'open.feishu.cn';
+    try {
+      const resp = await fetch(`https://${dc}/open-apis/auth/v3/tenant_access_token/internal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          app_id: this.env.LARK_APP_ID,
+          app_secret: this.env.LARK_APP_SECRET,
+        }),
+      });
+      const data = await resp.json() as Record<string, unknown>;
+      return (data.tenant_access_token as string) || null;
+    } catch (err) {
+      console.error('[lark-connection] getTenantTokenForWs failed:', err);
+      return null;
+    }
   }
 }
