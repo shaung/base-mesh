@@ -105,6 +105,10 @@ export class LarkConnection extends DurableObject<Env> {
       if (cached) {
         this.enrichedCfg = JSON.parse(cached) as Config;
         this.coordinator = this.buildCoordinator(this.enrichedCfg);
+        console.log('[lark-connection] config loaded from DO cache');
+        this.connectToLark().catch(err =>
+          console.error('[lark-connection] connect failed:', err),
+        );
         return;
       }
 
@@ -116,11 +120,8 @@ export class LarkConnection extends DurableObject<Env> {
       console.error('[lark-connection] config init error (using base config):', err);
     }
 
-    // Start Lark WebSocket connection after config is ready.
-    // This runs async in the background — the first fetch() will also
-    // check and retry if the connection failed.
     this.connectToLark().catch(err =>
-      console.error('[lark-connection] initial connect failed:', err),
+      console.error('[lark-connection] connect failed:', err),
     );
   }
 
@@ -184,6 +185,10 @@ export class LarkConnection extends DurableObject<Env> {
     try {
       await this.loadAndCacheConfig();
       console.log('[lark-connection] config reloaded from Configs table');
+      // Reconnect Lark WS with new config
+      this.connectToLark().catch(err =>
+        console.error('[lark-connection] reconnect after reload failed:', err),
+      );
       return new Response(JSON.stringify({ ok: true, message: 'config reloaded' }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
@@ -386,6 +391,7 @@ export class LarkConnection extends DurableObject<Env> {
    *  WSClient does: obtain a ticket, connect, authenticate, receive events. */
   private async connectToLark(): Promise<void> {
     try {
+      console.log('[lark-connection] starting Lark WS connection...');
       const token = await this.getTenantTokenForWs();
       if (!token) {
         console.warn('[lark-connection] cannot connect: no tenant token');
@@ -395,25 +401,37 @@ export class LarkConnection extends DurableObject<Env> {
 
       // Get WebSocket ticket from Lark
       const dc = this.env.OPEN_API_DOMAIN || 'open.feishu.cn';
+      console.log(`[lark-connection] fetching WS ticket from ${dc}...`);
       const ticketResp = await fetch(`https://${dc}/open-apis/ws/v1/app_ticket`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!ticketResp.ok) {
-        console.warn(`[lark-connection] failed to get WS ticket: ${ticketResp.status}`);
+        const errBody = await ticketResp.text().catch(() => '');
+        console.warn(`[lark-connection] failed to get WS ticket: HTTP ${ticketResp.status} ${errBody.slice(0, 200)}`);
         await this.scheduleReconnect();
         return;
       }
       const ticketData = await ticketResp.json() as Record<string, unknown>;
       const ticket = (ticketData.data as Record<string, unknown> | undefined)?.ticket as string | undefined;
       if (!ticket) {
-        console.warn('[lark-connection] no ticket in response');
+        console.warn(`[lark-connection] no ticket in response: ${JSON.stringify(ticketData).slice(0, 200)}`);
         await this.scheduleReconnect();
         return;
       }
 
+      console.log('[lark-connection] got WS ticket, connecting...');
       // Connect to Lark WebSocket with the ticket
       const wsUrl = `wss://${dc}/open-apis/ws/v1/app_ticket?ticket=${ticket}`;
-      const larkWs = new WebSocket(wsUrl);
+      console.log(`[lark-connection] WS URL: ${wsUrl.replace(ticket, 'TICKET')}`);
+      let larkWs: WebSocket;
+      try {
+        larkWs = new WebSocket(wsUrl);
+      } catch (err) {
+        console.error('[lark-connection] WebSocket constructor FAILED:', err instanceof Error ? err.message : err);
+        await this.scheduleReconnect();
+        return;
+      }
+      console.log('[lark-connection] WebSocket constructor OK');
 
       larkWs.addEventListener('open', () => {
         console.log('[lark-connection] connected to Lark WS, authenticating');
@@ -514,7 +532,11 @@ export class LarkConnection extends DurableObject<Env> {
         }),
       });
       const data = await resp.json() as Record<string, unknown>;
-      return (data.tenant_access_token as string) || null;
+      if (!resp.ok || !data.tenant_access_token) {
+        console.warn(`[lark-connection] getTenantToken failed: HTTP ${resp.status} code=${data.code}`);
+        return null;
+      }
+      return data.tenant_access_token as string;
     } catch (err) {
       console.error('[lark-connection] getTenantTokenForWs failed:', err);
       return null;
