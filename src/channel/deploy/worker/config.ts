@@ -2,71 +2,22 @@
 // Worker config builder — constructs a Config-compatible object from Env
 // for use with CoreCoordinator and WorkerSessionAdapter.
 //
-// Field and status mappings are HARDCODED — they are a schema contract, not
-// runtime configuration. Only runtime-tunable values (coordinator settings,
-// message templates, etc.) may be overridden via the Bitable Configs table.
+// Field / status mappings import from src/lib/config-defaults.ts (shared
+// with the Node.js config loader).  Runtime-tunable values (table IDs,
+// coordinator settings, message templates, etc.) are loaded from the
+// Bitable Configs table via enrichConfigFromTable().
 // ---------------------------------------------------------------------------
 
+import {
+  DEFAULT_FIELDS,
+  DEFAULT_STATUSES,
+  DEFAULT_ROUND_STATUSES,
+} from '../../../lib/config-defaults.js';
 import type { Env } from './index.js';
 import type { Config } from '../../../lib/types.js';
 import type { BitableAdapter } from '../../core/types.js';
 
-// ---------------------------------------------------------------------------
-// Hardcoded field mappings — standard base-mesh schema.
-// These MUST stay in sync with DEFAULT_FIELDS in src/lib/config.ts.
-// ---------------------------------------------------------------------------
-
-const FIELDS: Config['fields'] = {
-  ticket: {
-    status: 'status', owner: 'owner', ownerLeaseAt: 'owner_lease_at',
-    retryCount: 'retry_count', summary: 'summary', keyfacts: 'keyfacts',
-    rootMsgId: 'root_msg_id', chatId: 'chat_id', senderId: 'sender_id',
-    result: 'result', approvers: 'approvers', lastOwner: 'last_owner',
-    domain: 'domain', lastRoundId: 'last_round_id',
-    metadata: 'metadata', createdAt: 'created_at', updatedAt: 'updated_at',
-  },
-  turn: {
-    ticketRecordId: 'ticket_record_id', roundId: 'round_id',
-    rootMsgId: 'root_msg_id', role: 'role', content: 'content',
-    parts: 'parts', attachments: 'attachments', status: 'turn_status',
-    dedupKey: 'dedup_key', agentIdentity: 'agent_identity',
-    human: 'human', deliveryOwner: 'delivery_owner',
-    deliveryLeaseAt: 'delivery_lease_at',
-    createdAt: 'created_at', notified: 'notified',
-    metadata: 'metadata', updatedAt: 'updated_at', appId: 'app_id',
-  },
-  round: {
-    ticketRecordId: 'ticket_record_id', domains: 'domains',
-    status: 'round_status', executor: 'executor', reviewer: 'reviewer',
-    reviewComment: 'review_comment', supplementPrompt: 'supplement_prompt',
-    result: 'result', artifacts: 'artifacts', input: 'input',
-    createdAt: 'created_at', updatedAt: 'updated_at', appId: 'app_id',
-  },
-  roster: {
-    identity: 'identity', nickname: 'nickname', kind: 'kind',
-    metadata: 'metadata', lastSeenAt: 'last_seen_at',
-    registeredAt: 'registered_at', domains: 'domains',
-    human: 'human', enabled: 'enabled', description: 'description',
-    hitl: 'hitl', hitlPolicy: 'hitl_policy',
-    createdAt: 'created_at', updatedAt: 'updated_at',
-  },
-};
-
-// ---------------------------------------------------------------------------
-// Hardcoded status mappings
-// ---------------------------------------------------------------------------
-
-const STATUSES = { draft: 'draft', active: 'active', closed: 'closed' };
-
-const ROUND_STATUSES = {
-  pending: 'pending', pendingApproval: 'pending_approval',
-  approved: 'approved', rejected: 'rejected',
-  executing: 'executing', done: 'done', failed: 'failed', cancelled: 'cancelled',
-};
-
-// ---------------------------------------------------------------------------
-// Configs table loading (runtime config overrides)
-// ---------------------------------------------------------------------------
+// ---- Configs table loading (runtime config overrides) --------------------
 
 /** Row shape in the Configs Bitable table. */
 interface ConfigTableRow {
@@ -128,14 +79,12 @@ async function loadConfigRows(
  *  Only affects the `channel`, `operator`, `messages`, `coordinator`
  *  sub-objects — field/status mappings are never touched. */
 function mergeConfigRows(cfg: Config, rows: ConfigTableRow[]): void {
-  // Group by section
   const groups: Record<string, Record<string, unknown>> = {};
   for (const r of rows) {
     if (!groups[r.section]) groups[r.section] = {};
     groups[r.section][r.key] = coerce(r.value, r.default, r.type);
   }
 
-  // Apply each section group
   for (const [section, fields] of Object.entries(groups)) {
     const parts = section.split('.').map(snakeToCamel);
     const rootSection = parts[0] as keyof Config;
@@ -154,7 +103,7 @@ function mergeConfigRows(cfg: Config, rows: ConfigTableRow[]): void {
     }
   }
 
-  // Special case: operator.intent → cfg.intent (only when enabled=true)
+  // operator.intent → cfg.intent
   if (groups['operator.intent']) {
     const intent = camelizeKeys(groups['operator.intent']);
     if (intent.enabled === true) {
@@ -165,7 +114,7 @@ function mergeConfigRows(cfg: Config, rows: ConfigTableRow[]): void {
     }
   }
 
-  // Promote known channel keys to Config root
+  // Promote channel keys to Config root (table IDs from Configs table)
   const channelFields = groups['channel'];
   if (channelFields) {
     const camelized = camelizeKeys(channelFields);
@@ -176,8 +125,7 @@ function mergeConfigRows(cfg: Config, rows: ConfigTableRow[]): void {
 }
 
 /** Enrich a Config with runtime values from the Configs Bitable table.
- *  Field/status mappings are never overridden — only runtime knobs
- *  (channel, operator, messages, coordinator) are loaded.
+ *  Field / status mappings are never overridden.
  *  Returns the same `cfg` reference, mutated in place. */
 export async function enrichConfigFromTable(
   cfg: Config,
@@ -193,16 +141,17 @@ export async function enrichConfigFromTable(
   return cfg;
 }
 
-// ---------------------------------------------------------------------------
-// Builder
-// ---------------------------------------------------------------------------
+// ---- Builder -------------------------------------------------------------
 
 /** Build a Config-compatible object from Worker Env.
  *
- *  Field and status mappings are hardcoded — see FIELDS / STATUSES /
- *  ROUND_STATUSES above. Runtime-tunable values (coordinator, operator,
- *  messages, executor) use env var defaults and may be enriched later
- *  via enrichConfigFromTable() from the Bitable Configs table. */
+ *  Field and status mappings come from shared defaults (see
+ *  src/lib/config-defaults.ts).  Runtime-tunable values may be enriched
+ *  later via enrichConfigFromTable() from the Bitable Configs table.
+ *
+ *  Only static env vars that must be available before the first Bitable
+ *  call are required here: LARK_APP_ID, LARK_APP_SECRET, BITABLE_APP_TOKEN,
+ *  and BITABLE_CONFIGS_TABLE_ID (if Configs table is in use). */
 export function buildWorkerConfig(env: Env): Config {
   return {
     identity: 'worker-channel',
@@ -212,18 +161,20 @@ export function buildWorkerConfig(env: Env): Config {
     appToken: env.BITABLE_APP_TOKEN,
     openApiDomain: env.OPEN_API_DOMAIN || 'open.larksuite.com',
 
-    // Table IDs
-    ticketsTableId: env.BITABLE_TICKETS_TABLE_ID,
-    turnsTableId: env.BITABLE_TURNS_TABLE_ID,
-    rosterTableId: env.BITABLE_ROSTER_TABLE_ID,
-    roundsTableId: env.BITABLE_ROUNDS_TABLE_ID || undefined,
-    domainsTableId: env.BITABLE_DOMAINS_TABLE_ID || undefined,
+    // Table IDs — set to empty by default, loaded from Configs table at
+    // runtime via enrichConfigFromTable(). The BITABLE_CONFIGS_TABLE_ID is
+    // required to bootstrap the loading process.
+    ticketsTableId: '',
+    turnsTableId: '',
+    rosterTableId: '',
+    roundsTableId: undefined,
+    domainsTableId: undefined,
     configsTableId: env.BITABLE_CONFIGS_TABLE_ID || undefined,
 
-    // Hardcoded field and status mappings
-    fields: FIELDS,
-    statuses: STATUSES,
-    roundStatuses: ROUND_STATUSES,
+    // Shared defaults (no hardcoding)
+    fields: DEFAULT_FIELDS,
+    statuses: DEFAULT_STATUSES,
+    roundStatuses: DEFAULT_ROUND_STATUSES,
     leaseDuration: 60,
 
     // Coordinator config from env

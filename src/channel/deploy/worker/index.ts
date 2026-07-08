@@ -18,15 +18,10 @@ export interface Env {
   LARK_CONNECTION: DurableObjectNamespace<LarkConnection>;
   EXECUTOR_POOL: DurableObjectNamespace<ExecutorPool>;
 
-  // Secrets
+  // Static secrets (table IDs loaded from Configs table at runtime)
   LARK_APP_ID: string;
   LARK_APP_SECRET: string;
   BITABLE_APP_TOKEN: string;
-  BITABLE_TICKETS_TABLE_ID: string;
-  BITABLE_TURNS_TABLE_ID: string;
-  BITABLE_ROSTER_TABLE_ID: string;
-  BITABLE_ROUNDS_TABLE_ID?: string;
-  BITABLE_DOMAINS_TABLE_ID?: string;
   BITABLE_CONFIGS_TABLE_ID?: string;
 
   // Open API domain (default: open.larksuite.com)

@@ -20,23 +20,19 @@ class_name = "ExecutorPool"
 tag = "v1"
 new_classes = ["LarkConnection", "ExecutorPool"]
 
-# ── Environment variables ───────────────────────────────────────────────────
+# ── Static environment variables ────────────────────────────────────────────
+# Table IDs (tickets, turns, roster, rounds, domains) are loaded at runtime
+# from the Configs Bitable table (BITABLE_CONFIGS_TABLE_ID).
 
 [vars]
 LARK_APP_ID = ""
 BITABLE_APP_TOKEN = ""
-BITABLE_TICKETS_TABLE_ID = ""
-BITABLE_TURNS_TABLE_ID = ""
-BITABLE_ROSTER_TABLE_ID = ""
-BITABLE_ROUNDS_TABLE_ID = ""
-BITABLE_DOMAINS_TABLE_ID = ""
 BITABLE_CONFIGS_TABLE_ID = ""
 OPEN_API_DOMAIN = "open.larksuite.com"
-A2A_API_TOKEN = ""
 
 # ── Secrets (set via `wrangler secret put <name>`) ──────────────────────────
 #   LARK_APP_SECRET
-#   BITABLE_APP_TOKEN (if overriding vars)
+#   BITABLE_APP_TOKEN   (if not in vars)
 
 # ── Dev server ──────────────────────────────────────────────────────────────
 

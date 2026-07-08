@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import { parse as parseToml, stringify as stringifyToml } from 'smol-toml';
 import { Config, FieldMapping, StatusMapping, RoundStatusMapping, ChannelConfig, OperatorConfig, CoordinatorConfig, ExecutorConfig, MessagesConfig, DomainConfig, BackendConfig } from '../lib/types.js';
+import { DEFAULT_FIELDS, DEFAULT_STATUSES, DEFAULT_ROUND_STATUSES } from '../lib/config-defaults.js';
 
 // ---------------------------------------------------------------------------
 // Profile path
@@ -62,100 +63,6 @@ function randomNickname(): string {
   ];
   return `${prefixes[Math.floor(Math.random() * prefixes.length)]}-${suffixes[Math.floor(Math.random() * suffixes.length)]}-${Math.floor(Math.random() * 90) + 10}`;
 }
-
-// ---------------------------------------------------------------------------
-// Sensible defaults for field / status mappings
-// ---------------------------------------------------------------------------
-
-const DEFAULT_ROUND_STATUSES: RoundStatusMapping = {
-  pending: 'pending',
-  pendingApproval: 'pending_approval',
-  approved: 'approved',
-  rejected: 'rejected',
-  executing: 'executing',
-  done: 'done',
-  failed: 'failed',
-  cancelled: 'cancelled',
-};
-
-const DEFAULT_FIELDS: FieldMapping = {
-  ticket: {
-    status: 'status',
-    owner: 'owner',
-    ownerLeaseAt: 'owner_lease_at',
-    retryCount: 'retry_count',
-    summary: 'summary',
-    keyfacts: 'keyfacts',
-    rootMsgId: 'root_msg_id',
-    chatId: 'chat_id',
-    senderId: 'sender_id',
-    result: 'result',
-    approvers: 'approvers',
-    lastOwner: 'last_owner',
-    domain: 'domain',
-    lastRoundId: 'last_round_id',
-    metadata: 'metadata',
-    createdAt: 'created_at',
-    updatedAt: 'updated_at',
-  },
-  turn: {
-    ticketRecordId: 'ticket_record_id',
-    roundId: 'round_id',
-    rootMsgId: 'root_msg_id',
-    role: 'role',
-    content: 'content',
-    parts: 'parts',
-    attachments: 'attachments',
-    status: 'turn_status',
-    dedupKey: 'dedup_key',
-    agentIdentity: 'agent_identity',
-    human: 'human',
-    deliveryOwner: 'delivery_owner',
-    deliveryLeaseAt: 'delivery_lease_at',
-    createdAt: 'created_at',
-    notified: 'notified',
-    metadata: 'metadata',
-    updatedAt: 'updated_at',
-    appId: 'app_id',
-  },
-  round: {
-    ticketRecordId: 'ticket_record_id',
-    domains: 'domains',
-    status: 'round_status',
-    executor: 'executor',
-    reviewer: 'reviewer',
-    reviewComment: 'review_comment',
-    supplementPrompt: 'supplement_prompt',
-    result: 'result',
-    artifacts: 'artifacts',
-    input: 'input',
-    createdAt: 'created_at',
-    updatedAt: 'updated_at',
-    appId: 'app_id',
-  },
-  roster: {
-    identity: 'identity',
-    nickname: 'nickname',
-    kind: 'kind',
-    metadata: 'metadata',
-    lastSeenAt: 'last_seen_at',
-    registeredAt: 'registered_at',
-    domains: 'domains',
-    human: 'human',
-    enabled: 'enabled',
-    description: 'description',
-    hitl: 'hitl',
-    hitlPolicy: 'hitl_policy',
-    createdAt: 'created_at',
-    updatedAt: 'updated_at',
-  },
-};
-
-const DEFAULT_STATUSES: StatusMapping = {
-  draft: 'draft',
-  active: 'active',
-  closed: 'closed',
-};
 
 const DEFAULT_MESSAGES: MessagesConfig = {
   taskDone: '✅ Done processing',
