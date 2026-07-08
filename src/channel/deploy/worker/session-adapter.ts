@@ -3,11 +3,11 @@
 // and a Config-compatible object, without @larksuiteoapi/node-sdk.
 // ---------------------------------------------------------------------------
 
-import { ROUND_TRANSITIONS } from '../../lib/types.js';
-import type { Config, BitableRecord } from '../../lib/types.js';
+import { ROUND_TRANSITIONS } from '../../../lib/types.js';
+import type { Config, BitableRecord } from '../../../lib/types.js';
 import type {
   SessionAdapter, TicketRecord, TurnRecord, RoundRecord, RosterRecord,
-} from '../../core/types.js';
+} from '../../../core/types.js';
 import type { WorkerBitableAdapter } from './adapters/bitable.js';
 
 // Helper: config field accessors to match Session's pattern

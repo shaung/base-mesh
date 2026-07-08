@@ -4,7 +4,7 @@
 // ---------------------------------------------------------------------------
 
 import type { Env } from './index.js';
-import type { Config } from '../../lib/types.js';
+import type { Config } from '../../../lib/types.js';
 
 /** Parse a JSON-encoded env var with fallback. */
 function parseJSON<T>(raw: string | undefined, fallback: T): T {

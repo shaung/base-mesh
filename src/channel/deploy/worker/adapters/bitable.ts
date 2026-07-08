@@ -9,7 +9,7 @@
 // ---------------------------------------------------------------------------
 
 import type { Env } from '../index.js';
-import type { BitableAdapter, TicketRecord } from '../../core/types.js';
+import type { BitableAdapter, TicketRecord } from '../../../core/types.js';
 
 /** Base URL for Lark Open API. */
 function baseUrl(env: Env): string {

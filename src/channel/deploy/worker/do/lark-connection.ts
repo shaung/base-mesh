@@ -15,7 +15,7 @@
 
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../index.js';
-import { CoreCoordinator } from '../../core/coordinator.js';
+import { CoreCoordinator } from '../../../core/coordinator.js';
 import { WorkerBitableAdapter } from '../adapters/bitable.js';
 import { WorkerLarkAdapter } from '../adapters/lark.js';
 import { WorkerSessionAdapter } from '../session-adapter.js';

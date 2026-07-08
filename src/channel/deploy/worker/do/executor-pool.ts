@@ -16,7 +16,7 @@
 
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../index.js';
-import type { ExecutorPoolInterface, ExecutorInfo } from '../../core/types.js';
+import type { ExecutorPoolInterface, ExecutorInfo } from '../../../core/types.js';
 
 // ---- Types -----------------------------------------------------------------
 

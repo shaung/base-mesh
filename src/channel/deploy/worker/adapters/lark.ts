@@ -8,7 +8,7 @@
 // ---------------------------------------------------------------------------
 
 import type { Env } from '../index.js';
-import type { FeishuAdapter } from '../../core/types.js';          // interface has generic name
+import type { FeishuAdapter } from '../../../core/types.js';          // interface has generic name
 
 /** Base URL for Lark Open API. */
 function baseUrl(env: Env): string {
