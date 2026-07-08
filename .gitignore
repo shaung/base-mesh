@@ -9,3 +9,4 @@ scripts/
 coverage/
 # Cloudflare Workers local development
 .dev.vars
+.wrangler/
