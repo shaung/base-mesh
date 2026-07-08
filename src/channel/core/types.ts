@@ -91,6 +91,16 @@ export interface SessionAdapter {
 
   searchRoundsByStatus(status: string): Promise<RoundRecord[]>;
   searchStuckRounds(stuckTimeoutMs: number): Promise<RoundRecord[]>;
+
+  /** Search roster table with arbitrary filter conditions. */
+  searchRoster(filter: {
+    conjunction: string;
+    conditions: Array<{ field_name: string; operator: string; value: unknown[] }>;
+  }): Promise<RosterRecord[]>;
+
+  /** Get a roster record by identity. */
+  getRosterByIdentity(identity: string): Promise<Record<string, unknown> | null>;
+
   registerRoster(identity: string, fields: Record<string, unknown>): Promise<void>;
 }
 

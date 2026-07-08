@@ -4,7 +4,19 @@
 // ---------------------------------------------------------------------------
 
 import type { Session } from '../../../lib/bitable/protocol.js';
-import type { SessionAdapter, TicketRecord, TurnRecord, RoundRecord } from '../../core/types.js';
+import type {
+  SessionAdapter, TicketRecord, TurnRecord, RoundRecord, RosterRecord,
+} from '../../core/types.js';
+
+// Helper to access private Session fields for bitable/config access.
+// This is necessary because Session doesn't expose its BitableClient publicly.
+function getSessionBitable(session: Session): any {
+  return (session as any).bitable;
+}
+
+function getSessionCfg(session: Session): any {
+  return (session as any).cfg;
+}
 
 export class NodeSessionAdapter implements SessionAdapter {
   constructor(private session: Session) {}
@@ -26,7 +38,6 @@ export class NodeSessionAdapter implements SessionAdapter {
   }
 
   async claimRound(round: RoundRecord, identity: string): Promise<boolean> {
-    // RoundRecord and BitableRecord are structurally identical
     return this.session.claimRound(round as any, identity);
   }
 
@@ -75,12 +86,22 @@ export class NodeSessionAdapter implements SessionAdapter {
     return this.session.searchStuckRounds(stuckTimeoutMs) as Promise<RoundRecord[]>;
   }
 
+  async searchRoster(filter: {
+    conjunction: string;
+    conditions: Array<{ field_name: string; operator: string; value: unknown[] }>;
+  }): Promise<RosterRecord[]> {
+    const bitable = getSessionBitable(this.session);
+    const cfg = getSessionCfg(this.session);
+    return bitable.searchRecords(cfg.rosterTableId, filter) as Promise<RosterRecord[]>;
+  }
+
+  async getRosterByIdentity(identity: string): Promise<Record<string, unknown> | null> {
+    return this.session.getRosterByIdentity(identity);
+  }
+
   async registerRoster(identity: string, fields: Record<string, unknown>): Promise<void> {
-    // Delegate to Session.register or custom Bitable ops
-    // Session.register() is identity-based and self-registers, so for
-    // arbitrary roster writes we use the bitable client directly.
     const { BitableClient } = await import('../../../lib/bitable/client.js');
-    const bitable = new BitableClient(this.session['cfg']);
-    await bitable.createRecord(this.session['cfg'].rosterTableId, fields);
+    const bitable = new BitableClient(getSessionCfg(this.session));
+    await bitable.createRecord(getSessionCfg(this.session).rosterTableId, fields);
   }
 }

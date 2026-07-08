@@ -218,14 +218,32 @@ export class CoreCoordinator {
   /** Check if HITL approval is needed based on executor Roster configurations. */
   private async checkHitlRequired(domains: string[]): Promise<boolean> {
     try {
-      const agents = await this.session.searchRoundsByStatus(this.cfg.rosterTableId);
-      // HITL check reads from Roster table via session adapter
-      // In practice this queries the roster table with kind=agent filter.
-      // The session adapter's searchRoundsByStatus is repurposed here.
-      return false;
-    } catch {
-      return false;
+      const agents = await this.session.searchRoster({
+        conjunction: 'and',
+        conditions: [
+          { field_name: this.cfg.fields.roster.kind, operator: 'is', value: ['agent'] },
+          { field_name: this.cfg.fields.roster.enabled, operator: 'is', value: [true] },
+        ],
+      });
+
+      const { PrefixMatcher } = await import('../../lib/messaging/matcher.js');
+      const matcher = new PrefixMatcher();
+
+      for (const agent of agents) {
+        const agentDomains: string[] = Array.isArray(agent.fields[this.cfg.fields.roster.domains])
+          ? agent.fields[this.cfg.fields.roster.domains] as string[] : [];
+        if (domains.length > 0 && !matcher.matches(domains, agentDomains)) continue;
+
+        const hitl = String(agent.fields[this.cfg.fields.roster.hitl] ?? 'off');
+        const hitlPolicy = String(agent.fields[this.cfg.fields.roster.hitlPolicy] ?? 'default');
+        if (hitl === 'always' || (hitl === 'auto' && hitlPolicy === 'always')) {
+          return true;
+        }
+      }
+    } catch (err) {
+      this.log.error('[core-coordinator] checkHitlRequired error:', err);
     }
+    return false;
   }
 
   /** Assign a Round to an executor via ExecutorPoolInterface. */
