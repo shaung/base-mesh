@@ -256,4 +256,13 @@ export class WorkerSessionAdapter implements SessionAdapter {
     };
     await this.bitable.createRecord(this.cfg.rosterTableId, recordFields);
   }
+
+  async searchTicketsBySender(senderId: string): Promise<TicketRecord[]> {
+    return this.bitable.searchRecords(this.cfg.ticketsTableId, {
+      conjunction: 'and',
+      conditions: [
+        { field_name: tf(this.cfg).senderId, operator: 'is', value: [senderId] },
+      ],
+    });
+  }
 }

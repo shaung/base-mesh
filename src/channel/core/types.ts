@@ -102,6 +102,9 @@ export interface SessionAdapter {
   getRosterByIdentity(identity: string): Promise<Record<string, unknown> | null>;
 
   registerRoster(identity: string, fields: Record<string, unknown>): Promise<void>;
+
+  /** Search tickets by sender ID (for /cancel command). */
+  searchTicketsBySender(senderId: string): Promise<TicketRecord[]>;
 }
 
 // ---- Streaming card management -------------------------------------------
@@ -167,4 +170,62 @@ export interface ChannelEnv {
   mode: 'node' | 'worker';
   workerUrl?: string;
   appId: string;
+}
+
+// ---- Message event types (for CoreOperator) -------------------------------
+
+/** A mention in a Lark message. */
+export interface MessageMention {
+  mentioned_type: string;
+  id: { open_id: string; union_id?: string };
+  name?: string;
+}
+
+/** Parsed message event received from Lark IM. */
+export interface IncomingMessage {
+  message_id: string;
+  message_type: 'text' | 'post' | 'interactive';
+  content: string;
+  chat_type: 'p2p' | 'group';
+  chat_id: string;
+  root_id?: string;
+  parent_id?: string;
+  mentions?: MessageMention[];
+}
+
+/** Sender info from a Lark event. */
+export interface MessageSender {
+  sender_type: 'user' | 'bot';
+  sender_id: { open_id: string; union_id?: string };
+}
+
+/** Parsed incoming message event, ready for CoreOperator processing. */
+export interface ParsedMessageEvent {
+  content: string;
+  parts: unknown[];
+  message: IncomingMessage;
+  sender: MessageSender;
+  appId?: string;
+  botMentioned: boolean;
+  domain?: string;
+}
+
+/** Result of intent recognition. */
+export interface IntentResult {
+  domains: string[];
+  isComplete: boolean;
+  summary: string;
+  missingFields: string[];
+}
+
+/** Card action callback data. */
+export interface CardActionData {
+  round_id: string;
+  action: 'approve' | 'reject';
+}
+
+/** Domain descriptor from Domains table. */
+export interface DomainDescriptor {
+  domain: string;
+  description: string;
 }

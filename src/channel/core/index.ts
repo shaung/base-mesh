@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 export { CoreCoordinator } from './coordinator.js';
+export { CoreOperator } from './operator.js';
 
 export type {
   BitableAdapter,
@@ -21,4 +22,11 @@ export type {
   TurnRecord,
   RoundRecord,
   RosterRecord,
+  IncomingMessage,
+  MessageSender,
+  MessageMention,
+  ParsedMessageEvent,
+  IntentResult,
+  CardActionData,
+  DomainDescriptor,
 } from './types.js';

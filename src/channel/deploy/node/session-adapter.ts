@@ -104,4 +104,8 @@ export class NodeSessionAdapter implements SessionAdapter {
     const bitable = new BitableClient(getSessionCfg(this.session));
     await bitable.createRecord(getSessionCfg(this.session).rosterTableId, fields);
   }
+
+  async searchTicketsBySender(senderId: string): Promise<TicketRecord[]> {
+    return this.session.searchTicketsBySender(senderId) as Promise<TicketRecord[]>;
+  }
 }
