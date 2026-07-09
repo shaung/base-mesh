@@ -31,7 +31,7 @@ import type { Config } from '../../../lib/types.js';
 // ---- Attachment types stored on hibernated WebSockets ---------------------
 
 interface LarkWsAttachment {
-  type: 'lark';
+  type: 'lark-inbound' | 'lark-outbound';
   connectedAt: number;
 }
 
@@ -59,12 +59,16 @@ export class LarkConnection extends DurableObject<Env> {
     super(ctx, env);
 
     // Restore sessions from any previously hibernated (but still open)
-    // WebSocket connections.
+    // WebSocket connections. The outgoing Lark WS (type 'lark-outbound')
+    // is restored as `this.larkWs` so the DO reuses it on wake-up
+    // instead of re-connecting.
     for (const ws of this.ctx.getWebSockets()) {
       const attachment = ws.deserializeAttachment() as LarkWsAttachment | null;
-      if (attachment?.type === 'lark') {
-        this.sessions.set(ws, attachment);
+      if (attachment?.type === 'lark-outbound') {
         this.larkWs = ws;
+        this.sessions.set(ws, attachment);
+      } else if (attachment?.type === 'lark-inbound') {
+        this.sessions.set(ws, attachment);
       }
     }
 
@@ -97,7 +101,8 @@ export class LarkConnection extends DurableObject<Env> {
 
   // ── Config enrichment ─────────────────────────────────────────────────
 
-  /** Load enriched config and start Lark WS connection. */
+  /** Load enriched config into the DO. Connection is initiated in fetch(),
+   *  not here — constructor runs on every wake-up and would re-connect. */
   private async initConfig(): Promise<void> {
     try {
       const cached = await this.ctx.storage.get<string>('enriched_cfg');
@@ -105,7 +110,6 @@ export class LarkConnection extends DurableObject<Env> {
         this.enrichedCfg = JSON.parse(cached) as Config;
         this.coordinator = this.buildCoordinator(this.enrichedCfg);
         console.log('[lark-connection] config loaded from DO cache');
-        await this.connectToLark();
         return;
       }
       if (this.baseCfg.configsTableId) {
@@ -114,7 +118,6 @@ export class LarkConnection extends DurableObject<Env> {
     } catch (err) {
       console.error('[lark-connection] config init error (using base config):', err);
     }
-    await this.connectToLark();
   }
 
   /** Load config from the Bitable Configs table and cache in DO storage. */
@@ -191,12 +194,11 @@ export class LarkConnection extends DurableObject<Env> {
     this.ctx.acceptWebSocket(server);
 
     const attachment: LarkWsAttachment = {
-      type: 'lark',
+      type: 'lark-inbound',
       connectedAt: Date.now(),
     };
     server.serializeAttachment(attachment);
     this.sessions.set(server, attachment);
-    this.larkWs = server;
 
     return new Response(null, {
       status: 101,
@@ -205,8 +207,6 @@ export class LarkConnection extends DurableObject<Env> {
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    await this.cfgReadyPromise;
-
     const text = typeof message === 'string' ? message : new TextDecoder().decode(message);
     let data: Record<string, unknown>;
     try {
@@ -215,6 +215,17 @@ export class LarkConnection extends DurableObject<Env> {
       console.warn('[lark-connection] invalid JSON message');
       return;
     }
+
+    // Handle Lark application-level ping/pong. The Lark WS protocol sends
+    // {"type":"ping"} JSON messages — these are distinct from the WebSocket
+    // frame-level ping/pong handled by setWebSocketAutoResponse.
+    if (data.type === 'ping') {
+      ws.send(JSON.stringify({ type: 'pong' }));
+      return;
+    }
+    if (data.type === 'pong') return;
+
+    await this.cfgReadyPromise;
 
     const event = (data.event ?? data) as Record<string, unknown>;
     if (!event || typeof event !== 'object') return;
@@ -226,8 +237,6 @@ export class LarkConnection extends DurableObject<Env> {
       const rawType = data.type as string | undefined;
       if (rawType === 'executor_result') {
         await this.handleExecutorResult(data);
-      } else if (rawType === 'pong') {
-        // nothing
       }
       return;
     }
@@ -345,7 +354,9 @@ export class LarkConnection extends DurableObject<Env> {
   private async ensureLarkConnected(): Promise<void> {
     if (this.larkWs) {
       try {
-        if ((this.larkWs as any).readyState === 1) return;
+        const state = (this.larkWs as any).readyState;
+        // 1 = OPEN, 0 = CONNECTING — already in progress, skip
+        if (state === 1 || state === 0) return;
       } catch { /* */ }
     }
     const existingAlarm = await this.ctx.storage.getAlarm();
@@ -360,12 +371,21 @@ export class LarkConnection extends DurableObject<Env> {
    *  Matches the @larksuiteoapi/node-sdk WSClient protocol:
    *  1. POST {domain}/callback/ws/endpoint with AppID + AppSecret
    *  2. Connect to the returned WebSocket URL
-   *  3. Respond to server ping with pong */
+   *  3. Register with Hibernation API so the connection survives DO
+   *     hibernation — on wake-up the constructor restores it from
+   *     getWebSockets() instead of re-connecting.
+   *  4. Respond to server ping with pong (via webSocketMessage) */
   private async connectToLark(): Promise<void> {
     const dc = this.env.OPEN_API_DOMAIN || 'open.feishu.cn';
     const baseUrl = `https://${dc}`;
 
     try {
+      // Step 0: Close any existing Lark WS before opening a new one
+      if (this.larkWs) {
+        try { this.larkWs.close(1000, 'reconnecting'); } catch { /* may already be closed */ }
+        this.larkWs = null;
+      }
+
       console.log('[lark-connection] fetching WS endpoint...');
 
       // Step 1: Get WebSocket endpoint config (matches SDK's pullConnectConfig)
@@ -412,50 +432,20 @@ export class LarkConnection extends DurableObject<Env> {
         return;
       }
 
+      // Step 3: Register with Hibernation API. After this call the runtime
+      // remembers the WS across hibernations, and incoming messages are
+      // delivered to webSocketMessage() / webSocketClose() instead of
+      // inline event listeners.
+      larkWs.serializeAttachment({ type: 'lark-outbound', connectedAt: Date.now() });
+      this.ctx.acceptWebSocket(larkWs);
+      this.larkWs = larkWs;
+
+      // Open / error listeners for logging only. Message and close events
+      // are handled by the DO lifecycle methods (webSocketMessage,
+      // webSocketClose) via the Hibernation API.
       larkWs.addEventListener('open', () => {
         console.log('[lark-connection] connected to Lark WS');
-        this.larkWs = larkWs as any;
       });
-
-      larkWs.addEventListener('message', async (event: MessageEvent) => {
-        const text = typeof event.data === 'string' ? event.data : '';
-        if (!text) return;
-
-        let data: Record<string, unknown>;
-        try { data = JSON.parse(text); } catch { return; }
-
-        // Handle ping/pong — server pings, client must pong
-        if (data.type === 'ping') {
-          larkWs.send(JSON.stringify({ type: 'pong' }));
-          return;
-        }
-        if (data.type === 'pong') return;
-
-        // Route event to handler
-        await this.cfgReadyPromise;
-        const packet = (data.event ?? data) as Record<string, unknown>;
-        if (!packet || typeof packet !== 'object') return;
-
-        const header = packet.header as Record<string, unknown> | undefined;
-        const eventType = header?.event_type as string | undefined;
-
-        if (eventType === 'im.message.receive_v1') {
-          await this.handleImMessage(packet);
-        } else if (eventType === 'drive.file.bitable_record_changed_v1') {
-          await this.handleBitableEvent(packet);
-        } else if (eventType === 'card.action.trigger') {
-          await this.handleCardAction(packet);
-        } else {
-          console.debug(`[lark-connection] unhandled event: ${eventType || text.slice(0, 100)}`);
-        }
-      });
-
-      larkWs.addEventListener('close', (event: CloseEvent) => {
-        console.log(`[lark-connection] Lark WS closed (code=${event.code})`);
-        this.larkWs = null;
-        this.scheduleReconnect();
-      });
-
       larkWs.addEventListener('error', () => {
         console.warn('[lark-connection] Lark WS error');
       });

@@ -34,11 +34,6 @@ OPEN_API_DOMAIN = "open.larksuite.com"
 #   LARK_APP_SECRET
 #   BITABLE_APP_TOKEN   (if not in vars)
 
-# ── Cron trigger — keeps LarkConnection DO alive and auto-reconnects ────────
-# Runs every 2 minutes to ensure the Lark event WebSocket stays connected.
-[triggers]
-crons = ["*/2 * * * *"]
-
 # ── Dev server ──────────────────────────────────────────────────────────────
 
 [dev]
