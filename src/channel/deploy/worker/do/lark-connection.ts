@@ -261,8 +261,11 @@ export class LarkConnection extends DurableObject<Env> {
       case 'card.action.trigger':
         await this.handleCardAction(event);
         break;
+      case 'im.message.reaction.created_v1':
+      case 'im.message.reaction.deleted_v1':
+        break; // no-op
       default:
-        console.debug(`[lark-connection] unhandled event type: ${eventType}`);
+        if (eventType) console.debug(`[lark-connection] unhandled event type: ${eventType}`);
     }
   }
 
@@ -463,8 +466,11 @@ export class LarkConnection extends DurableObject<Env> {
       case 'card.action.trigger':
         await this.handleCardAction(eventBody);
         break;
+      case 'im.message.reaction.created_v1':
+      case 'im.message.reaction.deleted_v1':
+        break; // no-op
       default:
-        console.debug(`[lark-connection] unhandled event type: ${eventType}`);
+        if (eventType) console.debug(`[lark-connection] unhandled event type: ${eventType}`);
     }
   }
 
