@@ -30,7 +30,7 @@ function baseUrl(env: Env): string {
 /** Get an app_access_token using internal app credentials. */
 async function getAppToken(env: Env): Promise<string | null> {
   try {
-    const resp = await fetch(`${baseUrl(env)}/open-apis/auth/v3/app_access_token/internal`, {
+    const resp = await fet(`${baseUrl(env)}/open-apis/auth/v3/app_access_token/internal`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -47,6 +47,11 @@ async function getAppToken(env: Env): Promise<string | null> {
 }
 
 // ---- Adapter ---------------------------------------------------------------
+
+/** Fetch with 15s timeout. */
+function fet(url: string, opts?: RequestInit): Promise<Response> {
+  return fetch(url, { ...opts, signal: AbortSignal.timeout(15_000) });
+}
 
 export class WorkerBitableAdapter implements BitableAdapter {
   private tokenPromise: Promise<string | null> | null = null;
@@ -82,7 +87,7 @@ export class WorkerBitableAdapter implements BitableAdapter {
 
   async getRecord(tableId: string, recordId: string): Promise<TicketRecord | null> {
     const hdrs = await this.headers();
-    const resp = await fetch(`${this.tablePath(tableId)}/records/${recordId}`, {
+    const resp = await fet(`${this.tablePath(tableId)}/records/${recordId}`, {
       headers: hdrs,
     });
     const data = await resp.json() as Record<string, unknown>;
@@ -109,10 +114,11 @@ export class WorkerBitableAdapter implements BitableAdapter {
     const qs = Object.keys(params).length > 0 ? `?${new URLSearchParams(params)}` : '';
 
     const url = `${this.tablePath(tableId)}/records${qs}`;
-    const resp = await fetch(url, {
+    const resp = await fet(url, {
       method: 'POST',
       headers: hdrs,
       body: JSON.stringify({ fields }),
+      signal: AbortSignal.timeout(15_000),
     });
     if (!resp.ok) {
       const body = await resp.text().catch(() => '');
@@ -136,7 +142,7 @@ export class WorkerBitableAdapter implements BitableAdapter {
     fields: Record<string, unknown>,
   ): Promise<void> {
     const hdrs = await this.headers();
-    const resp = await fetch(`${this.tablePath(tableId)}/records/${recordId}`, {
+    const resp = await fet(`${this.tablePath(tableId)}/records/${recordId}`, {
       method: 'PUT',
       headers: hdrs,
       body: JSON.stringify({ fields }),
@@ -168,7 +174,7 @@ export class WorkerBitableAdapter implements BitableAdapter {
     }
 
     // Try searchRecords endpoint first (more efficient)
-    const searchResp = await fetch(
+    const searchResp = await fet(
       `${this.tablePath(tableId)}/records/search`,
       {
         method: 'POST',
@@ -196,7 +202,7 @@ export class WorkerBitableAdapter implements BitableAdapter {
       if (pageToken) params.set('page_token', pageToken);
       else params.delete('page_token');
 
-      const resp = await fetch(`${this.tablePath(tableId)}/records?${params}`, {
+      const resp = await fet(`${this.tablePath(tableId)}/records?${params}`, {
         headers: hdrs,
       });
       const data = await resp.json() as Record<string, unknown>;
