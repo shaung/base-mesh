@@ -388,7 +388,7 @@ export class CoreCoordinator {
       const available = await this.executorPool.getAvailableExecutors();
       const stillConnected = available.some(e => e.identity === identity);
       if (stillConnected) {
-        this.log.info(`[core-coordinator] round ${roundId} executor ${identity} still connected, skip stuck check`);
+        // still connected, skip stuck check
         return;
       }
     }
