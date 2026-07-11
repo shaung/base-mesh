@@ -460,7 +460,7 @@ export class DOExecutorPool implements ExecutorPoolInterface {
       const list = await resp.json() as ExecutorInfo[];
       console.log(`[do-executor-pool] executors=${list.length} domains=${domains} identities=${list.map(e => `${e.identity}(busy=${!!e.activeTicketId})`).join(',')}`);
       if (!domains || domains.length === 0) return list;
-      const { PrefixMatcher } = await import('../../../lib/messaging/matcher.js');
+      const { PrefixMatcher } = await import('../../../../lib/messaging/matcher.js');
       const matcher = new PrefixMatcher();
       const matched = list.filter(e => matcher.matches(domains, e.domains));
       console.log(`[do-executor-pool] domain filter: ${matched.length}/${list.length} matched`);

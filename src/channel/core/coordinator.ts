@@ -271,10 +271,11 @@ export class CoreCoordinator {
 
     // Phase 2: Any available executor
     const available = await this.executorPool.getAvailableExecutors(requiredDomains);
+    this.log.info(`[core-coordinator] assignRoundToExecutor: ${available.length} candidates for round ${roundId}`);
     for (const ex of available) {
       if (ex.identity === lastOwnerIdentity) continue;
       const won = await this.session.claimRound(round, ex.identity);
-      if (!won) continue;
+      if (!won) { this.log.info(`[core-coordinator] claimRound lost for ${ex.identity}`); continue; }
       this.dispatchRoundToExecutor(ex, round, ticket);
       return;
     }
