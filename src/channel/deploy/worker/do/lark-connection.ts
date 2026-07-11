@@ -387,6 +387,8 @@ export class LarkConnection extends DurableObject<Env> {
 
   /** Buffer for multi-frame event reassembly. */
   private eventChunks = new Map<string, { chunks: (Uint8Array | null)[]; createdAt: number }>();
+  /** Serial processing queue for events. */
+  private eventQueue: Promise<void> = Promise.resolve();
 
   /** Process a decoded event frame: reassemble chunks, dispatch, send ACK. */
   private async handleEventFrame(
@@ -642,16 +644,19 @@ export class LarkConnection extends DurableObject<Env> {
           return;
         }
 
-        console.log(`[lark-connection] frame: method=${frame.method} headers=${JSON.stringify(frame.headers)} payload=${frame.payload.byteLength}B`);
+        L.debug('lark-connection', 'frame', { method: frame.method, headers: frame.headers.length, payload: frame.payload.byteLength });
 
         // Build header lookup
         const hdrs = new Map(frame.headers.map(h => [h.key, h.value]));
         const msgType = hdrs.get(HEADER_TYPE);
 
         if (frame.method === FRAME_DATA && msgType === 'event') {
-          await this.handleEventFrame(frame, hdrs, larkWs);
+          // Serialize events: process one at a time in order
+          this.eventQueue = this.eventQueue
+            .then(() => this.handleEventFrame(frame, hdrs, larkWs))
+            .catch(err => L.error('lark-connection', 'eventQueue', { error: err }));
+          // Don't await — the queue runs independently so new frames can queue up
         }
-        // Control frames (method=0) and other types are logged above
       });
 
       larkWs.addEventListener('close', (event: CloseEvent) => {
