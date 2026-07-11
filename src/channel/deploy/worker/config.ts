@@ -118,6 +118,7 @@ function mergeConfigRows(cfg: Config, rows: ConfigTableRow[]): void {
   const channelFields = groups['channel'];
   if (channelFields) {
     const camelized = camelizeKeys(channelFields);
+    console.log(`[worker-config] channel fields from Configs table: ${JSON.stringify(camelized)}`);
     for (const rootKey of ['ticketsTableId', 'turnsTableId', 'rosterTableId', 'roundsTableId', 'domainsTableId']) {
       if (camelized[rootKey]) (cfg as any)[rootKey] = camelized[rootKey];
     }
