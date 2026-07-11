@@ -343,7 +343,9 @@ export class ExecutorPool extends DurableObject<Env> {
       return new Response('Missing identity or payload', { status: 400 });
     }
 
+    console.log(`[executor-pool] dispatchTask identity=${identity} type=${(payload as any).type}`);
     const sent = this.dispatchTask(identity, payload);
+    console.log(`[executor-pool] dispatchTask result=${sent} wsCount=${this.executors.size}`);
     return new Response(JSON.stringify({ sent }), {
       headers: { 'Content-Type': 'application/json' },
     });
@@ -435,14 +437,8 @@ export class ExecutorPool extends DurableObject<Env> {
 // DO via internal fetch. Used by CoreCoordinator running in LarkConnection DO.
 // =============================================================================
 
-/** Resolve the DO stub for a given executor_id. */
-function executorPoolStub(env: Env, executorId: string): DurableObjectStub {
-  const id = env.EXECUTOR_POOL.idFromName(executorId);
-  return env.EXECUTOR_POOL.get(id);
-}
-
 export class DOExecutorPool implements ExecutorPoolInterface {
-  private poolStub: DurableObjectStub | null = null;
+  private poolStub: DurableObjectStub;
 
   constructor(private env: Env) {
     // All executors connect to the 'default-pool' DO instance
@@ -472,9 +468,7 @@ export class DOExecutorPool implements ExecutorPoolInterface {
   }
 
   dispatchTask(executorId: string, payload: unknown): boolean {
-    const stub = executorPoolStub(this.env, executorId);
-    // Fire-and-forget — the DO will handle the dispatch asynchronously.
-    stub.fetch('http://do/dispatch', {
+    this.poolStub.fetch('http://do/dispatch', {
       method: 'POST',
       body: JSON.stringify({ identity: executorId, payload }),
     }).catch(() => {});
@@ -482,8 +476,7 @@ export class DOExecutorPool implements ExecutorPoolInterface {
   }
 
   dispatchCancel(executorId: string, _roundId: string): boolean {
-    const stub = executorPoolStub(this.env, executorId);
-    stub.fetch('http://do/cancel', {
+    this.poolStub.fetch('http://do/cancel', {
       method: 'POST',
       body: JSON.stringify({ identity: executorId, round_id: _roundId }),
     }).catch(() => {});
