@@ -732,12 +732,113 @@ export class LarkConnection extends DurableObject<Env> {
         console.warn('[lark-connection] Lark WS error');
       });
     } catch (err) {
-      console.error('[lark-connection] connectToLark failed:', err);
-      await this.scheduleReconnect();
-  // ── Streaming card handlers ───────────────────────────────────────────
+
+      // ── Streaming card handlers ───────────────────────────────────────────
 
   private streamState = new Map<string, { cardId: string; seq: number; think: string; answer: string }>();
 
+  private async handleStreamUpdate(data: Record<string, unknown>): Promise<void> {
+    const cfg = this.enrichedCfg ?? this.baseCfg;
+    if (!cfg.coordinator?.streamOutput) return;
+    const ticketId = data.ticket_id as string;
+    const roundId = data.round_id as string || '';
+    const content = (data.content as string) || '';
+    const contentType = (data.content_type as string) || 'message';
+    const rootMsgId = (data.root_msg_id as string) || '';
+    const cardKey = roundId || ticketId;
+    if (!rootMsgId && !this.streamState.has(cardKey)) return;
+    if (!this.streamState.has(cardKey)) {
+      const card = await this.createStreamingCard(rootMsgId);
+      if (!card) return;
+      this.streamState.set(cardKey, { cardId: card.cardId, seq: 0, think: '', answer: '' });
+    }
+    const st = this.streamState.get(cardKey)!;
+    const dc = `https://${this.env.OPEN_API_DOMAIN || 'open.feishu.cn'}`;
+    const token = await this.getStreamToken();
+    if (!token) return;
+    if (contentType === 'thinking') {
+      st.think += (st.think ? '\n' : '') + '> ' + content.replace(/\n/g, '\n> ');
+    } else {
+      st.answer += (st.answer ? '\n' : '') + content;
+    }
+    st.seq++;
+    await this.updateCardElement(st.cardId, contentType === 'thinking' ? 'stream_thinking' : 'stream_answer',
+      contentType === 'thinking' ? st.think : st.answer, st.seq, token, dc);
+  }
+
+  private async handleStreamEnd(data: Record<string, unknown>): Promise<void> {
+    const cfg = this.enrichedCfg ?? this.baseCfg;
+    if (!cfg.coordinator?.streamOutput) return;
+    const cardKey = (data.round_id as string) || (data.ticket_id as string);
+    const st = this.streamState.get(cardKey);
+    if (!st) return;
+    const dc = `https://${this.env.OPEN_API_DOMAIN || 'open.feishu.cn'}`;
+    const token = await this.getStreamToken();
+    if (!token) return;
+    if (st.think) { st.seq++; await this.updateCardElement(st.cardId, 'stream_thinking', st.think, st.seq, token, dc); }
+    if (st.answer) { st.seq++; await this.updateCardElement(st.cardId, 'stream_answer', st.answer, st.seq, token, dc); }
+    try {
+      await fetch(`${dc}/open-apis/cardkit/v1/cards/${st.cardId}/settings`, {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          settings: JSON.stringify({ config: { streaming_mode: false, summary: { content: (st.answer || st.think).slice(0, 50) || '[Done]' } } }),
+          sequence: ++st.seq,
+          uuid: `c_${st.cardId}_${st.seq}`,
+        }),
+      });
+    } catch {}
+    this.streamState.delete(cardKey);
+  }
+
+  private async createStreamingCard(rootMsgId: string): Promise<{ cardId: string } | null> {
+    const dc = `https://${this.env.OPEN_API_DOMAIN || 'open.feishu.cn'}`;
+    const token = await this.getStreamToken();
+    if (!token || !rootMsgId) return null;
+    try {
+      const cardSpec = { schema: '2.0', config: { streaming_mode: true, summary: { content: '[Generating...]' }, streaming_config: { print_frequency_ms: { default: 70 }, print_step: { default: 1 }, print_strategy: 'fast' } }, body: { elements: [{ tag: 'markdown', element_id: 'stream_thinking', content: '', text_size: 'text_size_note' }, { tag: 'markdown', element_id: 'stream_answer', content: '...' }, { tag: 'markdown', element_id: 'stream_stats', content: '', text_size: 'body' }] } };
+      const resp = await fetch(`${dc}/open-apis/cardkit/v1/cards`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'card_json', data: JSON.stringify(cardSpec) }),
+      });
+      const d = await resp.json() as any;
+      if (d.code !== 0 || !d.data?.card_id) return null;
+      const cardId = d.data.card_id;
+      await fetch(`${dc}/open-apis/im/v1/messages/${rootMsgId}/reply`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ msg_type: 'interactive', content: JSON.stringify({ type: 'card', data: { card_id: cardId } }), reply_in_thread: true }),
+      });
+      return { cardId };
+    } catch { return null; }
+  }
+
+  private async updateCardElement(cardId: string, elementId: string, content: string, seq: number, token: string, dc: string): Promise<void> {
+    try {
+      await fetch(`${dc}/open-apis/cardkit/v1/cards/${cardId}/elements/${elementId}/content`, {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content, sequence: seq, uuid: `${elementId}_${cardId}_${seq}` }),
+      });
+    } catch {}
+  }
+
+  private async getStreamToken(): Promise<string | null> {
+    const dc = `https://${this.env.OPEN_API_DOMAIN || 'open.feishu.cn'}`;
+    try {
+      const resp = await fetch(`${dc}/open-apis/auth/v3/tenant_access_token/internal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ app_id: this.env.LARK_APP_ID, app_secret: this.env.LARK_APP_SECRET }),
+      });
+      const d = await resp.json() as any;
+      return d.tenant_access_token || null;
+    } catch { return null; }
+  }
+}
+
+// ---- Message parsing helpers -----------------------------------------------
   private async handleStreamUpdate(data: Record<string, unknown>): Promise<void> {
     const cfg = this.enrichedCfg ?? this.baseCfg;
     if (!cfg.coordinator?.streamOutput) return;
