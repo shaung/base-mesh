@@ -318,18 +318,30 @@ export class ExecutorPool extends DurableObject<Env> {
     }
   }
 
+  /** Forward a stream-related message to the LarkConnection DO. */
+  private async forwardToLark(data: Record<string, unknown>): Promise<void> {
+    try {
+      const id = this.env.LARK_CONNECTION.idFromName(this.env.LARK_APP_ID);
+      const stub = this.env.LARK_CONNECTION.get(id);
+      await stub.fetch('http://do/stream-update', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      });
+    } catch (err) {
+      console.error('[executor-pool] failed to forward stream msg:', err);
+    }
+  }
+
   private async handleStreamUpdate(ws: WebSocket, data: Record<string, unknown>): Promise<void> {
     const identity = this.wsToIdentity.get(ws);
     if (!identity) return;
-    // TODO: Forward streaming updates to Lark card
-    console.log(`[executor-pool] stream update from ${identity}: ticket=${data.ticket_id}`);
+    await this.forwardToLark(data);
   }
 
   private async handleStreamEnd(ws: WebSocket, data: Record<string, unknown>): Promise<void> {
     const identity = this.wsToIdentity.get(ws);
     if (!identity) return;
-    // TODO: Finalize streaming card and write result
-    console.log(`[executor-pool] stream end from ${identity}: ticket=${data.ticket_id}`);
+    await this.forwardToLark(data);
   }
 
   // ── Task dispatch ──────────────────────────────────────────────────────
