@@ -187,10 +187,16 @@ export class WorkerBitableAdapter implements BitableAdapter {
       const data = await searchResp.json() as Record<string, unknown>;
       if ((data as any).code === 0) {
         const items = (data as any).data?.items ?? [];
-        return items.map((r: any) => normalizeRecord({
+        const records = items.map((r: any) => normalizeRecord({
           record_id: r.record_id as string,
           fields: r.fields as Record<string, unknown>,
         }));
+        // Post-filter: Bitable's `is` operator may do prefix matching,
+        // so we apply exact match client-side as a safety net.
+        if (filter.conditions.length > 0) {
+          return records.filter(r => this.matchesFilter(r, filter));
+        }
+        return records;
       }
     }
 
