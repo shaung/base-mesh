@@ -161,14 +161,13 @@ export function buildWorkerConfig(env: Env): Config {
     appToken: env.BITABLE_APP_TOKEN,
     openApiDomain: env.OPEN_API_DOMAIN || 'open.larksuite.com',
 
-    // Table IDs — set to empty by default, loaded from Configs table at
-    // runtime via enrichConfigFromTable(). The BITABLE_CONFIGS_TABLE_ID is
-    // required to bootstrap the loading process.
-    ticketsTableId: '',
-    turnsTableId: '',
-    rosterTableId: '',
-    roundsTableId: undefined,
-    domainsTableId: undefined,
+    // Table IDs — check env vars first (from .dev.vars / wrangler.toml),
+    // then allow override from Configs table at runtime via enrichConfigFromTable().
+    ticketsTableId: env.BITABLE_TICKETS_TABLE_ID || '',
+    turnsTableId: env.BITABLE_TURNS_TABLE_ID || '',
+    rosterTableId: env.BITABLE_ROSTER_TABLE_ID || '',
+    roundsTableId: env.BITABLE_ROUNDS_TABLE_ID || undefined,
+    domainsTableId: env.BITABLE_DOMAINS_TABLE_ID || undefined,
     configsTableId: env.BITABLE_CONFIGS_TABLE_ID || undefined,
 
     // Shared defaults (no hardcoding)
