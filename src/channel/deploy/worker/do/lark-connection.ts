@@ -26,6 +26,8 @@ import { WorkerLarkAdapter } from '../adapters/lark.js';
 import { WorkerSessionAdapter } from '../session-adapter.js';
 import { buildWorkerConfig, enrichConfigFromTable } from '../config.js';
 import { DOExecutorPool } from './executor-pool.js';
+import { decodeFrame, FRAME_DATA, HEADER_TYPE, HEADER_MESSAGE_ID, HEADER_SUM, HEADER_SEQ } from '../lark-ws-protocol.js';
+import type { DecodedFrame } from '../lark-ws-protocol.js';
 import type { Config } from '../../../lib/types.js';
 
 // ---- Attachment types stored on hibernated WebSockets ---------------------
@@ -342,6 +344,136 @@ export class LarkConnection extends DurableObject<Env> {
     });
   }
 
+  // ── Event frame handling ─────────────────────────────────────────────
+
+  /** Buffer for multi-frame event reassembly. */
+  private eventChunks = new Map<string, { chunks: (Uint8Array | null)[]; createdAt: number }>();
+
+  /** Process a decoded event frame: reassemble chunks, dispatch, send ACK. */
+  private async handleEventFrame(
+    frame: DecodedFrame,
+    headers: Map<string, string>,
+    ws: WebSocket,
+  ): Promise<void> {
+    const messageId = headers.get(HEADER_MESSAGE_ID) || '';
+    const sum = parseInt(headers.get(HEADER_SUM) || '1', 10);
+    const seq = parseInt(headers.get(HEADER_SEQ) || '0', 10);
+
+    if (!messageId) return;
+
+    // Reassemble multi-chunk events
+    const fullPayload = this.reassembleEvent(messageId, frame.payload, sum, seq);
+    if (!fullPayload) return; // waiting for more chunks
+
+    // Parse event JSON
+    let eventData: Record<string, unknown>;
+    try {
+      const jsonStr = new TextDecoder().decode(fullPayload);
+      eventData = JSON.parse(jsonStr);
+    } catch (err) {
+      console.error('[lark-connection] event JSON parse failed:', err);
+      return;
+    }
+
+    console.log(`[lark-connection] event: id=${messageId} type=${(eventData.header as any)?.event_type}`);
+
+    // Send ACK
+    this.sendFrameAck(ws, frame, 0);
+
+    await this.cfgReadyPromise;
+
+    // Dispatch
+    const header = eventData.header as Record<string, unknown> | undefined;
+    const eventType = header?.event_type as string | undefined;
+    const eventBody = (eventData.event ?? eventData) as Record<string, unknown>;
+
+    switch (eventType) {
+      case 'im.message.receive_v1':
+        await this.handleImMessage(eventBody);
+        break;
+      case 'drive.file.bitable_record_changed_v1':
+        await this.handleBitableEvent(eventBody);
+        break;
+      case 'card.action.trigger':
+        await this.handleCardAction(eventBody);
+        break;
+      default:
+        console.debug(`[lark-connection] unhandled event type: ${eventType}`);
+    }
+  }
+
+  /** Reassemble multi-chunk event payloads. Returns null if still waiting. */
+  private reassembleEvent(
+    messageId: string,
+    chunk: Uint8Array,
+    total: number,
+    seq: number,
+  ): Uint8Array | null {
+    let entry = this.eventChunks.get(messageId);
+    if (!entry) {
+      entry = { chunks: new Array(total).fill(null), createdAt: Date.now() };
+      this.eventChunks.set(messageId, entry);
+    }
+    entry.chunks[seq] = chunk;
+
+    // Check if all chunks received
+    if (entry.chunks.some(c => c === null)) return null;
+
+    // Concatenate
+    const totalLen = entry.chunks.reduce((s, c) => s + c!.byteLength, 0);
+    const merged = new Uint8Array(totalLen);
+    let offset = 0;
+    for (const c of entry.chunks) {
+      merged.set(c!, offset);
+      offset += c!.byteLength;
+    }
+
+    this.eventChunks.delete(messageId);
+    return merged;
+  }
+
+  /** Send an ACK response frame for a received event. */
+  private sendFrameAck(ws: WebSocket, frame: DecodedFrame, code: number): void {
+    try {
+      // Simple protobuf-encoded response: Frame with code in payload
+      // We reuse the same SeqID/LogID so the server correlates the ACK
+      const respPayload = JSON.stringify({ code });
+      const encoder = new TextEncoder();
+
+      // Build response Frame as protobuf bytes (minimal encoding)
+      // Fields: 1=SeqID(varint), 2=LogID(varint), 4=method(varint),
+      //         5=headers(length-delimited), 8=payload(bytes)
+      const chunks: Uint8Array[] = [];
+      const w = (fn: number, ...bytes: number[]) => chunks.push(new Uint8Array([fn, ...bytes]));
+      const wVarint = (fn: number, val: bigint) => {
+        const b: number[] = [];
+        let v = val;
+        while (v > 0x7fn) { b.push(Number(v & 0x7fn) | 0x80); v >>= 7n; }
+        b.push(Number(v));
+        w(fn << 3 | 0, ...b);
+      };
+      const wBytes = (fn: number, data: Uint8Array) => {
+        const len: number[] = [];
+        let l = data.byteLength;
+        while (l > 0x7f) { len.push((l & 0x7f) | 0x80); l >>>= 7; }
+        len.push(l);
+        w(fn << 3 | 2, ...len, ...Array.from(data));
+      };
+
+      wVarint(1, frame.seqId);
+      wVarint(2, frame.logId);
+      wVarint(4, 0n); // method = control (0)
+      wBytes(8, encoder.encode(respPayload));
+
+      const full = new Uint8Array(chunks.reduce((s, c) => s + c.byteLength, 0));
+      let off = 0;
+      for (const c of chunks) { full.set(c, off); off += c.byteLength; }
+      ws.send(full.buffer as ArrayBuffer);
+    } catch (err) {
+      console.warn('[lark-connection] ACK send failed:', err);
+    }
+  }
+
   // ── Connection management ──────────────────────────────────────────────
 
   private async scheduleReconnect(): Promise<void> {
@@ -442,36 +574,41 @@ export class LarkConnection extends DurableObject<Env> {
       });
 
       larkWs.addEventListener('message', async (event: MessageEvent) => {
-        const isString = typeof event.data === 'string';
-        const isBinary = event.data instanceof ArrayBuffer || event.data instanceof Blob;
-        const dataSize = isString ? (event.data as string).length : (isBinary ? (event.data as ArrayBuffer).byteLength : '?');
-        const preview = isString ? (event.data as string).slice(0, 100) : `[binary ${dataSize} bytes]`;
-        console.log(`[lark-connection] WS message: type=${isString ? 'text' : isBinary ? 'binary' : typeof event.data} size=${dataSize} preview=${preview}`);
-
-        if (!isString) return; // binary = protobuf frame, not JSON
-
-        const text = event.data as string;
-        let data: Record<string, unknown>;
-        try { data = JSON.parse(text); } catch {
-          console.warn('[lark-connection] non-JSON text message:', text.slice(0, 200));
+        let buf: ArrayBuffer;
+        if (typeof event.data === 'string') {
+          // Text message — legacy fallback (shouldn't happen with current protocol)
+          const text = event.data;
+          let data: Record<string, unknown>;
+          try { data = JSON.parse(text); } catch { return; }
+          if (data.type === 'ping') { larkWs.send('{"type":"pong"}'); return; }
+          return;
+        } else if (event.data instanceof ArrayBuffer) {
+          buf = event.data;
+        } else if (event.data instanceof Blob) {
+          buf = await event.data.arrayBuffer();
+        } else {
           return;
         }
 
-        await this.cfgReadyPromise;
-        const packet = (data.event ?? data) as Record<string, unknown>;
-        if (!packet || typeof packet !== 'object') return;
-        const header = packet.header as Record<string, unknown> | undefined;
-        const eventType = header?.event_type as string | undefined;
-
-        if (eventType === 'im.message.receive_v1') {
-          await this.handleImMessage(packet);
-        } else if (eventType === 'drive.file.bitable_record_changed_v1') {
-          await this.handleBitableEvent(packet);
-        } else if (eventType === 'card.action.trigger') {
-          await this.handleCardAction(packet);
-        } else {
-          console.debug(`[lark-connection] unhandled event: ${eventType || text.slice(0, 100)}`);
+        // Decode protobuf frame
+        let frame: DecodedFrame;
+        try {
+          frame = decodeFrame(buf);
+        } catch (err) {
+          console.error('[lark-connection] protobuf decode failed:', err);
+          return;
         }
+
+        console.log(`[lark-connection] frame: method=${frame.method} headers=${JSON.stringify(frame.headers)} payload=${frame.payload.byteLength}B`);
+
+        // Build header lookup
+        const hdrs = new Map(frame.headers.map(h => [h.key, h.value]));
+        const msgType = hdrs.get(HEADER_TYPE);
+
+        if (frame.method === FRAME_DATA && msgType === 'event') {
+          await this.handleEventFrame(frame, hdrs, larkWs);
+        }
+        // Control frames (method=0) and other types are logged above
       });
 
       larkWs.addEventListener('close', (event: CloseEvent) => {
