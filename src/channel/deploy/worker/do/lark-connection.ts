@@ -442,17 +442,20 @@ export class LarkConnection extends DurableObject<Env> {
       });
 
       larkWs.addEventListener('message', async (event: MessageEvent) => {
-        const text = typeof event.data === 'string' ? event.data : '';
-        if (!text) return;
+        const isString = typeof event.data === 'string';
+        const isBinary = event.data instanceof ArrayBuffer || event.data instanceof Blob;
+        const dataSize = isString ? (event.data as string).length : (isBinary ? (event.data as ArrayBuffer).byteLength : '?');
+        const preview = isString ? (event.data as string).slice(0, 100) : `[binary ${dataSize} bytes]`;
+        console.log(`[lark-connection] WS message: type=${isString ? 'text' : isBinary ? 'binary' : typeof event.data} size=${dataSize} preview=${preview}`);
 
+        if (!isString) return; // binary = protobuf frame, not JSON
+
+        const text = event.data as string;
         let data: Record<string, unknown>;
-        try { data = JSON.parse(text); } catch { return; }
-
-        if (data.type === 'ping') {
-          larkWs.send(JSON.stringify({ type: 'pong' }));
+        try { data = JSON.parse(text); } catch {
+          console.warn('[lark-connection] non-JSON text message:', text.slice(0, 200));
           return;
         }
-        if (data.type === 'pong') return;
 
         await this.cfgReadyPromise;
         const packet = (data.event ?? data) as Record<string, unknown>;
