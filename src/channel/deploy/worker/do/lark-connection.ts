@@ -158,6 +158,12 @@ export class LarkConnection extends DurableObject<Env> {
       return new Response('OK', { status: 200 });
     }
 
+    if (url.pathname === '/executor-result' && request.method === 'POST') {
+      const data = await request.json() as Record<string, unknown>;
+      await this.handleExecutorResult(data);
+      return new Response('OK', { status: 200 });
+    }
+
     await this.cfgReadyPromise;
     this.ensureLarkConnected().catch(() => {});
 

@@ -305,7 +305,16 @@ export class ExecutorPool extends DurableObject<Env> {
     // Acknowledge receipt
     ws.send(JSON.stringify({ type: 'ack' }));
 
-    // TODO: Forward result to Bitable via the Coordinator core
+    // Forward result to LarkConnection DO for processing (write turn, reply via IM)
+    try {
+      const larkId = this.env.LARK_CONNECTION.idFromName(this.env.LARK_APP_ID);
+      await larkId.fetch('http://do/executor-result', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      });
+    } catch (err) {
+      console.error('[executor-pool] failed to forward result to LarkConnection:', err);
+    }
   }
 
   private async handleStreamUpdate(ws: WebSocket, data: Record<string, unknown>): Promise<void> {
