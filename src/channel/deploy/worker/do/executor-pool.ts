@@ -453,14 +453,20 @@ export class DOExecutorPool implements ExecutorPoolInterface {
   async getAvailableExecutors(domains?: string[]): Promise<ExecutorInfo[]> {
     try {
       const resp = await this.poolStub!.fetch('http://do/executors');
-      if (!resp.ok) return [];
+      if (!resp.ok) {
+        console.warn(`[do-executor-pool] /executors returned ${resp.status}`);
+        return [];
+      }
       const list = await resp.json() as ExecutorInfo[];
+      console.log(`[do-executor-pool] executors=${list.length} domains=${domains} identities=${list.map(e => `${e.identity}(busy=${!!e.activeTicketId})`).join(',')}`);
       if (!domains || domains.length === 0) return list;
-      // Filter by domain match
       const { PrefixMatcher } = await import('../../../lib/messaging/matcher.js');
       const matcher = new PrefixMatcher();
-      return list.filter(e => matcher.matches(domains, e.domains));
-    } catch {
+      const matched = list.filter(e => matcher.matches(domains, e.domains));
+      console.log(`[do-executor-pool] domain filter: ${matched.length}/${list.length} matched`);
+      return matched;
+    } catch (err) {
+      console.warn(`[do-executor-pool] getAvailableExecutors error:`, err);
       return [];
     }
   }
