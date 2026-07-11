@@ -307,8 +307,9 @@ export class ExecutorPool extends DurableObject<Env> {
 
     // Forward result to LarkConnection DO for processing (write turn, reply via IM)
     try {
-      const larkId = this.env.LARK_CONNECTION.idFromName(this.env.LARK_APP_ID);
-      await larkId.fetch('http://do/executor-result', {
+      const id = this.env.LARK_CONNECTION.idFromName(this.env.LARK_APP_ID);
+      const stub = this.env.LARK_CONNECTION.get(id);
+      await stub.fetch('http://do/executor-result', {
         method: 'POST',
         body: JSON.stringify(data),
       });

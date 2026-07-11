@@ -103,6 +103,8 @@ export interface StatusMapping {
   draft: string;
   active: string;
   closed: string;
+  /** Legacy — may be used by Channel for re-activation. */
+  failed?: string;
 }
 
 // ---- Round status mappings ------------------------------------------------

@@ -42,7 +42,7 @@ export const DEFAULT_FIELDS: FieldMapping = {
 };
 
 export const DEFAULT_STATUSES: StatusMapping = {
-  draft: 'draft', active: 'active', closed: 'closed',
+  draft: 'draft', active: 'active', closed: 'closed', failed: 'failed',
 };
 
 export const DEFAULT_ROUND_STATUSES: RoundStatusMapping = {

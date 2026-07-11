@@ -718,7 +718,7 @@ export class Channel {
       return;
     }
 
-    if (status === this.cfg.statuses.closed) {
+    if (status === this.cfg.statuses.failed) {
       await this.bitable.updateRecord(this.cfg.ticketsTableId, recordId, {
         [this.cfg.fields.ticket.status]: this.cfg.statuses.active,
         [this.cfg.fields.ticket.retryCount]: 0,
