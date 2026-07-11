@@ -699,8 +699,6 @@ export class LarkConnection extends DurableObject<Env> {
           return;
         }
 
-        L.debug('lark-connection', 'frame', { method: frame.method, headers: frame.headers.length, payload: frame.payload.byteLength });
-
         // Build header lookup
         const hdrs = new Map(frame.headers.map(h => [h.key, h.value]));
         const msgType = hdrs.get(HEADER_TYPE);
