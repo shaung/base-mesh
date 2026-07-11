@@ -64,23 +64,31 @@ async function loadConfigRows(
     conditions: [],
   });
 
+  if (records.length > 0) {
+    // Log the raw fields of the first record to understand the API response format
+    const sample = records[0];
+    const fieldKeys = Object.keys(sample.fields || {});
+    console.log(`[worker-config] Configs table: ${records.length} records, field keys: ${JSON.stringify(fieldKeys.slice(0, 10))}`);
+    console.log(`[worker-config] Configs table sample: ${JSON.stringify(sample.fields).slice(0, 300)}`);
+  }
   return records
     .map(r => {
-      // Bitable field values can be plain strings OR objects like { text: "..." }
-      const fieldVal = (f: string) => {
-        const v = r.fields[f];
-        if (v == null) return '';
-        if (typeof v === 'string') return v;
-        if (typeof v === 'object' && v !== null && 'text' in (v as any)) return String((v as any).text);
-        if (typeof v === 'object' && v !== null && 'value' in (v as any)) return String((v as any).value);
-        return String(v);
+      const v = (f: string) => {
+        const raw = r.fields[f];
+        if (raw == null) return '';
+        if (typeof raw === 'string') return raw;
+        // Bitable text fields: { text: "value" }
+        if (typeof raw === 'object' && 'text' in (raw as any) && (raw as any).text != null) return String((raw as any).text);
+        // Single select: { text: "value", option_id: "...", ... }
+        if (typeof raw === 'object' && 'option_name' in (raw as any)) return String((raw as any).option_name);
+        return String(raw);
       };
       return {
-        section: fieldVal('section'),
-        key: fieldVal('key'),
-        value: fieldVal('value'),
-        default: fieldVal('default'),
-        type: fieldVal('type'),
+        section: v('section') || v('Section') || '',
+        key: v('key') || v('Key') || '',
+        value: v('value') || v('Value') || '',
+        default: v('default') || v('Default') || '',
+        type: v('type') || v('Type') || '',
       };
     })
     .filter(r => r.section && r.key);
