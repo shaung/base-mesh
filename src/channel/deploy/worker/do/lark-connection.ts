@@ -336,7 +336,12 @@ export class LarkConnection extends DurableObject<Env> {
       botMentioned: false,
     };
 
-    await this.operator.handleMessage(parsedEvent);
+    const roundId = await this.operator.handleMessage(parsedEvent);
+    // If a round was created, process it immediately (same DO, no need to wait for bitable events)
+    if (roundId) {
+      L.info('lark-connection', 'processingNewRound', { roundId });
+      await this.coordinator.processRound(roundId);
+    }
   }
 
   private async handleBitableEvent(event: Record<string, unknown>): Promise<void> {

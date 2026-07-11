@@ -50,8 +50,9 @@ export class CoreOperator {
   // Main message entry point
   // ===========================================================================
 
-  /** Process an incoming IM message: parse, create ticket/turn/round. */
-  async handleMessage(event: ParsedMessageEvent): Promise<void> {
+  /** Process an incoming IM message: parse, create ticket/turn/round.
+   *  Returns the round record_id if a round was created, undefined otherwise. */
+  async handleMessage(event: ParsedMessageEvent): Promise<string | undefined> {
     const { content, parts, message, sender, appId, botMentioned, domain } = event;
     const messageId = message.message_id;
     const chatId = message.chat_id;
@@ -125,9 +126,11 @@ export class CoreOperator {
 
       // Process draft: intent → promote → create round
       this.log.info(`[core-operator] calling processDraft roundsTableId="${this.cfg.roundsTableId}"`);
-      await this.processDraft(ticket, content, messageId, chatId, appId, domain);
+      const roundId = await this.processDraft(ticket, content, messageId, chatId, appId, domain);
+      return roundId;
     } catch (err) {
       this.log.error('[core-operator] failed to handle message:', err);
+      return undefined;
     }
   }
 
@@ -260,7 +263,8 @@ export class CoreOperator {
   // Draft processing
   // ===========================================================================
 
-  /** Process a draft: intent recognition, promote to pending, create round. */
+  /** Process a draft: intent recognition, promote to pending, create round.
+   *  Returns the round record_id if created. */
   async processDraft(
     ticket: TicketRecord,
     content: string,
@@ -268,7 +272,7 @@ export class CoreOperator {
     _chatId: string,
     appId?: string,
     domain?: string,
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     let domains: string[] = ['general'];
     let summary = content;
 
@@ -290,7 +294,7 @@ export class CoreOperator {
         if (rootMsgId) {
           await this.feishu.reply(rootMsgId, question, true);
         }
-        return;
+        return undefined;
       }
     }
 
@@ -303,10 +307,14 @@ export class CoreOperator {
       try {
         const round = await this.createRound(ticket.record_id, domains, appId, content);
         this.log.info(`[core-operator] created round ${round.record_id!} for ticket ${ticket.record_id}`);
+        return round.record_id;
       } catch (err) {
         this.log.error('[core-operator] createRound failed:', err);
+        return undefined;
       }
     }
+
+    return undefined;
   }
 
   // ===========================================================================
