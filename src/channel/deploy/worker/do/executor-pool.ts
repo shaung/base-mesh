@@ -468,10 +468,12 @@ export class DOExecutorPool implements ExecutorPoolInterface {
   }
 
   dispatchTask(executorId: string, payload: unknown): boolean {
+    const body = JSON.stringify({ identity: executorId, payload });
     this.poolStub.fetch('http://do/dispatch', {
       method: 'POST',
-      body: JSON.stringify({ identity: executorId, payload }),
-    }).catch(() => {});
+      body,
+    }).then(resp => resp.json().then(d => console.log(`[do-executor-pool] dispatch result: sent=${d.sent}`)))
+    .catch(err => console.warn(`[do-executor-pool] dispatch fetch failed:`, err));
     return true;
   }
 
