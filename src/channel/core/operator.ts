@@ -78,7 +78,7 @@ export class CoreOperator {
     // New conversation — create ticket and turn
     try {
       const dedupKey = appId ? `${appId}:${messageId}` : messageId;
-      this.log.info(`[core-operator] msg rootId=${rootId} appId=${appId} messageId=${messageId} dedupKey=${dedupKey}`);
+      this.log.info(`[core-operator] msg messageId=${messageId} appId=${appId} rootId=${rootId}`);
 
       // Dedup check
       const existing = await this.bitable.searchRecords(this.cfg.turnsTableId, {
@@ -88,7 +88,7 @@ export class CoreOperator {
         ],
       });
       if (existing.length > 0) {
-        this.log.info(`[core-operator] dedup: ${dedupKey.slice(0, 30)} already processed`);
+        this.log.info(`[core-operator] dedup msg already processed`);
         return;
       }
 
