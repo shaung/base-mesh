@@ -93,8 +93,14 @@ export class CoreOperator {
       }
 
       // Create ticket
-      const ticket = await this.createTicketDirect(content, messageId, chatId, senderId);
-      this.log.info(`[core-operator] ticket created: id=${ticket.record_id}`);
+      let ticket: TicketRecord;
+      try {
+        ticket = await this.createTicketDirect(content, messageId, chatId, senderId);
+        this.log.info(`[core-operator] ticket created: id=${ticket.record_id}`);
+      } catch (err) {
+        this.log.error(`[core-operator] createTicketDirect FAILED:`, err);
+        throw err;
+      }
 
       const recordId = ticket.record_id;
       if (!recordId) {
@@ -115,7 +121,8 @@ export class CoreOperator {
       };
       if (parts.length > 0) turnFields[this.cfg.fields.turn.parts] = JSON.stringify(parts);
 
-      await this.bitable.createRecord(this.cfg.turnsTableId, turnFields);
+      const turn = await this.bitable.createRecord(this.cfg.turnsTableId, turnFields);
+      this.log.info(`[core-operator] user turn created: id=${turn.record_id} ticket=${recordId}`);
 
       // Process draft: intent → promote → create round
       await this.processDraft(ticket, content, messageId, chatId, appId, domain);
