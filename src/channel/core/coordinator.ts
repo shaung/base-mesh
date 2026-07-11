@@ -496,8 +496,20 @@ export class CoreCoordinator {
 
   /** Process an executor result: write turn, update ticket/round, manage reactions. */
   async processResult(identity: string, data: ExecutorResultPayload): Promise<void> {
-    const { ticket_id: ticketId, round_id: roundId, answer, root_msg_id: rootMsgId,
+    const { ticket_id: ticketId, round_id: roundId, answer,
             parts, reassignTo, streamed, newSummary } = data;
+    let { root_msg_id: rootMsgId } = data;
+
+    // Resolve rootMsgId from turns if executor didn't include it
+    if (!rootMsgId) {
+      try {
+        const turns = await this.session.getTurns(ticketId);
+        for (const t of turns) {
+          const rid = String(t.fields[this.cfg.fields.turn.rootMsgId] ?? '');
+          if (rid) { rootMsgId = rid; break; }
+        }
+      } catch { /* */ }
+    }
 
     this.log.info(`[core-coordinator] result from ${identity} ticket=${ticketId} rootMsgId=${rootMsgId || '(empty)'} streamed=${!!streamed} answer=${(answer || '').slice(0, 60)}`);
 
