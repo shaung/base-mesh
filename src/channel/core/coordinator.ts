@@ -499,7 +499,7 @@ export class CoreCoordinator {
     const { ticket_id: ticketId, round_id: roundId, answer, root_msg_id: rootMsgId,
             parts, reassignTo, streamed, newSummary } = data;
 
-    this.log.info(`[core-coordinator] result from ${identity} ticket=${ticketId} answer=${(answer || '').slice(0, 60)}`);
+    this.log.info(`[core-coordinator] result from ${identity} ticket=${ticketId} rootMsgId=${rootMsgId || '(empty)'} streamed=${!!streamed} answer=${(answer || '').slice(0, 60)}`);
 
     // Write agent turn
     try {
