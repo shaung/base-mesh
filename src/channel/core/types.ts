@@ -59,7 +59,7 @@ export interface ExecutorInfo {
 }
 
 export interface ExecutorPoolInterface {
-  getAvailableExecutors(domains?: string[]): ExecutorInfo[];
+  getAvailableExecutors(domains?: string[]): ExecutorInfo[] | Promise<ExecutorInfo[]>;
   dispatchTask(executorId: string, payload: unknown): boolean;
   dispatchCancel(executorId: string, roundId: string): boolean;
   broadcast(message: string): number;

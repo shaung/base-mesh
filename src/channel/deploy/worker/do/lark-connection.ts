@@ -117,6 +117,8 @@ export class LarkConnection extends DurableObject<Env> {
         this.enrichedCfg = JSON.parse(cached) as Config;
         this.coordinator = this.buildCoordinator(this.enrichedCfg);
         L.info('lark-connection', 'initConfig', { source: 'cache' });
+        // Start round coordination after config loads
+        await this.scheduleNextPoll();
         return;
       }
       if (this.baseCfg.configsTableId) {
@@ -125,6 +127,7 @@ export class LarkConnection extends DurableObject<Env> {
     } catch (err) {
       console.error('[lark-connection] config init error (using base config):', err);
     }
+    await this.scheduleNextPoll();
   }
 
   /** Load config from the Bitable Configs table and cache in DO storage. */
@@ -279,9 +282,20 @@ export class LarkConnection extends DurableObject<Env> {
   // ── Alarm handler ──────────────────────────────────────────────────────
 
   async alarm(): Promise<void> {
+    await this.cfgReadyPromise;
+
+    // 1. Reconnect Lark WS if needed
     if (!this.larkWs) {
       await this.connectToLark();
     }
+
+    // 2. Coordinate pending rounds (like Node's roundCoordinationCycle)
+    if (this.coordinator) {
+      await this.coordinator.roundCoordinationCycle();
+    }
+
+    // 3. Schedule next poll
+    await this.ctx.storage.setAlarm(Date.now() + LarkConnection.POLL_INTERVAL);
   }
 
   // ── Event handlers ─────────────────────────────────────────────────────
@@ -389,6 +403,8 @@ export class LarkConnection extends DurableObject<Env> {
   private eventChunks = new Map<string, { chunks: (Uint8Array | null)[]; createdAt: number }>();
   /** Serial processing queue for events. */
   private eventQueue: Promise<void> = Promise.resolve();
+  /** Round coordination cycle interval in ms. */
+  private static readonly POLL_INTERVAL = 15_000;
 
   /** Process a decoded event frame: reassemble chunks, dispatch, send ACK. */
   private async handleEventFrame(

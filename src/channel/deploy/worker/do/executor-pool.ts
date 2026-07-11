@@ -442,13 +442,27 @@ function executorPoolStub(env: Env, executorId: string): DurableObjectStub {
 }
 
 export class DOExecutorPool implements ExecutorPoolInterface {
-  constructor(private env: Env) {}
+  private poolStub: DurableObjectStub | null = null;
 
-  getAvailableExecutors(_domains?: string[]): ExecutorInfo[] {
-    // Non-blocking: returns empty list. In practice, executors are spread
-    // across DO shards, so a full listing requires iterating all shards.
-    // Use the /executors endpoint on individual DO stubs for targeted lookups.
-    return [];
+  constructor(private env: Env) {
+    // All executors connect to the 'default-pool' DO instance
+    const id = env.EXECUTOR_POOL.idFromName('default-pool');
+    this.poolStub = env.EXECUTOR_POOL.get(id);
+  }
+
+  async getAvailableExecutors(domains?: string[]): Promise<ExecutorInfo[]> {
+    try {
+      const resp = await this.poolStub!.fetch('http://do/executors');
+      if (!resp.ok) return [];
+      const list = await resp.json() as ExecutorInfo[];
+      if (!domains || domains.length === 0) return list;
+      // Filter by domain match
+      const { PrefixMatcher } = await import('../../../lib/messaging/matcher.js');
+      const matcher = new PrefixMatcher();
+      return list.filter(e => matcher.matches(domains, e.domains));
+    } catch {
+      return [];
+    }
   }
 
   dispatchTask(executorId: string, payload: unknown): boolean {

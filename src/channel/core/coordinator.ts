@@ -258,7 +258,7 @@ export class CoreCoordinator {
     const rawLastOwner = String(ticket.fields[this.cfg.fields.ticket.lastOwner] ?? '');
     const lastOwnerIdentity = parseExecutorIdentity(rawLastOwner);
     if (lastOwnerIdentity) {
-      const available = this.executorPool.getAvailableExecutors(requiredDomains);
+      const available = await this.executorPool.getAvailableExecutors(requiredDomains);
       const matched = available.find(e => e.identity === lastOwnerIdentity && !e.activeTicketId);
       if (matched) {
         const won = await this.session.claimRound(round, matched.identity);
@@ -270,7 +270,7 @@ export class CoreCoordinator {
     }
 
     // Phase 2: Any available executor
-    const available = this.executorPool.getAvailableExecutors(requiredDomains);
+    const available = await this.executorPool.getAvailableExecutors(requiredDomains);
     for (const ex of available) {
       if (ex.identity === lastOwnerIdentity) continue;
       const won = await this.session.claimRound(round, ex.identity);
@@ -384,7 +384,7 @@ export class CoreCoordinator {
     const identity = parseExecutorIdentity(executorField);
 
     if (identity) {
-      const available = this.executorPool.getAvailableExecutors();
+      const available = await this.executorPool.getAvailableExecutors();
       const stillConnected = available.some(e => e.identity === identity);
       if (stillConnected) {
         this.log.info(`[core-coordinator] round ${roundId} executor ${identity} still connected, skip stuck check`);
@@ -430,7 +430,7 @@ export class CoreCoordinator {
 
     // Try affinity first
     if (lastOwnerIdentity) {
-      const available = this.executorPool.getAvailableExecutors();
+      const available = await this.executorPool.getAvailableExecutors();
       const matched = available.find(e => e.identity === lastOwnerIdentity && !e.activeTicketId);
       if (matched) {
         const won = await this.session.claim(ticket);
@@ -442,7 +442,7 @@ export class CoreCoordinator {
     }
 
     // Try any available executor
-    const available = this.executorPool.getAvailableExecutors();
+    const available = await this.executorPool.getAvailableExecutors();
     for (const ex of available) {
       if (ex.activeTicketId) continue;
       if (ex.identity === lastOwnerIdentity) continue;

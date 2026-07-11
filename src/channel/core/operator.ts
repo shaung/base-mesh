@@ -124,6 +124,7 @@ export class CoreOperator {
       this.log.info(`[core-operator] user turn created: id=${turn.record_id} ticket=${recordId}`);
 
       // Process draft: intent → promote → create round
+      this.log.info(`[core-operator] calling processDraft roundsTableId="${this.cfg.roundsTableId}"`);
       await this.processDraft(ticket, content, messageId, chatId, appId, domain);
     } catch (err) {
       this.log.error('[core-operator] failed to handle message:', err);
