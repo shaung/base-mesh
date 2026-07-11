@@ -376,8 +376,6 @@ export class LarkConnection extends DurableObject<Env> {
 
     if (!tableId || !recordId) return;
 
-    console.log(`[lark-connection] bitable event: ${tableId}/${recordId}`);
-
     if (cfg.roundsTableId && tableId === cfg.roundsTableId) {
       await this.coordinator.processRound(recordId);
     }
@@ -459,8 +457,6 @@ export class LarkConnection extends DurableObject<Env> {
       console.error('[lark-connection] event JSON parse failed:', err);
       return;
     }
-
-    console.log(`[lark-connection] event: id=${messageId} type=${(eventData.header as any)?.event_type}`);
 
     // Send ACK
     this.sendFrameAck(ws, frame, 0);

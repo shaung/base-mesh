@@ -188,7 +188,7 @@ export function buildWorkerConfig(env: Env): Config {
     // Coordinator config from env
     coordinator: {
       globalPrompt: env.COORDINATOR_GLOBAL_PROMPT || '',
-      streamOutput: env.COORDINATOR_STREAM_OUTPUT !== 'false',
+      streamOutput: env.COORDINATOR_STREAM_OUTPUT === 'true',
       streamThinking: env.COORDINATOR_STREAM_THINKING === 'true',
       heartbeatSeconds: parseInt(env.COORDINATOR_HEARTBEAT_SECONDS || '60', 10),
       pollIntervalSeconds: parseInt(env.COORDINATOR_POLL_INTERVAL_SECONDS || '10', 10),
