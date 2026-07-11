@@ -83,7 +83,8 @@ export class CoreOperator {
         ],
       });
       if (existing.length > 0) {
-        this.log.info(`[core-operator] dedup msg already processed`);
+        const found = existing.map(r => String(r.fields[this.cfg.fields.turn.dedupKey] ?? '?').slice(0, 40));
+        this.log.info(`[core-operator] dedup hit count=${existing.length} keys=[${found.join(',')}]`);
         return;
       }
 
