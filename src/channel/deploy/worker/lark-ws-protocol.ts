@@ -67,12 +67,16 @@ class PbReader {
     return Number(this.varint());
   }
 
-  /** Skip length-delimited bytes and return them. */
+  /** Read length-delimited bytes and return a SELF-CONTAINED copy. */
   bytes(): Uint8Array {
     const len = this.varint32();
+    if (len < 0 || len > this.view.byteLength - this.pos) {
+      throw new Error(`invalid length ${len} at pos ${this.pos}/${this.view.byteLength}`);
+    }
     const start = this.pos;
     this.pos += len;
-    return new Uint8Array(this.view.buffer, this.view.byteOffset + start, len);
+    // Return a copy so .buffer gives the correct (small) ArrayBuffer
+    return new Uint8Array(new Uint8Array(this.view.buffer, this.view.byteOffset + start, len));
   }
 
   /** Read a length-delimited string. */
