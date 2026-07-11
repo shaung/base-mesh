@@ -78,7 +78,7 @@ export class CoreOperator {
     // New conversation — create ticket and turn
     try {
       const dedupKey = appId ? `${appId}:${messageId}` : messageId;
-      this.log.info(`[core-operator] handleMessage: rootId="${rootId}" appId="${appId}" messageId="${messageId}" dedupKey="${dedupKey}"`);
+      this.log.info(`[core-operator] msg rootId=${rootId} appId=${appId} messageId=${messageId} dedupKey=${dedupKey}`);
 
       // Dedup check
       const existing = await this.bitable.searchRecords(this.cfg.turnsTableId, {
@@ -96,7 +96,7 @@ export class CoreOperator {
       let ticket: TicketRecord;
       try {
         ticket = await this.createTicketDirect(content, messageId, chatId, senderId);
-        this.log.info(`[core-operator] ticket created: id=${ticket.record_id}`);
+        this.log.info(`[core-operator] ticketCreated id=${ticket.record_id}`);
       } catch (err) {
         this.log.error(`[core-operator] createTicketDirect FAILED:`, err);
         throw err;

@@ -30,6 +30,7 @@ import { DOExecutorPool } from './executor-pool.js';
 import { decodeFrame, FRAME_DATA, HEADER_TYPE, HEADER_MESSAGE_ID, HEADER_SUM, HEADER_SEQ } from '../lark-ws-protocol.js';
 import type { DecodedFrame } from '../lark-ws-protocol.js';
 import type { Config } from '../../../lib/types.js';
+import { log as L } from '../logger.js';
 
 // ---- Attachment types stored on hibernated WebSockets ---------------------
 
@@ -115,7 +116,7 @@ export class LarkConnection extends DurableObject<Env> {
       if (cached) {
         this.enrichedCfg = JSON.parse(cached) as Config;
         this.coordinator = this.buildCoordinator(this.enrichedCfg);
-        console.log('[lark-connection] config loaded from DO cache');
+        L.info('lark-connection', 'initConfig', { source: 'cache' });
         return;
       }
       if (this.baseCfg.configsTableId) {
@@ -176,7 +177,7 @@ export class LarkConnection extends DurableObject<Env> {
     }
     try {
       await this.loadAndCacheConfig();
-      console.log('[lark-connection] config reloaded from Configs table');
+      L.info('lark-connection', 'configReloaded', {});
       await this.connectToLark();
       return new Response(JSON.stringify({ ok: true, message: 'config reloaded' }), {
         status: 200,
@@ -560,7 +561,7 @@ export class LarkConnection extends DurableObject<Env> {
         this.larkWs = null;
       }
 
-      console.log('[lark-connection] fetching WS endpoint...');
+      L.info('lark-connection', 'fetchEndpoint', {});
 
       // Step 1: Get WebSocket endpoint config (matches SDK's pullConnectConfig)
       const endpointResp = await fetch(`${baseUrl}/callback/ws/endpoint`, {
@@ -594,7 +595,7 @@ export class LarkConnection extends DurableObject<Env> {
         return;
       }
 
-      console.log('[lark-connection] got WS endpoint, connecting...');
+      L.info('lark-connection', 'connecting', {});
 
       // Step 2: Connect to the WebSocket URL (matches SDK's connect())
       let larkWs: WebSocket;
@@ -612,7 +613,7 @@ export class LarkConnection extends DurableObject<Env> {
       this.larkWs = larkWs;
 
       larkWs.addEventListener('open', () => {
-        console.log('[lark-connection] connected to Lark WS');
+        L.info('lark-connection', 'wsConnected', {});
       });
 
       larkWs.addEventListener('message', async (event: MessageEvent) => {
