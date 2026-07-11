@@ -65,13 +65,24 @@ async function loadConfigRows(
   });
 
   return records
-    .map(r => ({
-      section: String(r.fields['section'] ?? ''),
-      key: String(r.fields['key'] ?? ''),
-      value: String(r.fields['value'] ?? ''),
-      default: String(r.fields['default'] ?? ''),
-      type: String(r.fields['type'] ?? 'string'),
-    }))
+    .map(r => {
+      // Bitable field values can be plain strings OR objects like { text: "..." }
+      const fieldVal = (f: string) => {
+        const v = r.fields[f];
+        if (v == null) return '';
+        if (typeof v === 'string') return v;
+        if (typeof v === 'object' && v !== null && 'text' in (v as any)) return String((v as any).text);
+        if (typeof v === 'object' && v !== null && 'value' in (v as any)) return String((v as any).value);
+        return String(v);
+      };
+      return {
+        section: fieldVal('section'),
+        key: fieldVal('key'),
+        value: fieldVal('value'),
+        default: fieldVal('default'),
+        type: fieldVal('type'),
+      };
+    })
     .filter(r => r.section && r.key);
 }
 
