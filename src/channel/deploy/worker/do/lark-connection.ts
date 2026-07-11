@@ -419,6 +419,10 @@ export class LarkConnection extends DurableObject<Env> {
     this.sendFrameAck(ws, frame, 0);
 
     await this.cfgReadyPromise;
+    const cfg = this.enrichedCfg ?? this.baseCfg;
+    if (!cfg.rosterTableId) {
+      console.warn('[lark-connection] rosterTableId not configured — tickets will not be created. Run /reload or check Configs table.');
+    }
 
     // Dispatch
     const header = eventData.header as Record<string, unknown> | undefined;

@@ -97,17 +97,20 @@ export class WorkerBitableAdapter implements BitableAdapter {
     if (_userIdType) params['user_id_type'] = _userIdType;
     const qs = Object.keys(params).length > 0 ? `?${new URLSearchParams(params)}` : '';
 
-    const resp = await fetch(`${this.tablePath(tableId)}/records${qs}`, {
+    const url = `${this.tablePath(tableId)}/records${qs}`;
+    const resp = await fetch(url, {
       method: 'POST',
       headers: hdrs,
       body: JSON.stringify({ fields }),
     });
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '');
+      throw new Error(`createRecord HTTP ${resp.status} table="${tableId}" url="${url}": ${body.slice(0, 300)}`);
+    }
     const data = await resp.json() as Record<string, unknown>;
     if ((data as any).code !== 0) {
-      // Log and throw a descriptive error
       const errMsg = JSON.stringify(data).slice(0, 300);
-      console.error(`[worker-bitable] createRecord failed: ${errMsg}`);
-      throw new Error(`Bitable createRecord failed: code=${(data as any).code}`);
+      throw new Error(`Bitable createRecord failed code=${(data as any).code} table="${tableId}": ${errMsg}`);
     }
     const record = (data as any).data?.record;
     return {
