@@ -159,8 +159,22 @@ export class LarkConnection extends DurableObject<Env> {
     }
 
     if (url.pathname === '/executor-result' && request.method === 'POST') {
+      await this.cfgReadyPromise;
       const data = await request.json() as Record<string, unknown>;
-      await this.handleExecutorResult(data);
+      const cfg = this.enrichedCfg ?? this.baseCfg;
+      L.info('lark-connection', 'executorResult', { ticket: data.ticket_id, round: data.round_id, answerLen: String((data.answer as string || '').length) });
+      await this.coordinator.processResult('worker-executor', {
+        ticket_id: data.ticket_id as string,
+        round_id: data.round_id as string | undefined,
+        answer: (data.answer as string) || '',
+        root_msg_id: (data.root_msg_id as string) || '',
+        parts: data.parts as unknown[] | undefined,
+        reassignTo: data.reassignTo as { roles?: string[]; kind?: string } | undefined,
+        streamed: data.streamed as boolean | undefined,
+        newSummary: data.newSummary as string | undefined,
+        duration_ms: data.duration_ms as number | undefined,
+        token_usage: data.token_usage as { input?: number; output?: number } | undefined,
+      });
       return new Response('OK', { status: 200 });
     }
 
