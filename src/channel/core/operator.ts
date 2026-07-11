@@ -78,6 +78,7 @@ export class CoreOperator {
     // New conversation — create ticket and turn
     try {
       const dedupKey = appId ? `${appId}:${messageId}` : messageId;
+      this.log.info(`[core-operator] handleMessage: rootId="${rootId}" appId="${appId}" tables tickets="${this.cfg.ticketsTableId}" turns="${this.cfg.turnsTableId}" rounds="${this.cfg.roundsTableId}"`);
 
       // Dedup check
       const existing = await this.bitable.searchRecords(this.cfg.turnsTableId, {
@@ -93,9 +94,13 @@ export class CoreOperator {
 
       // Create ticket
       const ticket = await this.createTicketDirect(content, messageId, chatId, senderId);
+      this.log.info(`[core-operator] ticket created: id=${ticket.record_id}`);
 
       const recordId = ticket.record_id;
-      if (!recordId) return;
+      if (!recordId) {
+        this.log.warn('[core-operator] ticket created but no record_id');
+        return;
+      }
 
       // Create user turn
       const turnFields: Record<string, unknown> = {
