@@ -563,6 +563,14 @@ export class LarkConnection extends DurableObject<Env> {
     }
   }
 
+  /** Schedule the next round coordination poll (alarm-based). */
+  private async scheduleNextPoll(): Promise<void> {
+    const existing = await this.ctx.storage.getAlarm();
+    if (!existing) {
+      await this.ctx.storage.setAlarm(Date.now() + LarkConnection.POLL_INTERVAL);
+    }
+  }
+
   // ── Outgoing WebSocket to Lark event service ──────────────────────────
 
   /** Connect to Lark's WebSocket event push service.
