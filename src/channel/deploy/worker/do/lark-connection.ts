@@ -432,20 +432,51 @@ export class LarkConnection extends DurableObject<Env> {
         return;
       }
 
-      // Step 3: Register with Hibernation API. After this call the runtime
-      // remembers the WS across hibernations, and incoming messages are
-      // delivered to webSocketMessage() / webSocketClose() instead of
-      // inline event listeners.
-      larkWs.serializeAttachment({ type: 'lark-outbound', connectedAt: Date.now() });
-      this.ctx.acceptWebSocket(larkWs);
+      // Step 3: Use inline event listeners. Client-initiated WebSockets
+      // (new WebSocket) cannot use Hibernation API — they'll reconnect via
+      // alarm on every DO wake.
       this.larkWs = larkWs;
 
-      // Open / error listeners for logging only. Message and close events
-      // are handled by the DO lifecycle methods (webSocketMessage,
-      // webSocketClose) via the Hibernation API.
       larkWs.addEventListener('open', () => {
         console.log('[lark-connection] connected to Lark WS');
       });
+
+      larkWs.addEventListener('message', async (event: MessageEvent) => {
+        const text = typeof event.data === 'string' ? event.data : '';
+        if (!text) return;
+
+        let data: Record<string, unknown>;
+        try { data = JSON.parse(text); } catch { return; }
+
+        if (data.type === 'ping') {
+          larkWs.send(JSON.stringify({ type: 'pong' }));
+          return;
+        }
+        if (data.type === 'pong') return;
+
+        await this.cfgReadyPromise;
+        const packet = (data.event ?? data) as Record<string, unknown>;
+        if (!packet || typeof packet !== 'object') return;
+        const header = packet.header as Record<string, unknown> | undefined;
+        const eventType = header?.event_type as string | undefined;
+
+        if (eventType === 'im.message.receive_v1') {
+          await this.handleImMessage(packet);
+        } else if (eventType === 'drive.file.bitable_record_changed_v1') {
+          await this.handleBitableEvent(packet);
+        } else if (eventType === 'card.action.trigger') {
+          await this.handleCardAction(packet);
+        } else {
+          console.debug(`[lark-connection] unhandled event: ${eventType || text.slice(0, 100)}`);
+        }
+      });
+
+      larkWs.addEventListener('close', (event: CloseEvent) => {
+        console.log(`[lark-connection] Lark WS closed (code=${event.code})`);
+        this.larkWs = null;
+        this.scheduleReconnect();
+      });
+
       larkWs.addEventListener('error', () => {
         console.warn('[lark-connection] Lark WS error');
       });

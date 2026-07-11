@@ -238,7 +238,26 @@ export class ExecutorPool extends DurableObject<Env> {
       session_token: `session_${identity}_${Date.now()}`,
     }));
 
+    // Ensure LarkConnection DO is initialized to receive events
+    this.warmupLarkConnection();
+
     console.log(`[executor-pool] executor authenticated: ${identity} domains=[${domains.join(',')}]`);
+  }
+
+  /** Hand off to reauth handler (also warms up Lark). */
+  private async afterAuthWarmup(): Promise<void> {
+    this.warmupLarkConnection();
+  }
+
+  // ── Lark connection warmup ──────────────────────────────────────────────
+
+  /** Fire a request to the LarkConnection DO so it initializes and connects
+   *  to the Lark event WebSocket. Called after an executor authenticates. */
+  private warmupLarkConnection(): void {
+    try {
+      const id = this.env.LARK_CONNECTION.idFromName(this.env.LARK_APP_ID);
+      id.fetch(new Request('http://do/__warmup')).catch(() => {});
+    } catch { /* best effort */ }
   }
 
   /** Handle re-authentication with existing session token. */
