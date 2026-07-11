@@ -16,6 +16,7 @@ import {
 import type { Env } from './index.js';
 import type { Config } from '../../../lib/types.js';
 import type { BitableAdapter } from '../../core/types.js';
+import { extractText } from '../../../lib/messaging/text.js';
 
 // ---- Configs table loading (runtime config overrides) --------------------
 
@@ -72,33 +73,13 @@ async function loadConfigRows(
     console.log(`[worker-config] Configs table sample: ${JSON.stringify(sample.fields).slice(0, 300)}`);
   }
   return records
-    .map(r => {
-      /** Extract text from a Bitable field value which can be:
-       *  - a plain string: "channel"
-       *  - an array of {text, type}: [{"text":"channel","type":"text"}]
-       *  - an object {text, type}: {"text":"channel","type":"text"} */
-      const v = (f: string) => {
-        const raw = r.fields[f];
-        if (raw == null) return '';
-        if (typeof raw === 'string') return raw;
-        // Array format: [{text:"...", type:"..."}]
-        if (Array.isArray(raw) && raw.length > 0 && typeof raw[0] === 'object' && 'text' in raw[0]) {
-          return String(raw[0].text ?? '');
-        }
-        // Object format: {text:"...", type:"..."}
-        if (typeof raw === 'object' && 'text' in (raw as any)) return String((raw as any).text ?? '');
-        // Single select: {text:"...", option_id:"...", option_name:"..."}
-        if (typeof raw === 'object' && 'option_name' in (raw as any)) return String((raw as any).option_name);
-        return String(raw);
-      };
-      return {
-        section: v('section') || '',
-        key: v('key') || '',
-        value: v('value') || '',
-        default: v('default') || '',
-        type: v('type') || '',
-      };
-    })
+    .map(r => ({
+      section: extractText(r.fields['section']),
+      key: extractText(r.fields['key']),
+      value: extractText(r.fields['value']),
+      default: extractText(r.fields['default']),
+      type: extractText(r.fields['type']),
+    }))
     .filter(r => r.section && r.key);
 }
 

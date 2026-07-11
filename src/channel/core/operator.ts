@@ -63,6 +63,9 @@ export class CoreOperator {
 
     this.log.info(`[core-operator] message from ${senderId}: ${content.slice(0, 60)} (op=${appId || 'primary'})`);
 
+    // Acknowledge receipt with OneSecond emoji
+    try { await this.feishu.react(messageId, 'OneSecond'); } catch { /* best effort */ }
+
     // Ensure human roster record exists
     await this.ensureHumanRoster(senderId, senderUnionId);
 

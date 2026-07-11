@@ -10,6 +10,17 @@
 
 import type { Env } from '../index.js';
 import type { BitableAdapter, TicketRecord } from '../../../core/types.js';
+import { extractText } from '../../../../lib/messaging/text.js';
+
+/** Normalize all field values in a record using shared extractText. */
+function normalizeRecord(record: TicketRecord): TicketRecord {
+  if (!record.fields) return record;
+  const fields: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(record.fields)) {
+    fields[key] = extractText(val);
+  }
+  return { record_id: record.record_id, fields };
+}
 
 /** Base URL for Lark Open API. */
 function baseUrl(env: Env): string {
@@ -81,10 +92,10 @@ export class WorkerBitableAdapter implements BitableAdapter {
     }
     const record = (data as any).data?.record;
     if (!record) return null;
-    return {
+    return normalizeRecord({
       record_id: record.record_id as string,
       fields: record.fields as Record<string, unknown>,
-    };
+    });
   }
 
   async createRecord(
@@ -113,10 +124,10 @@ export class WorkerBitableAdapter implements BitableAdapter {
       throw new Error(`Bitable createRecord failed code=${(data as any).code} table="${tableId}": ${errMsg}`);
     }
     const record = (data as any).data?.record;
-    return {
+    return normalizeRecord({
       record_id: record?.record_id as string,
       fields: record?.fields as Record<string, unknown> ?? fields,
-    };
+    });
   }
 
   async updateRecord(
@@ -170,7 +181,7 @@ export class WorkerBitableAdapter implements BitableAdapter {
       const data = await searchResp.json() as Record<string, unknown>;
       if ((data as any).code === 0) {
         const items = (data as any).data?.items ?? [];
-        return items.map((r: any) => ({
+        return items.map((r: any) => normalizeRecord({
           record_id: r.record_id as string,
           fields: r.fields as Record<string, unknown>,
         }));
@@ -193,10 +204,10 @@ export class WorkerBitableAdapter implements BitableAdapter {
 
       const items = (data as any).data?.items ?? [];
       for (const item of items) {
-        const record = {
+        const record = normalizeRecord({
           record_id: item.record_id as string,
           fields: item.fields as Record<string, unknown>,
-        };
+        });
 
         // Apply client-side filtering
         if (this.matchesFilter(record, filter)) {
