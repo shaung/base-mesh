@@ -21,6 +21,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../index.js';
 import { CoreCoordinator } from '../../../core/coordinator.js';
+import { CoreOperator } from '../../../core/operator.js';
 import { WorkerBitableAdapter } from '../adapters/bitable.js';
 import { WorkerLarkAdapter } from '../adapters/lark.js';
 import { WorkerSessionAdapter } from '../session-adapter.js';
@@ -47,6 +48,8 @@ export class LarkConnection extends DurableObject<Env> {
 
   /** CoreCoordinator instance for round processing and result handling. */
   private coordinator: CoreCoordinator;
+  /** CoreOperator instance for IM message processing. */
+  private operator: CoreOperator;
 
   /** Base config from env vars (always available, synchronous). */
   private baseCfg: Config;
@@ -98,6 +101,7 @@ export class LarkConnection extends DurableObject<Env> {
     const feishu = new WorkerLarkAdapter(this.env);
     const sessionAdapter = new WorkerSessionAdapter(bitable, cfg);
     const executorPool = new DOExecutorPool(this.env);
+    this.operator = new CoreOperator(sessionAdapter, feishu, bitable, cfg, console);
     return new CoreCoordinator(sessionAdapter, executorPool, feishu, cfg, console);
   }
 
@@ -281,9 +285,43 @@ export class LarkConnection extends DurableObject<Env> {
 
   // ── Event handlers ─────────────────────────────────────────────────────
 
-  private async handleImMessage(event: Record<string, unknown>): Promise<void> {
-    const eventType = (event.header as Record<string, unknown> | undefined)?.event_type as string ?? 'im.message.receive_v1';
-    console.log(`[lark-connection] ${eventType} — IM message handling pending operator core`);
+  private async handleImMessage(eventBody: Record<string, unknown>): Promise<void> {
+    const { message, sender } = eventBody as { message?: Record<string, unknown>; sender?: Record<string, unknown> };
+    if (!message || !sender || !message.content) return;
+
+    // Parse message content to plain text
+    const content = parseMessageToText(message);
+    if (!content) return;
+
+    const messageId = String(message.message_id ?? '');
+    const chatType = String(message.chat_type ?? '');
+
+    // Construct the parsed event for CoreOperator
+    const parsedEvent = {
+      content,
+      parts: [],
+      message: {
+        message_id: messageId,
+        message_type: String(message.message_type ?? 'text') as any,
+        content: String(message.content ?? ''),
+        chat_type: chatType as any,
+        chat_id: String(message.chat_id ?? ''),
+        root_id: message.root_id as string | undefined,
+        parent_id: message.parent_id as string | undefined,
+        mentions: (message.mentions || []) as any[],
+      },
+      sender: {
+        sender_type: String(sender.sender_type ?? 'user') as any,
+        sender_id: {
+          open_id: String((sender.sender_id as any)?.open_id ?? ''),
+          union_id: (sender.sender_id as any)?.union_id as string | undefined,
+        },
+      },
+      appId: this.env.LARK_APP_ID,
+      botMentioned: false,
+    };
+
+    await this.operator.handleMessage(parsedEvent);
   }
 
   private async handleBitableEvent(event: Record<string, unknown>): Promise<void> {
@@ -625,4 +663,56 @@ export class LarkConnection extends DurableObject<Env> {
       await this.scheduleReconnect();
     }
   }
+}
+
+// ---- Message parsing helpers -----------------------------------------------
+
+/** Extract plain text from a Lark IM message event. */
+function parseMessageToText(msg: Record<string, unknown>): string {
+  const msgType = String(msg.message_type ?? '');
+  const rawContent = String(msg.content ?? '');
+
+  if (msgType === 'text') {
+    try {
+      const parsed = JSON.parse(rawContent);
+      return (parsed.text ?? rawContent).replace(/@_user_\d+/g, '').trim();
+    } catch {
+      return rawContent.replace(/@_user_\d+/g, '').trim();
+    }
+  }
+
+  if (msgType === 'post') {
+    try {
+      const parsed = JSON.parse(rawContent);
+      const section = parsed.content ? parsed : Object.values(parsed)[0] as any;
+      if (!section?.content) return '';
+      const lines: string[] = [];
+      for (const para of section.content) {
+        if (!Array.isArray(para)) { lines.push(''); continue; }
+        const parts = para.map((e: any) => {
+          if (e.tag === 'text') return e.text ?? '';
+          if (e.tag === 'a') return e.text ?? e.href ?? '';
+          if (e.tag === 'at') return `@${e.user_name ?? 'user'}`;
+          return '';
+        });
+        lines.push(parts.filter(Boolean).join(''));
+      }
+      return lines.join('\n\n').trim();
+    } catch { return ''; }
+  }
+
+  if (msgType === 'interactive') {
+    try {
+      const parsed = JSON.parse(rawContent);
+      const elements: any[] = parsed?.body?.elements ?? parsed?.elements ?? [];
+      return elements
+        .filter((e: any) => e.tag === 'markdown' || e.tag === 'div')
+        .map((e: any) => e.content || e.text?.content || '')
+        .filter(Boolean)
+        .join('\n\n')
+        .trim();
+    } catch { return ''; }
+  }
+
+  return '';
 }
