@@ -721,6 +721,8 @@ export class LarkConnection extends DurableObject<Env> {
       console.error('[lark-connection] connectToLark failed:', err);
       await this.scheduleReconnect();
     }
+  }
+
   // ── Streaming card handlers ───────────────────────────────────────────
 
   private streamState = new Map<string, { cardId: string; seq: number; think: string; answer: string }>();
@@ -814,6 +816,17 @@ export class LarkConnection extends DurableObject<Env> {
       return d.tenant_access_token || null;
     } catch { return null; }
   }
+}
+
+// ---- Message parsing helpers -----------------------------------------------
+
+/** Extract plain text from a Lark IM message event. */
+function parseMessageToText(msg: Record<string, unknown>): string {
+  const msgType = String(msg.message_type ?? '');
+  const rawContent = String(msg.content ?? '');
+
+
+}
 }
 
 // ---- Message parsing helpers -----------------------------------------------
