@@ -61,9 +61,6 @@ export class CoreOperator {
 
     if (!content || !messageId) return;
 
-    // Acknowledge receipt with OneSecond emoji
-    try { await this.feishu.react(messageId, 'OneSecond'); } catch { /* best effort */ }
-
     // Ensure human roster record exists
     await this.ensureHumanRoster(senderId, senderUnionId);
 
@@ -89,6 +86,9 @@ export class CoreOperator {
         this.log.info(`[core-operator] dedup msg already processed`);
         return;
       }
+
+      // Acknowledge receipt — only for new (non-duplicate) messages
+      try { await this.feishu.react(messageId, 'OneSecond'); } catch { /* best effort */ }
 
       // Create ticket
       let ticket: TicketRecord;
