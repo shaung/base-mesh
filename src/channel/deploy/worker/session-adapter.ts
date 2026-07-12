@@ -80,13 +80,27 @@ export class WorkerSessionAdapter implements SessionAdapter {
     return active.length > 0 ? active[active.length - 1] : null;
   }
 
-  async claimRound(round: RoundRecord, identity: string): Promise<boolean> {
+  async claimRound(round: RoundRecord, identity: string, nextStatus?: string): Promise<boolean> {
     const roundId = round.record_id;
     if (!roundId || !this.cfg.roundsTableId) return false;
+    // Only claim if round is still in a claimable state. This prevents
+    // re-dispatching a round that was already claimed by a previous cycle
+    // but whose status write hadn't propagated yet.
     try {
-      await this.bitable.updateRecord(this.cfg.roundsTableId, roundId, {
+      const current = await this.getRound(roundId);
+      if (!current) return false;
+      const curStatus = String(current.fields[rfRound(this.cfg).status] ?? '');
+      const claimable = [this.cfg.roundStatuses.pending, this.cfg.roundStatuses.approved];
+      if (!claimable.includes(curStatus)) return false;
+    } catch {
+      return false;
+    }
+    try {
+      const fields: Record<string, unknown> = {
         [rfRound(this.cfg).executor]: identity,
-      });
+      };
+      if (nextStatus) fields[rfRound(this.cfg).status] = nextStatus;
+      await this.bitable.updateRecord(this.cfg.roundsTableId, roundId, fields);
     } catch {
       return false;
     }

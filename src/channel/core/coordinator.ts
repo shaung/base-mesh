@@ -21,54 +21,7 @@ import type {
 } from './types.js';
 import type { Config } from '../../lib/types.js';
 
-// ---- Helpers ---------------------------------------------------------------
-
-/** Parse the JSON `domains` field from a Round record. Returns empty array if unset or malformed. */
-function parseDomains(v: unknown): string[] {
-  if (!v) return [];
-  try {
-    const parsed = JSON.parse(String(v));
-    return Array.isArray(parsed) ? parsed.map(String) : [];
-  } catch {
-    return [];
-  }
-}
-
-/** Find the latest user turn's message ID from the turns list.
- *  Handles dedupKey formats: "messageId" (legacy) or "appId:messageId" (multi-operator). */
-function latestTurnMessageId(
-  turns: TicketRecord[],
-  roleField: string,
-  dedupKeyField: string,
-): string {
-  for (let i = turns.length - 1; i >= 0; i--) {
-    const role = String(turns[i].fields[roleField] ?? '');
-    if (role === 'user') {
-      const raw = String(turns[i].fields[dedupKeyField] ?? '');
-      if (!raw) return '';
-      const colonIdx = raw.indexOf(':');
-      return colonIdx > 0 ? raw.slice(colonIdx + 1) : raw;
-    }
-  }
-  return '';
-}
-
-/** Extract the appId from a turn's appId field or dedupKey prefix. */
-function extractAppIdFromTurn(turn: TicketRecord, appIdField: string, dedupKeyField: string): string | undefined {
-  const fieldVal = String(turn.fields[appIdField] ?? '');
-  if (fieldVal) return fieldVal;
-  const dedupKey = String(turn.fields[dedupKeyField] ?? '');
-  if (dedupKey) {
-    const colonIdx = dedupKey.indexOf(':');
-    if (colonIdx > 0) return dedupKey.slice(0, colonIdx);
-  }
-  return undefined;
-}
-
-/** Extract the identity from an executor field value (strips prefix like "RETRY:"). */
-function parseExecutorIdentity(v: string): string {
-  return v.includes('#') ? v.split('#').pop()! : v;
-}
+import { parseDomains, latestTurnMessageId, extractAppIdFromTurn, parseExecutorIdentity } from './helpers.js';
 
 // =============================================================================
 // CoreCoordinator
@@ -84,13 +37,28 @@ export class CoreCoordinator {
   private streamThinkingAccumulated = new Map<string, string>();
   private streamAnswerAccumulated = new Map<string, string>();
 
+  /** Per-operator adapters keyed by appId (for multi-credential IM replies). */
+  private feishuMap = new Map<string, FeishuAdapter>();
+
   constructor(
     private session: SessionAdapter,
     private executorPool: ExecutorPoolInterface,
     private feishu: FeishuAdapter,
     private cfg: Config,
     private log: Logger,
-  ) {}
+    operatorFeishus?: Map<string, FeishuAdapter>,
+  ) {
+    if (operatorFeishus) this.feishuMap = operatorFeishus;
+  }
+
+  /** Get the FeishuAdapter for a given appId, falling back to the primary adapter. */
+  private getFeishu(appId?: string): FeishuAdapter {
+    if (appId) {
+      const op = this.feishuMap.get(appId);
+      if (op) return op;
+    }
+    return this.feishu;
+  }
 
   // ===========================================================================
   // Round state machine
@@ -173,6 +141,17 @@ export class CoreCoordinator {
 
     const ticketId = String(round.fields[this.cfg.fields.round.ticketRecordId] ?? '');
     if (!ticketId) return;
+
+    // Re-read round to confirm it's still pending — a previous cycle or
+    // bitable event may have already advanced it.
+    const fresh = await this.session.getRound(roundId);
+    if (!fresh) return;
+    const curStatus = String(fresh.fields[this.cfg.fields.round.status] ?? '');
+    if (curStatus !== this.cfg.roundStatuses.pending) {
+      this.log.info(`[core-coordinator] round ${roundId} skip: status=${curStatus} (no longer pending)`);
+      return;
+    }
+
     const ticket = await this.session.getTicket(ticketId);
     if (!ticket) return;
 
@@ -261,7 +240,7 @@ export class CoreCoordinator {
       const available = await this.executorPool.getAvailableExecutors(requiredDomains);
       const matched = available.find(e => e.identity === lastOwnerIdentity && !e.activeTicketId);
       if (matched) {
-        const won = await this.session.claimRound(round, matched.identity);
+        const won = await this.session.claimRound(round, matched.identity, this.cfg.roundStatuses.executing);
         if (won) {
           this.dispatchRoundToExecutor(matched, round, ticket);
           return;
@@ -274,7 +253,7 @@ export class CoreCoordinator {
     this.log.info(`[core-coordinator] assignRoundToExecutor: ${available.length} candidates for round ${roundId}`);
     for (const ex of available) {
       if (ex.identity === lastOwnerIdentity) continue;
-      const won = await this.session.claimRound(round, ex.identity);
+      const won = await this.session.claimRound(round, ex.identity, this.cfg.roundStatuses.executing);
       if (!won) { this.log.info(`[core-coordinator] claimRound lost for ${ex.identity}`); continue; }
       this.dispatchRoundToExecutor(ex, round, ticket);
       return;
@@ -294,13 +273,13 @@ export class CoreCoordinator {
         const matcher = new PrefixMatcher();
         if (!matcher.matches(requiredDomains, domains)) continue;
       }
-      const won = await this.session.claimRound(round, identity);
+      const won = await this.session.claimRound(round, identity, this.cfg.roundStatuses.executing);
       if (!won) continue;
       const ticketId = String(round.fields[this.cfg.fields.round.ticketRecordId] ?? '');
       if (!ticketId) continue;
       const ticket = await this.session.getTicket(ticketId);
       if (!ticket) continue;
-      this.log.info(`[core-coordinator] assigned pending round ${round.record_id!} to ${identity}`);
+      this.dispatchRoundToExecutor({ identity, domains, activeTicketId: undefined, connected: true, lastHeartbeat: Date.now() }, round, ticket);
       return;
     }
   }
@@ -314,8 +293,7 @@ export class CoreCoordinator {
     const recordId = ticket.record_id;
     if (!recordId) return;
 
-    // Transition Round to executing
-    await this.session.transitionRound(round.record_id!, this.cfg.roundStatuses.executing);
+    // Status already set to executing by claimRound, no extra transition needed.
 
     const turns = await this.session.getTurns(recordId);
     const supplementPrompt = String(round.fields[this.cfg.fields.round.supplementPrompt] ?? '');
@@ -513,19 +491,28 @@ export class CoreCoordinator {
 
     this.log.info(`[core-coordinator] result from ${identity} ticket=${ticketId} rootMsgId=${rootMsgId || '(empty)'} streamed=${!!streamed} answer=${(answer || '').slice(0, 60)}`);
 
+    // Resolve appId from round for multi-operator IM routing
+    let resultAppId: string | undefined;
+    if (roundId && this.cfg.roundsTableId) {
+      try {
+        const round = await this.session.getRound(roundId);
+        if (round) resultAppId = String(round.fields[this.cfg.fields.round.appId] ?? '') || undefined;
+      } catch { /* ignore */ }
+    }
+
     // Write agent turn
     try {
       const agentDedupKey = `${ticketId}_${Date.now()}`;
       const turnId = await this.session.appendTurn(
         ticketId, 'agent', answer, agentDedupKey, identity,
-        'answered', rootMsgId, roundId, parts, 1,
+        'answered', rootMsgId, roundId, parts, 1, resultAppId,
       );
       this.log.info(`[core-coordinator] agent turn written ticket=${ticketId} turnId=${turnId}`);
 
       // Direct IM delivery for non-streamed results
       if (answer && rootMsgId && !streamed) {
         try {
-          await this.feishu.reply(rootMsgId, answer, true);
+          await this.getFeishu(resultAppId).reply(rootMsgId, answer, true);
         } catch (imErr) {
           this.log.error('[core-coordinator] direct IM delivery failed:', imErr);
         }
@@ -535,8 +522,11 @@ export class CoreCoordinator {
     }
 
     // Record lastOwner for future affinity routing
+    // Note: In Node, session.release handles lastOwner. In Worker, release only
+    // updates status — the executor field on the Round serves as the affinity
+    // record. Both deployments get equivalent affinity behavior.
     try {
-      await this.session.release(ticketId, this.cfg.statuses.active); // minimal update
+      await this.session.release(ticketId, this.cfg.statuses.active);
     } catch { /* best effort */ }
 
     // Update ticket status
@@ -607,19 +597,24 @@ export class CoreCoordinator {
     }
 
     const s = this.streamingCards.get(cardKey);
-    if (s) {
-      if (contentType === 'thinking') {
-        const display = '> ' + content.replace(/\n/g, '\n> ');
-        const prev = this.streamThinkingAccumulated.get(cardKey) || '';
-        const sep = prev && !prev.endsWith('\n') ? '\n' : '';
-        const full = prev + sep + display;
-        this.streamThinkingAccumulated.set(cardKey, full);
-      } else {
-        const prev = this.streamAnswerAccumulated.get(cardKey) || '';
-        const sep = prev && !prev.endsWith('\n') ? '\n' : '';
-        const full = prev + sep + content;
-        this.streamAnswerAccumulated.set(cardKey, full);
-      }
+    if (!s || !s.cardId) return;
+
+    const feishu = this.getFeishu(streamAppId);
+    if (contentType === 'thinking') {
+      const display = '> ' + content.replace(/\n/g, '\n> ');
+      const prev = this.streamThinkingAccumulated.get(cardKey) || '';
+      const sep = prev && !prev.endsWith('\n') ? '\n' : '';
+      const full = prev + sep + display;
+      this.streamThinkingAccumulated.set(cardKey, full);
+      s.seq++;
+      try { await feishu.updateCardElement!(s.cardId, 'stream_thinking', full, s.seq, `st_${s.cardId}_${s.seq}`); } catch {}
+    } else {
+      const prev = this.streamAnswerAccumulated.get(cardKey) || '';
+      const sep = prev && !prev.endsWith('\n') ? '\n' : '';
+      const full = prev + sep + content;
+      this.streamAnswerAccumulated.set(cardKey, full);
+      s.seq++;
+      try { await feishu.updateCardElement!(s.cardId, 'stream_answer', full, s.seq, `sa_${s.cardId}_${s.seq}`); } catch {}
     }
   }
 
@@ -631,40 +626,115 @@ export class CoreCoordinator {
     const cardKey = roundId || ticketId;
 
     const s = this.streamingCards.get(cardKey);
-    if (s && s.cardId) {
+    if (!s) { this.streamBuffer.delete(cardKey); return; }
+
+    // Card creation still in progress — buffer end content
+    if (!s.cardId && this.streamBuffer.has(cardKey)) {
+      this.streamBuffer.get(cardKey)!.push({ content, type: 'message' });
+      return;
+    }
+
+    if (s.cardId) {
+      const feishu = this.getFeishu(s.appId);
       const thinkingContent = this.streamThinkingAccumulated.get(cardKey) || '';
       const answerContent = this.streamAnswerAccumulated.get(cardKey) || content;
 
-      // Reset streaming state for next iteration
-      this.streamingCards.delete(cardKey);
-      this.streamThinkingAccumulated.delete(cardKey);
-      this.streamAnswerAccumulated.delete(cardKey);
+      // Finalize both elements
+      if (thinkingContent) {
+        s.seq++;
+        try { await feishu.updateCardElement!(s.cardId, 'stream_thinking', thinkingContent, s.seq, `ft_${s.cardId}_${s.seq}`); } catch {}
+      }
+      if (answerContent) {
+        s.seq++;
+        try { await feishu.updateCardElement!(s.cardId, 'stream_answer', answerContent, s.seq, `fa_${s.cardId}_${s.seq}`); } catch {}
+      }
+
+      // Stats line
+      const statsParts: string[] = [];
+      if (tokenUsage) {
+        const total = (tokenUsage.input || 0) + (tokenUsage.output || 0);
+        if (total > 0) statsParts.push(`⚡ ${total.toLocaleString()} tokens`);
+      }
+      if (durationMs && durationMs > 100) {
+        statsParts.push(`${(durationMs / 1000).toFixed(1)}s`);
+      }
+      if (statsParts.length > 0) {
+        s.seq++;
+        try { await feishu.updateCardElement!(s.cardId, 'stream_stats', `— *${statsParts.join(' · ')}* —`, s.seq, `ss_${s.cardId}_${s.seq}`); } catch {}
+      }
+
+      // Disable streaming mode
+      const summary = (answerContent || thinkingContent).slice(0, 50) || '[Done]';
+      s.seq++;
+      try { await feishu.disableStreamingMode!(s.cardId, s.seq, summary, `c_${s.cardId}_${s.seq}`); } catch {}
     }
+
+    // Cleanup
+    this.streamingCards.delete(cardKey);
+    this.streamThinkingAccumulated.delete(cardKey);
+    this.streamAnswerAccumulated.delete(cardKey);
     this.streamBuffer.delete(cardKey);
   }
 
-  /** Create a new streaming card in Lark IM. */
+  /** Create a new streaming card in Lark IM. Buffers content during creation. */
   private async initializeStreamCard(
     cardKey: string,
     rootMsgId: string,
     initialContent: string,
     contentType: string,
-    _appId?: string,
+    appId?: string,
   ): Promise<void> {
-    // Buffer the initial content
     const buf = this.streamBuffer.get(cardKey) || [];
     buf.push({ content: initialContent, type: contentType });
     this.streamBuffer.set(cardKey, buf);
-
     if (buf.length > 1) return;
 
-    this.streamingCards.set(cardKey, { cardId: '', seq: 0, appId: _appId });
+    this.streamingCards.set(cardKey, { cardId: '', seq: 0, appId });
+    const feishu = this.getFeishu(appId);
 
     try {
-      // Streaming cards require the Lark CardKit API (available in Workers via fetch).
-      // For now, set a placeholder so stream_end can find us.
-      this.log.info(`[core-coordinator] stream initialized for ${cardKey}`);
+      const cardSpec = {
+        schema: '2.0',
+        config: { streaming_mode: true, summary: { content: '[Generating...]' }, streaming_config: { print_frequency_ms: { default: 70 }, print_step: { default: 1 }, print_strategy: 'fast' } },
+        body: { elements: [
+          { tag: 'markdown', element_id: 'stream_thinking', content: '', text_size: 'text_size_note' },
+          { tag: 'markdown', element_id: 'stream_answer', content: '...' },
+          { tag: 'markdown', element_id: 'stream_stats', content: '', text_size: 'body' },
+        ] },
+      };
+      const cardId = await feishu.createStreamingCard!(cardSpec, rootMsgId, true);
+      if (!cardId) { this.streamingCards.delete(cardKey); this.streamBuffer.delete(cardKey); return; }
+
+      const st = this.streamingCards.get(cardKey);
+      if (st) st.cardId = cardId;
+
+      // Flush buffered content
+      const pending = this.streamBuffer.get(cardKey) || [];
+      this.streamBuffer.delete(cardKey);
+      let thinkingFull = '';
+      let answerFull = '';
+      for (const chunk of pending) {
+        if (chunk.type === 'thinking') {
+          const sep = thinkingFull ? '\n' : '';
+          thinkingFull += sep + '> ' + chunk.content.replace(/\n/g, '\n> ');
+        } else {
+          const sep = answerFull ? '\n' : '';
+          answerFull += sep + chunk.content;
+        }
+      }
+      const st2 = this.streamingCards.get(cardKey);
+      if (thinkingFull && st2) {
+        st2.seq++;
+        try { await feishu.updateCardElement!(cardId, 'stream_thinking', thinkingFull, st2.seq, `t_${cardId}_${st2.seq}`); } catch {}
+      }
+      if (answerFull && st2) {
+        st2.seq++;
+        try { await feishu.updateCardElement!(cardId, 'stream_answer', answerFull, st2.seq, `a_${cardId}_${st2.seq}`); } catch {}
+      }
+      this.streamThinkingAccumulated.set(cardKey, thinkingFull);
+      this.streamAnswerAccumulated.set(cardKey, answerFull);
     } catch {
+      this.streamingCards.delete(cardKey);
       this.streamBuffer.delete(cardKey);
     }
   }

@@ -39,7 +39,23 @@ export interface BitableAdapter {
 
 // ---- Feishu IM operations -------------------------------------------------
 
-export interface FeishuAdapter {
+/** App credentials for a Lark bot (used for multi-operator support). */
+export interface FeishuCredentials {
+  appId: string;
+  appSecret?: string;
+}
+
+/** CardKit streaming card operations. */
+export interface CardKitAdapter {
+  /** Create a streaming card and reply it to an IM message. Returns cardId. */
+  createStreamingCard(cardSpec: object, rootMsgId: string, replyInThread?: boolean): Promise<string | null>;
+  /** Update a card element's content (PUT /content — streaming text update). */
+  updateCardElement(cardId: string, elementId: string, content: string, seq: number, uuid: string): Promise<void>;
+  /** Disable streaming mode on a card (PATCH /settings). */
+  disableStreamingMode(cardId: string, seq: number, summary: string, uuid: string): Promise<void>;
+}
+
+export interface FeishuAdapter extends Partial<CardKitAdapter> {
   reply(messageId: string, content: string, replyInThread?: boolean, msgType?: 'interactive' | 'text'): Promise<void>;
   react(messageId: string, emojiType: string): Promise<void>;
   removeReaction(messageId: string, emojiType: string): Promise<void>;
@@ -73,7 +89,7 @@ export interface SessionAdapter {
   getRound(roundId: string): Promise<RoundRecord | null>;
   getCurrentRound(ticketId: string): Promise<RoundRecord | null>;
 
-  claimRound(round: RoundRecord, identity: string): Promise<boolean>;
+  claimRound(round: RoundRecord, identity: string, nextStatus?: string): Promise<boolean>;
   releaseRound(roundId: string): Promise<void>;
   claim(ticket: TicketRecord): Promise<boolean>;
   release(ticketId: string, newStatus: string): Promise<void>;

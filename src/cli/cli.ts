@@ -174,7 +174,7 @@ export async function main(): Promise<void> {
     await ensureSetup(profile);
     const cfg = loadConfig(profile);
     validateConfig(cfg);
-    const { Channel } = await import('../channel/channel.js');
+    const { Channel } = await import('../channel/deploy/node/channel.js');
     await new Channel(cfg, true).run();
     return;
   }
@@ -185,7 +185,8 @@ export async function main(): Promise<void> {
     await ensureSetup(profile);
     const cfg = loadConfig(profile);
     validateConfig(cfg);
-    const { Coordinator } = await import('../channel/coordinator.js');
+    const mod = await import('../channel/deploy/node/coordinator.js');
+    const Coordinator = mod.NodeCoordinator;
     new Coordinator(cfg).start();
     await new Promise(() => {});
   }
@@ -200,7 +201,7 @@ export async function main(): Promise<void> {
     validateConfig(cfg);
 
     const lite = process.argv.includes('--lite');
-    const { Channel } = await import('../channel/channel.js');
+    const { Channel } = await import('../channel/deploy/node/channel.js');
     await new Channel(cfg, lite).run();
     return;
   }
@@ -212,7 +213,7 @@ export async function main(): Promise<void> {
     const cfg = loadConfig(profile);
     validateConfig(cfg);
 
-    const { Channel } = await import('../channel/channel.js');
+    const { Channel } = await import('../channel/deploy/node/channel.js');
     const channel = new Channel(cfg);
     await channel.run();
     return;

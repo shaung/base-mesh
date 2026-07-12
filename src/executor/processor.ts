@@ -349,10 +349,10 @@ export class KekkaiProcessor implements Processor {
         logLine(ev as any);
         if (ev.type === 'message') {
           ctx.onStream?.((ev as any).content ?? '', 'message');
-          console.log(`[processor]  message: ${(ev as any).content?.slice(0, 200)}`);
+          console.log(`[processor]  message: ${((ev as any).content ?? '').slice(0, 200)}`);
         } else if (ev.type === 'thinking') {
           ctx.onStream?.((ev as any).content ?? '', 'thinking');
-          console.log(`[processor]  thinking: ${(ev as any).content?.slice(0, 100)}`);
+          console.log(`[processor]  thinking: ${((ev as any).content ?? '').slice(0, 100)}`);
         } else if (ev.type === 'tool_use') {
           console.log(`[processor]  tool_use: ${(ev as any).tool}`);
         } else if (ev.type === 'tool_result') {
@@ -396,13 +396,20 @@ export class KekkaiProcessor implements Processor {
       // Schema validation (same as Kekkai.run())
       if (OUTPUT_SCHEMA && result.output && result.status === 'completed') {
         const { tryParseLooseJson, validateSchema } = await import('@typooo/kekkai');
-        const parsed = tryParseLooseJson(result.output);
+        const parsed = tryParseLooseJson(result.output) as Record<string, unknown> | null;
         if (parsed === null) {
           result.error = 'Output is not valid JSON';
         } else {
           const validationError = validateSchema(OUTPUT_SCHEMA, parsed);
           if (validationError) {
             result.error = validationError;
+            // Opencode often wraps valid JSON in markdown fences — Kekkai
+            // may set hasStructured=false but the content IS valid. Try
+            // extracting the answer directly from the parsed JSON anyway.
+            if (typeof parsed.answer === 'string' && parsed.answer) {
+              result.structured = parsed;
+              result.error = undefined;
+            }
           } else {
             result.structured = parsed;
           }

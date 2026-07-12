@@ -31,6 +31,7 @@ import { decodeFrame, FRAME_DATA, HEADER_TYPE, HEADER_MESSAGE_ID, HEADER_SUM, HE
 import type { DecodedFrame } from '../lark-ws-protocol.js';
 import type { Config } from '../../../lib/types.js';
 import { log as L } from '../logger.js';
+import { parseMessageToText } from '../../../core/message-parser.js';
 
 // ---- Attachment types stored on hibernated WebSockets ---------------------
 
@@ -51,6 +52,9 @@ export class LarkConnection extends DurableObject<Env> {
   private coordinator: CoreCoordinator;
   /** CoreOperator instance for IM message processing. */
   private operator: CoreOperator;
+
+  /** WorkerLarkAdapter for cached token and IM operations. */
+  private feishu: WorkerLarkAdapter;
 
   /** Base config from env vars (always available, synchronous). */
   private baseCfg: Config;
@@ -86,6 +90,9 @@ export class LarkConnection extends DurableObject<Env> {
     // Build base config from env vars (synchronous, no IO).
     this.baseCfg = buildWorkerConfig(env);
 
+    // Create the shared Lark adapter early so streaming handlers have it.
+    this.feishu = new WorkerLarkAdapter(this.env);
+
     // Create a temporary coordinator with the base config. It may be
     // upgraded to an enriched config once loadAndCacheConfig() completes.
     this.coordinator = this.buildCoordinator(this.baseCfg);
@@ -99,11 +106,20 @@ export class LarkConnection extends DurableObject<Env> {
 
   private buildCoordinator(cfg: Config): CoreCoordinator {
     const bitable = new WorkerBitableAdapter(this.env);
-    const feishu = new WorkerLarkAdapter(this.env);
     const sessionAdapter = new WorkerSessionAdapter(bitable, cfg);
     const executorPool = new DOExecutorPool(this.env);
-    this.operator = new CoreOperator(sessionAdapter, feishu, bitable, cfg, console);
-    return new CoreCoordinator(sessionAdapter, executorPool, feishu, cfg, console);
+    this.operator = new CoreOperator(sessionAdapter, this.feishu, bitable, cfg, console);
+    // Build per-operator adapters for multi-credential IM replies
+    const operatorFeishus = new Map<string, WorkerLarkAdapter>();
+    if (cfg.operators) {
+      const domain = cfg.openApiDomain || 'open.larksuite.com';
+      for (const op of cfg.operators) {
+        if (op.appId && op.appSecret && op.appId !== cfg.appId && !operatorFeishus.has(op.appId)) {
+          operatorFeishus.set(op.appId, new WorkerLarkAdapter({ appId: op.appId, appSecret: op.appSecret }, domain));
+        }
+      }
+    }
+    return new CoreCoordinator(sessionAdapter, executorPool, this.feishu, cfg, console, operatorFeishus);
   }
 
   // ── Config enrichment ─────────────────────────────────────────────────
@@ -175,6 +191,18 @@ export class LarkConnection extends DurableObject<Env> {
         duration_ms: data.duration_ms as number | undefined,
         token_usage: data.token_usage as { input?: number; output?: number } | undefined,
       });
+      return new Response('OK', { status: 200 });
+    }
+
+    if (url.pathname === '/stream-update' && request.method === 'POST') {
+      await this.cfgReadyPromise;
+      const data = await request.json() as Record<string, unknown>;
+      const type = data.type as string;
+      if (type === 'stream_update' && this.coordinator) {
+        await this.coordinator.handleStreamUpdate(data as any);
+      } else if (type === 'stream_end' && this.coordinator) {
+        await this.coordinator.handleStreamEnd(data as any);
+      }
       return new Response('OK', { status: 200 });
     }
 
@@ -305,20 +333,44 @@ export class LarkConnection extends DurableObject<Env> {
   // ── Alarm handler ──────────────────────────────────────────────────────
 
   async alarm(): Promise<void> {
-    await this.cfgReadyPromise;
+    try {
+      await this.cfgReadyPromise;
 
-    // 1. Reconnect Lark WS if needed
-    if (!this.larkWs) {
-      await this.connectToLark();
+      // 1. Reconnect Lark WS if needed
+      if (!this.larkWs) {
+        await this.connectToLark();
+      }
+
+      // 2. Coordinate pending rounds (like Node's roundCoordinationCycle)
+      if (this.coordinator) {
+        await this.coordinator.roundCoordinationCycle();
+      }
+
+      // 3. Deliver agent turns to IM (like Node's main loop)
+      if (this.operator) {
+        await this.operator.deliverTurns();
+      }
+
+      // 4. Send approval cards for pending_approval rounds
+      if (this.operator) {
+        await this.operator.deliverApprovalCards();
+      }
+
+      // 5. Close stale draft tickets
+      if (this.operator) {
+        const ttlMs = (this.baseCfg.operator?.draftTTLMinutes ?? 60) * 60 * 1000;
+        await this.operator.cleanupStaleDrafts(ttlMs);
+      }
+    } catch (err) {
+      console.error('[lark-connection] alarm error:', err);
     }
 
-    // 2. Coordinate pending rounds (like Node's roundCoordinationCycle)
-    if (this.coordinator) {
-      await this.coordinator.roundCoordinationCycle();
+    // 6. Schedule next poll — always reschedule even if coordination fails
+    try {
+      await this.ctx.storage.setAlarm(Date.now() + LarkConnection.POLL_INTERVAL);
+    } catch (err) {
+      console.error('[lark-connection] failed to reschedule alarm:', err);
     }
-
-    // 3. Schedule next poll
-    await this.ctx.storage.setAlarm(Date.now() + LarkConnection.POLL_INTERVAL);
   }
 
   // ── Event handlers ─────────────────────────────────────────────────────
@@ -333,6 +385,15 @@ export class LarkConnection extends DurableObject<Env> {
 
     const messageId = String(message.message_id ?? '');
     const chatType = String(message.chat_type ?? '');
+    const mentions = (message.mentions || []) as any[];
+
+    // Determine if the bot was @-mentioned. In p2p chat every message is for
+    // the bot; in group chat the Lark event includes a mention entry with
+    // mentioned_type === 'bot' when the bot is @-mentioned.
+    const isP2p = chatType === 'p2p' || chatType === 'person';
+    const botMentioned = isP2p || (Array.isArray(mentions) && mentions.some(
+      (m: any) => m?.mentioned_type === 'bot',
+    ));
 
     // Construct the parsed event for CoreOperator
     const parsedEvent = {
@@ -346,7 +407,7 @@ export class LarkConnection extends DurableObject<Env> {
         chat_id: String(message.chat_id ?? ''),
         root_id: message.root_id as string | undefined,
         parent_id: message.parent_id as string | undefined,
-        mentions: (message.mentions || []) as any[],
+        mentions,
       },
       sender: {
         sender_type: String(sender.sender_type ?? 'user') as any,
@@ -356,7 +417,7 @@ export class LarkConnection extends DurableObject<Env> {
         },
       },
       appId: this.env.LARK_APP_ID,
-      botMentioned: false,
+      botMentioned,
     };
 
     const roundId = await this.operator.handleMessage(parsedEvent);
@@ -390,12 +451,7 @@ export class LarkConnection extends DurableObject<Env> {
 
     console.log(`[lark-connection] card action: ${decision} round=${roundId}`);
     try {
-      const cfg = this.enrichedCfg ?? this.baseCfg;
-      if (decision === 'approve') {
-        await this.coordinator['session'].transitionRound(roundId, cfg.roundStatuses.approved);
-      } else if (decision === 'reject') {
-        await this.coordinator['session'].transitionRound(roundId, cfg.roundStatuses.rejected);
-      }
+      await this.operator.handleCardAction({ round_id: roundId, action: decision as 'approve' | 'reject' });
     } catch (err) {
       console.error(`[lark-connection] card action failed round=${roundId}:`, err);
     }
@@ -523,6 +579,9 @@ export class LarkConnection extends DurableObject<Env> {
   /** Send an ACK response frame for a received event. */
   private sendFrameAck(ws: WebSocket, frame: DecodedFrame, code: number): void {
     try {
+      // If the WebSocket is no longer open, the ACK will fail anyway
+      const readyState = (ws as any).readyState;
+      if (readyState !== 1 /* OPEN */) return;
       // Simple protobuf-encoded response: Frame with code in payload
       // We reuse the same SeqID/LogID so the server correlates the ACK
       const respPayload = JSON.stringify({ code });
@@ -723,160 +782,6 @@ export class LarkConnection extends DurableObject<Env> {
     }
   }
 
-  // ── Streaming card handlers ───────────────────────────────────────────
-
-  private streamState = new Map<string, { cardId: string; seq: number; think: string; answer: string }>();
-
-  private async handleStreamUpdate(data: Record<string, unknown>): Promise<void> {
-    const cfg = this.enrichedCfg ?? this.baseCfg;
-    if (!cfg.coordinator?.streamOutput) return;
-    const ticketId = data.ticket_id as string;
-    const roundId = data.round_id as string || '';
-    const content = (data.content as string) || '';
-    const contentType = (data.content_type as string) || 'message';
-    const rootMsgId = (data.root_msg_id as string) || '';
-    const cardKey = roundId || ticketId;
-    if (!rootMsgId && !this.streamState.has(cardKey)) return;
-    if (!this.streamState.has(cardKey)) {
-      const card = await this.createStreamingCard(rootMsgId);
-      if (!card) return;
-      this.streamState.set(cardKey, { cardId: card.cardId, seq: 0, think: '', answer: '' });
-    }
-    const st = this.streamState.get(cardKey)!;
-    const dc = `https://${this.env.OPEN_API_DOMAIN || 'open.feishu.cn'}`;
-    const token = await this.getStreamToken();
-    if (!token) return;
-    if (contentType === 'thinking') {
-      st.think += (st.think ? '\n' : '') + '> ' + content.replace(/\n/g, '\n> ');
-    } else {
-      st.answer += (st.answer ? '\n' : '') + content;
-    }
-    st.seq++;
-    await this.updateCardElement(st.cardId, contentType === 'thinking' ? 'stream_thinking' : 'stream_answer',
-      contentType === 'thinking' ? st.think : st.answer, st.seq, token, dc);
-  }
-
-  private async handleStreamEnd(data: Record<string, unknown>): Promise<void> {
-    const cfg = this.enrichedCfg ?? this.baseCfg;
-    if (!cfg.coordinator?.streamOutput) return;
-    const cardKey = (data.round_id as string) || (data.ticket_id as string);
-    const st = this.streamState.get(cardKey);
-    if (!st) return;
-    const dc = `https://${this.env.OPEN_API_DOMAIN || 'open.feishu.cn'}`;
-    const token = await this.getStreamToken();
-    if (!token) return;
-    if (st.think) { st.seq++; await this.updateCardElement(st.cardId, 'stream_thinking', st.think, st.seq, token, dc); }
-    if (st.answer) { st.seq++; await this.updateCardElement(st.cardId, 'stream_answer', st.answer, st.seq, token, dc); }
-    try {
-      await fetch(`${dc}/open-apis/cardkit/v1/cards/${st.cardId}/settings`, {
-        method: 'PATCH', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ settings: JSON.stringify({ config: { streaming_mode: false, summary: { content: (st.answer || st.think).slice(0, 50) || '[Done]' } } }), sequence: ++st.seq, uuid: `c_${st.cardId}_${st.seq}` }),
-      });
-    } catch {}
-    this.streamState.delete(cardKey);
-  }
-
-  private async createStreamingCard(rootMsgId: string): Promise<{ cardId: string } | null> {
-    const dc = `https://${this.env.OPEN_API_DOMAIN || 'open.feishu.cn'}`;
-    const token = await this.getStreamToken();
-    if (!token || !rootMsgId) return null;
-    try {
-      const resp = await fetch(`${dc}/open-apis/cardkit/v1/cards`, {
-        method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'card_json', data: JSON.stringify({ schema: '2.0', config: { streaming_mode: true, summary: { content: '[Generating...]' }, streaming_config: { print_frequency_ms: { default: 70 }, print_step: { default: 1 }, print_strategy: 'fast' } }, body: { elements: [{ tag: 'markdown', element_id: 'stream_thinking', content: '', text_size: 'text_size_note' }, { tag: 'markdown', element_id: 'stream_answer', content: '...' }, { tag: 'markdown', element_id: 'stream_stats', content: '', text_size: 'body' }] } }) }),
-      });
-      const d = await resp.json() as any;
-      if (d.code !== 0 || !d.data?.card_id) return null;
-      const cardId = d.data.card_id;
-      await fetch(`${dc}/open-apis/im/v1/messages/${rootMsgId}/reply`, {
-        method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ msg_type: 'interactive', content: JSON.stringify({ type: 'card', data: { card_id: cardId } }), reply_in_thread: true }),
-      });
-      return { cardId };
-    } catch { return null; }
-  }
-
-  private async updateCardElement(cardId: string, elementId: string, content: string, seq: number, token: string, dc: string): Promise<void> {
-    try {
-      await fetch(`${dc}/open-apis/cardkit/v1/cards/${cardId}/elements/${elementId}/content`, {
-        method: 'PATCH', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content, sequence: seq, uuid: `${elementId}_${cardId}_${seq}` }),
-      });
-    } catch {}
-  }
-
-  private async getStreamToken(): Promise<string | null> {
-    const dc = `https://${this.env.OPEN_API_DOMAIN || 'open.feishu.cn'}`;
-    try {
-      const resp = await fetch(`${dc}/open-apis/auth/v3/tenant_access_token/internal`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ app_id: this.env.LARK_APP_ID, app_secret: this.env.LARK_APP_SECRET }),
-      });
-      const d = await resp.json() as any;
-      return d.tenant_access_token || null;
-    } catch { return null; }
-  }
 }
 
-// ---- Message parsing helpers -----------------------------------------------
-
-/** Extract plain text from a Lark IM message event. */
-function parseMessageToText(msg: Record<string, unknown>): string {
-  const msgType = String(msg.message_type ?? '');
-  const rawContent = String(msg.content ?? '');
-
-
-}
-}
-
-// ---- Message parsing helpers -----------------------------------------------
-
-/** Extract plain text from a Lark IM message event. */
-function parseMessageToText(msg: Record<string, unknown>): string {
-  const msgType = String(msg.message_type ?? '');
-  const rawContent = String(msg.content ?? '');
-
-  if (msgType === 'text') {
-    try {
-      const parsed = JSON.parse(rawContent);
-      return (parsed.text ?? rawContent).replace(/@_user_\d+/g, '').trim();
-    } catch {
-      return rawContent.replace(/@_user_\d+/g, '').trim();
-    }
-  }
-
-  if (msgType === 'post') {
-    try {
-      const parsed = JSON.parse(rawContent);
-      const section = parsed.content ? parsed : Object.values(parsed)[0] as any;
-      if (!section?.content) return '';
-      const lines: string[] = [];
-      for (const para of section.content) {
-        if (!Array.isArray(para)) { lines.push(''); continue; }
-        const parts = para.map((e: any) => {
-          if (e.tag === 'text') return e.text ?? '';
-          if (e.tag === 'a') return e.text ?? e.href ?? '';
-          if (e.tag === 'at') return `@${e.user_name ?? 'user'}`;
-          return '';
-        });
-        lines.push(parts.filter(Boolean).join(''));
-      }
-      return lines.join('\n\n').trim();
-    } catch { return ''; }
-  }
-
-  if (msgType === 'interactive') {
-    try {
-      const parsed = JSON.parse(rawContent);
-      const elements: any[] = parsed?.body?.elements ?? parsed?.elements ?? [];
-      return elements
-        .filter((e: any) => e.tag === 'markdown' || e.tag === 'div')
-        .map((e: any) => e.content || e.text?.content || '')
-        .filter(Boolean)
-        .join('\n\n')
-        .trim();
-    } catch { return ''; }
-  }
-
-  return '';
-}
+// ---- Message parsing (imported from core/message-parser.ts) ----------------

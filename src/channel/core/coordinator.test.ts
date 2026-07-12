@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { Config, BitableRecord } from '../lib/types.js';
+import type { Config, BitableRecord } from '../../lib/types.js';
 
 // Mock ws BEFORE importing Coordinator — EventEmitter-like so tests can
 // capture 'message' handlers and trigger them with custom payloads.
@@ -39,13 +39,13 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 }));
 
 // Mock sessions module
-vi.mock('../lib/sessions.js', () => ({
+vi.mock('../../lib/sessions.js', () => ({
   createSession: vi.fn(() => 'mock_session_token'),
   validateSession: vi.fn(() => null),
 }));
 
-import { Coordinator } from '../channel/coordinator.js';
-import { BitableClient } from '../lib/bitable/client.js';
+import { NodeCoordinator as Coordinator } from '../deploy/node/coordinator.js';
+import { BitableClient } from '../../lib/bitable/client.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -54,7 +54,7 @@ import { BitableClient } from '../lib/bitable/client.js';
 const RECORDS = new Map<string, Map<string, BitableRecord>>();
 
 // Override BitableClient mock to provide an in-memory implementation
-vi.mock('../lib/bitable/client.js', () => ({
+vi.mock('../../lib/bitable/client.js', () => ({
   BitableClient: class MockBitableClient {
     constructor(cfg: any) {
       (this as any).cfg = cfg;
@@ -245,7 +245,7 @@ describe('Coordinator — Round state machine', () => {
         [cfg.fields.roster.hitl]: 'always',
       });
 
-      const result = await (coordinator as any)['checkHitlRequired'](['general']);
+      const result = await (coordinator as any).coreCoordinator['checkHitlRequired'](['general']);
       expect(result).toBe(true);
     });
 
@@ -255,12 +255,12 @@ describe('Coordinator — Round state machine', () => {
         [cfg.fields.roster.hitl]: 'off',
       });
 
-      const result = await (coordinator as any)['checkHitlRequired'](['general']);
+      const result = await (coordinator as any).coreCoordinator['checkHitlRequired'](['general']);
       expect(result).toBe(false);
     });
 
     it('returns false when no agents in roster', async () => {
-      const result = await (coordinator as any)['checkHitlRequired'](['general']);
+      const result = await (coordinator as any).coreCoordinator['checkHitlRequired'](['general']);
       expect(result).toBe(false);
     });
 
@@ -271,7 +271,7 @@ describe('Coordinator — Round state machine', () => {
         [cfg.fields.roster.hitl]: 'always',
       });
 
-      const result = await (coordinator as any)['checkHitlRequired'](['general']);
+      const result = await (coordinator as any).coreCoordinator['checkHitlRequired'](['general']);
       expect(result).toBe(false);
     });
 
@@ -282,7 +282,7 @@ describe('Coordinator — Round state machine', () => {
         [cfg.fields.roster.hitlPolicy]: 'always',
       });
 
-      const result = await (coordinator as any)['checkHitlRequired'](['general']);
+      const result = await (coordinator as any).coreCoordinator['checkHitlRequired'](['general']);
       expect(result).toBe(true);
     });
   });
@@ -296,7 +296,7 @@ describe('Coordinator — Round state machine', () => {
       const ticket = await createTicket(cfg);
       const round = await createRound(cfg, ticket.record_id);
 
-      await (coordinator as any)['processPendingRound'](round);
+      await (coordinator as any).coreCoordinator['processPendingRound'](round);
 
       const updated = await bitable.getRecord(cfg.roundsTableId!, round.record_id);
       expect((updated?.fields as any)[cfg.fields.round.status]).toBe(cfg.roundStatuses.pendingApproval);
@@ -310,7 +310,7 @@ describe('Coordinator — Round state machine', () => {
       const ticket = await createTicket(cfg);
       const round = await createRound(cfg, ticket.record_id);
 
-      await (coordinator as any)['processPendingRound'](round);
+      await (coordinator as any).coreCoordinator['processPendingRound'](round);
 
       const updated = await bitable.getRecord(cfg.roundsTableId!, round.record_id);
       // No push executor → round remains pending
@@ -331,7 +331,7 @@ describe('Coordinator — Round state machine', () => {
       });
 
       // approvalTimeoutMinutes defaults to 30 min, and round is 2 hours old → should timeout
-      await (coordinator as any)['processPendingApprovalRound'](round);
+      await (coordinator as any).coreCoordinator['processPendingApprovalRound'](round);
 
       const updated = await bitable.getRecord(cfg.roundsTableId!, round.record_id);
       expect((updated?.fields as any)[cfg.fields.round.status]).toBe(cfg.roundStatuses.pending);
@@ -348,7 +348,7 @@ describe('Coordinator — Round state machine', () => {
         [cfg.fields.round.updatedAt]: recentTs,
       });
 
-      await (coordinator as any)['processPendingApprovalRound'](round);
+      await (coordinator as any).coreCoordinator['processPendingApprovalRound'](round);
 
       const updated = await bitable.getRecord(cfg.roundsTableId!, round.record_id);
       expect((updated?.fields as any)[cfg.fields.round.status]).toBe(cfg.roundStatuses.pendingApproval);
@@ -361,7 +361,7 @@ describe('Coordinator — Round state machine', () => {
       const ticket = await createTicket(cfg);
       const round = await createRound(cfg, ticket.record_id, cfg.roundStatuses.approved);
 
-      await (coordinator as any)['processApprovedRound'](round);
+      await (coordinator as any).coreCoordinator['processApprovedRound'](round);
 
       // No push executor → round stays approved
       const updated = await bitable.getRecord(cfg.roundsTableId!, round.record_id);
@@ -377,7 +377,7 @@ describe('Coordinator — Round state machine', () => {
         [cfg.fields.round.updatedAt]: Date.now() - 300_000, // 5 min old = past stuck timeout
       });
 
-      await (coordinator as any)['processStuckRound'](round);
+      await (coordinator as any).coreCoordinator['processStuckRound'](round);
 
       const updated = await bitable.getRecord(cfg.roundsTableId!, round.record_id);
       const status = (updated?.fields as any)[cfg.fields.round.status];
@@ -392,7 +392,7 @@ describe('Coordinator — Round state machine', () => {
       const ticket = await createTicket(cfg);
       const round = await createRound(cfg, ticket.record_id);
 
-      await (coordinator as any)['assignRoundToExecutor'](round, ticket);
+      await (coordinator as any).coreCoordinator['assignRoundToExecutor'](round, ticket);
 
       const updated = await bitable.getRecord(cfg.roundsTableId!, round.record_id);
       // No push executor → round stays pending
@@ -412,7 +412,7 @@ describe('Coordinator — Round state machine', () => {
       await createRound(cfg, ticket.record_id);
 
       // Run the cycle
-      await (coordinator as any)['roundCoordinationCycle']();
+      await (coordinator as any).coreCoordinator['roundCoordinationCycle']();
 
       // No push executor → round stays pending, not done
       const rounds = await bitable.searchRecords(cfg.roundsTableId!, {
@@ -433,7 +433,7 @@ describe('Coordinator — Round state machine', () => {
         [cfg.fields.round.updatedAt]: oldTs,
       });
 
-      await (coordinator as any)['roundCoordinationCycle']();
+      await (coordinator as any).coreCoordinator['roundCoordinationCycle']();
 
       const updated = await bitable.getRecord(cfg.roundsTableId!, round.record_id);
       // The round was recovered (stuck→pending) then immediately processed.
@@ -458,13 +458,13 @@ describe('Coordinator — Round state machine', () => {
       expect(body.body.elements[0].content).toContain('Hello from agent');
     });
 
-    it('notifyIM skips when appSecret is missing', async () => {
+    it('notifyIM sends when appSecret is empty (uses default Client)', async () => {
       const saved = cfg.appSecret;
       cfg.appSecret = '';
-      await (coordinator as any)['notifyIM']('om_test_root', 'Should not send');
+      await (coordinator as any)['notifyIM']('om_test_root', 'Should still send');
 
       const mockReply = vi.mocked((coordinator as any).client.im.v1.message.reply);
-      expect(mockReply).not.toHaveBeenCalled();
+      expect(mockReply).toHaveBeenCalledTimes(1);
       cfg.appSecret = saved;
     });
 

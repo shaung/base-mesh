@@ -3,3 +3,5 @@
 // ---------------------------------------------------------------------------
 
 export { NodeSessionAdapter } from './session-adapter.js';
+export { NodeCoordinator } from './coordinator.js';
+export { Channel as NodeChannel } from './channel.js';

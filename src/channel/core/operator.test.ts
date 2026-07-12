@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { Config } from '../lib/types.js';
+import type { Config } from '../../lib/types.js';
 
 // Mock Feishu SDK BEFORE importing Channel
 vi.mock('@larksuiteoapi/node-sdk', () => ({
@@ -13,18 +13,18 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
   EventDispatcher: class MockDispatcher { register() {} },
 }));
 
-vi.mock('../lib/sessions.js', () => ({
+vi.mock('../../lib/sessions.js', () => ({
   createSession: vi.fn(() => 'mock_session_token'),
   validateSession: vi.fn(() => null),
 }));
 
-vi.mock('./a2a.js', () => ({
+vi.mock('../a2a.js', () => ({
   resolvePostMessageImages: vi.fn(),
 }));
 
 const RECORDS = new Map<string, Map<string, any>>();
 
-vi.mock('../lib/bitable/client.js', () => ({
+vi.mock('../../lib/bitable/client.js', () => ({
   BitableClient: class MockBitableClient {
     constructor(cfg: any) { (this as any).cfg = cfg; }
     async createRecord(tableId: string, fields: Record<string, unknown>) {
@@ -64,7 +64,7 @@ vi.mock('../lib/bitable/client.js', () => ({
   },
 }));
 
-import { Channel } from '../channel/channel.js';
+import { Channel } from '../deploy/node/channel.js';
 
 function makeChannelConfig(): Config {
   return {
@@ -157,34 +157,14 @@ describe('Channel', () => {
     });
   });
 
-  // -- loadDomains ------------------------------------------------------------
-
-  describe('loadDomains', () => {
-    it('loads and caches domains from bitable', async () => {
-      const bitable = (channel as any).bitable;
-      await bitable.createRecord('tbl_domains', {
-        domain: 'billing', description: 'Billing support', enabled: true,
-      });
-      cfg.domainsTableId = 'tbl_domains';
-
-      const first = await (channel as any)['loadDomains']();
-      expect(first).toHaveLength(1);
-      expect(first[0].domain).toBe('billing');
-
-      // Cache hit on second call
-      const second = await (channel as any)['loadDomains']();
-      expect(second).toEqual(first);
-    });
-
-    it('returns empty when no domainsTableId', async () => {
-      const result = await (channel as any)['loadDomains']();
-      expect(result).toEqual([]);
-    });
-  });
-
   // -- deliverTurns -----------------------------------------------------------
 
+  // Note: deliverTurns is now delegated to CoreOperator (core/operator.ts).
+  // Tests access it through channel.coreOperator.
+
   describe('deliverTurns', () => {
+    function coreOp() { return (channel as any).coreOperator; }
+
     it('delivers agent turn and marks notified', async () => {
       const bitable = (channel as any).bitable;
       const ticket = await bitable.createRecord(cfg.ticketsTableId, {
@@ -197,10 +177,9 @@ describe('Channel', () => {
         [cfg.fields.turn.role]: 'agent',
         [cfg.fields.turn.status]: 'answered',
         [cfg.fields.turn.notified]: 0,
-        [cfg.fields.turn.deliveryLeaseAt]: 0,
       });
 
-      await (channel as any)['deliverTurns']();
+      await coreOp().deliverTurns();
 
       const mockReply = (channel as any).client.im.v1.message.reply;
       expect(mockReply).toHaveBeenCalled();
@@ -220,11 +199,10 @@ describe('Channel', () => {
         [cfg.fields.turn.role]: 'agent',
         [cfg.fields.turn.status]: 'answered',
         [cfg.fields.turn.notified]: 0,
-        [cfg.fields.turn.deliveryLeaseAt]: 0,
-        [cfg.fields.turn.human]: [{ id: 'ou_human_1' }],
+        [cfg.fields.turn.human]: 'ou_human_1',
       });
 
-      await (channel as any)['deliverTurns']();
+      await coreOp().deliverTurns();
 
       const mockReply = (channel as any).client.im.v1.message.reply;
       expect(mockReply).toHaveBeenCalled();
@@ -244,11 +222,10 @@ describe('Channel', () => {
         [cfg.fields.turn.role]: 'agent',
         [cfg.fields.turn.status]: 'answered',
         [cfg.fields.turn.notified]: 1,
-        [cfg.fields.turn.deliveryLeaseAt]: 0,
       });
 
-      (channel as any).deliveredTurnIds.add(turn.record_id);
-      await (channel as any)['deliverTurns']();
+      coreOp().deliveredTurnIds.add(turn.record_id);
+      await coreOp().deliverTurns();
       expect((channel as any).client.im.v1.message.reply).not.toHaveBeenCalled();
     });
   });

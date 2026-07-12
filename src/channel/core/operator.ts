@@ -22,6 +22,7 @@ import type {
   Logger,
 } from './types.js';
 import type { Config } from '../../lib/types.js';
+import { extractAppIdFromTurn } from './helpers.js';
 
 // =============================================================================
 // CoreOperator
@@ -34,6 +35,8 @@ export class CoreOperator {
   private deliveredTurnIds = new Set<string>();
   /** In-flight delivery dedup. */
   private deliveryInFlight = new Set<string>();
+  /** Per-operator FeishuAdapters for multi-credential IM routing. */
+  private feishuMap = new Map<string, FeishuAdapter>();
 
   constructor(
     private session: SessionAdapter,
@@ -41,9 +44,20 @@ export class CoreOperator {
     private bitable: BitableAdapter,
     private cfg: Config,
     private log: Logger,
+    operatorFeishus?: Map<string, FeishuAdapter>,
   ) {
+    if (operatorFeishus) this.feishuMap = operatorFeishus;
     // Invalidate domain cache every 60s
     setTimeout(() => { this.cachedDomains = null; }, 60_000);
+  }
+
+  /** Get the FeishuAdapter for a given appId, falling back to the primary adapter. */
+  private getFeishu(appId?: string): FeishuAdapter {
+    if (appId) {
+      const op = this.feishuMap.get(appId);
+      if (op) return op;
+    }
+    return this.feishu;
   }
 
   // ===========================================================================
@@ -404,11 +418,27 @@ export class CoreOperator {
           continue;
         }
 
+        // Human CC mentions
+        const human = String(turn.fields[this.cfg.fields.turn.human] ?? '');
+        let finalContent = content;
+        if (human) {
+          const { formatMessage } = await import('../../lib/messaging/messages.js');
+          const parts = human.split(',').map(s => s.trim()).filter(Boolean);
+          const mentions = parts.map(p =>
+            p.startsWith('ou_') ? `<at id=${p}></at>` : p,
+          ).join(' ');
+          finalContent = formatMessage(this.cfg.messages?.ccFormat || '{content}\n\ncc {mentions}', { content, mentions });
+        }
+
+        // Resolve the operator appId for multi-credential IM routing
+        const turnAppId = extractAppIdFromTurn(turn, this.cfg.fields.turn.appId, this.cfg.fields.turn.dedupKey);
+        const feishu = this.getFeishu(turnAppId);
+
         try {
-          await this.feishu.reply(rootMsgId, content, true);
+          await feishu.reply(rootMsgId, finalContent, true);
           this.deliveredTurnIds.add(turnRecordId);
           await this.markTurnNotified(turnRecordId);
-          this.log.info(`[core-operator] delivered turn ${turnRecordId}`);
+          this.log.info(`[core-operator] delivered turn ${turnRecordId} appId=${turnAppId || 'primary'}`);
         } catch (err) {
           this.log.error(`[core-operator] deliver turn failed ${turnRecordId}:`, err);
         }
@@ -438,13 +468,34 @@ export class CoreOperator {
         const summary = String(ticket.fields[this.cfg.fields.ticket.summary] ?? '');
         if (!rootMsgId) continue;
 
-        // Send approval card
+        // Dedup: skip if card already sent for this round
         const cardDedupKey = `approval_card_${round.record_id}`;
+        const existing = await this.bitable.searchRecords(this.cfg.turnsTableId, {
+          conjunction: 'and',
+          conditions: [
+            { field_name: this.cfg.fields.turn.dedupKey, operator: 'is', value: [cardDedupKey] },
+          ],
+        });
+        if (existing.length > 0) continue;
+
+        // Resolve operator appId for multi-credential IM routing
+        const roundAppId = String(round.fields[this.cfg.fields.round.appId] ?? '') || undefined;
+        const feishu = this.getFeishu(roundAppId);
+
+        // Reviewer mention
+        const reviewer = round.fields[this.cfg.fields.round.reviewer];
+        let reviewerSection = '';
+        if (reviewer) {
+          const ids = String(reviewer).split(',').map(s => s.trim()).filter(Boolean);
+          const mentions = ids.map(id => `<at id=${id}></at>`).join(' ');
+          if (mentions) reviewerSection = `\nReviewer: ${mentions}`;
+        }
+
         const card = {
           schema: '2.0',
           body: {
             elements: [
-              { tag: 'markdown', content: `⏳ **Approval Required**\n${summary}` },
+              { tag: 'markdown', content: `⏳ **Approval Required**\n${summary}${reviewerSection}` },
               { tag: 'hr' },
               {
                 tag: 'action',
@@ -458,8 +509,9 @@ export class CoreOperator {
         };
 
         try {
-          // Send via Lark reply
-          await this.feishu.reply(rootMsgId, JSON.stringify(card), true);
+          // Send via Lark reply — pass the card JSON as content; the adapter
+          // (Node or Worker) determines whether to send as interactive or text
+          await feishu.reply(rootMsgId, JSON.stringify(card), true);
           // Record the card was sent
           await this.bitable.createRecord(this.cfg.turnsTableId, {
             [this.cfg.fields.turn.ticketRecordId]: ticketId,
@@ -528,29 +580,79 @@ export class CoreOperator {
   }
 
   // ===========================================================================
+  // Card action from raw event
+  // ===========================================================================
+
+  /** Parse a raw card action event and handle it.
+   *  Raw format: { event: { action: { value: { round_id, action } } } }
+   *  Parses to CardActionData and delegates to handleCardAction. */
+  async handleCardActionFromRaw(raw: Record<string, any>): Promise<void> {
+    const action = raw.event?.action ?? raw.action;
+    if (!action?.value?.round_id) return;
+    await this.handleCardAction({
+      round_id: action.value.round_id,
+      action: action.value.action,
+    });
+  }
+
+  // ===========================================================================
+  // Stale draft cleanup
+  // ===========================================================================
+
+  /** Close stale draft tickets that exceed the given max age. */
+  async cleanupStaleDrafts(maxAgeMs: number): Promise<void> {
+    try {
+      const drafts = await this.bitable.searchRecords(this.cfg.ticketsTableId, {
+        conjunction: 'and',
+        conditions: [
+          { field_name: this.cfg.fields.ticket.status, operator: 'is', value: [this.cfg.statuses.draft] },
+        ],
+      });
+
+      const cutoff = Date.now() - maxAgeMs;
+      const tf = this.cfg.fields.ticket;
+      let closed = 0;
+
+      for (const d of drafts) {
+        const createdAt = Number(d.fields[tf.createdAt] ?? 0) || Date.now();
+        if (createdAt < cutoff) {
+          await this.bitable.updateRecord(this.cfg.ticketsTableId, d.record_id!, {
+            [tf.status]: this.cfg.statuses.closed,
+          });
+          closed++;
+        }
+      }
+
+      if (closed > 0) this.log.info(`[core-operator] closed ${closed} stale draft(s)`);
+
+      // Prevent unbounded growth of delivery dedup set
+      if (this.deliveredTurnIds.size > 10_000) {
+        this.deliveredTurnIds.clear();
+        this.log.info('[core-operator] cleared deliveredTurnIds set');
+      }
+    } catch (err) {
+      this.log.error('[core-operator] cleanupStaleDrafts error:', err);
+    }
+  }
+
+  // ===========================================================================
   // Internal helpers
   // ===========================================================================
 
   /** Ensure a human Roster record exists. */
-  private async ensureHumanRoster(senderId: string, unionId?: string): Promise<void> {
+  async ensureHumanRoster(senderId: string, unionId?: string): Promise<void> {
     const primaryId = unionId || senderId;
+    const identity = `human_${primaryId}`;
     try {
       const existing = await this.session.searchRoster({
         conjunction: 'and',
         conditions: [
-          { field_name: this.cfg.fields.roster.kind, operator: 'is', value: ['human'] },
+          { field_name: this.cfg.fields.roster.identity, operator: 'is', value: [identity] },
         ],
       });
-      const found = existing.some(r => {
-        const f = r.fields[this.cfg.fields.roster.human];
-        if (!f) return false;
-        const ids = String(f);
-        return ids.includes(primaryId) || ids.includes(senderId);
-      });
-      if (found) return;
+      if (existing.length > 0) return;
     } catch { /* best effort */ }
 
-    const identity = `human_${primaryId}`;
     const fields: Record<string, unknown> = {
       [this.cfg.fields.roster.identity]: identity,
       [this.cfg.fields.roster.nickname]: `user_${primaryId.slice(0, 8)}`,

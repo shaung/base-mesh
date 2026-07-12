@@ -37,7 +37,7 @@ export class NodeSessionAdapter implements SessionAdapter {
     return this.session.getCurrentRound(ticketId) as Promise<RoundRecord | null>;
   }
 
-  async claimRound(round: RoundRecord, identity: string): Promise<boolean> {
+  async claimRound(round: RoundRecord, identity: string, _nextStatus?: string): Promise<boolean> {
     return this.session.claimRound(round as any, identity);
   }
 

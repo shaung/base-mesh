@@ -4,6 +4,13 @@
 
 export { CoreCoordinator } from './coordinator.js';
 export { CoreOperator } from './operator.js';
+export { parseMessageToText, parseMessageContent } from './message-parser.js';
+export {
+  parseDomains,
+  latestTurnMessageId,
+  extractAppIdFromTurn,
+  parseExecutorIdentity,
+} from './helpers.js';
 
 export type {
   BitableAdapter,
