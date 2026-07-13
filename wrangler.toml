@@ -18,7 +18,7 @@ class_name = "ExecutorPool"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["LarkConnection", "ExecutorPool"]
+new_sqlite_classes = ["LarkConnection", "ExecutorPool"]
 
 # ── Static environment variables ────────────────────────────────────────────
 # Table IDs (tickets, turns, roster, rounds, domains) are loaded at runtime
