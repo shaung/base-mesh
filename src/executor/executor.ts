@@ -81,16 +81,7 @@ export class Executor {
   private async pushLoop(): Promise<void> {
     const { readExecutorToken, writeExecutorToken } = await import('../lib/sessions.js');
 
-    const rawUrl = this.cfg.executor?.coordinatorUrl || '';
-    // Append /executor/ws for Worker deployments (Node coordinator accepts
-    // any path, Worker requires /executor/ws). Only add if URL has no path.
-    const wsUrl = (() => {
-      try {
-        const u = new URL(rawUrl);
-        if (u.pathname === '/' || u.pathname === '') return `${rawUrl.replace(/\/+$/, '')}/executor/ws`;
-      } catch { /* not a valid URL, use as-is */ }
-      return rawUrl;
-    })();
+    const wsUrl = this.cfg.executor?.coordinatorUrl || '';
     const identity = this.cfg.clientId || this.cfg.identity;
     const domainsList = this.cfg.executor?.domains ?? [];
     console.log(`[executor] configured domains: ${JSON.stringify(domainsList)}`);
