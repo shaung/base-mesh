@@ -37,8 +37,14 @@ export class NodeSessionAdapter implements SessionAdapter {
     return this.session.getCurrentRound(ticketId) as Promise<RoundRecord | null>;
   }
 
-  async claimRound(round: RoundRecord, identity: string, _nextStatus?: string): Promise<boolean> {
-    return this.session.claimRound(round as any, identity);
+  async claimRound(round: RoundRecord, identity: string, nextStatus?: string): Promise<boolean> {
+    const ok = await this.session.claimRound(round as any, identity);
+    // Session.claimRound only sets executor, not status. Without status change
+    // the round stays 'pending' and the polling cycle re-dispatches it.
+    if (ok && nextStatus && round.record_id) {
+      await this.session.transitionRound(round.record_id, nextStatus);
+    }
+    return ok;
   }
 
   async releaseRound(roundId: string): Promise<void> {

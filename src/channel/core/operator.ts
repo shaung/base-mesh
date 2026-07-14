@@ -293,13 +293,15 @@ export class CoreOperator {
     if (domain) {
       domains = [domain];
       this.log.info(`[core-operator] processDraft domain override: "${domain}"`);
-    } else if (this.cfg.intent) {
+    } else {
+      // Always run intent for domain tag parsing (even without cfg.intent).
+      // parseDomainTag is checked first, then LLM intent if configured.
       const result = await this.runIntent(ticket, content, ticket.record_id!, appId);
       domains = result.domains;
       summary = result.summary || content;
       this.log.info(`[core-operator] intent: domains=${result.domains}`);
 
-      if (!result.isComplete) {
+      if (this.cfg.intent && !result.isComplete) {
         // Missing fields — ask user for clarification
         const question = result.missingFields.length > 0
           ? `Please provide: ${result.missingFields.join(', ')}`
