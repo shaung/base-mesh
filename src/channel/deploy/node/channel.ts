@@ -493,8 +493,57 @@ export class Channel {
     // --- /cancel command ────────────────────────────────────────────
 
     if (this.cfg.roundsTableId && content.trim() === '/cancel') {
-      await this.coreOperator.handleCancel(senderId, messageId, appId);
+      const roundId = await this.coreOperator.handleCancel(senderId, messageId, appId);
+      if (roundId && this.coordinator) {
+        await this.coordinator.dispatchCancelToExecutor(roundId);
+      }
       return;
+    }
+
+    // --- Multi-operator thread reply routing ───────────────────────
+    // When a user replies in a thread without @-mentioning any bot,
+    // only the last operator that handled the ticket should write the
+    // user turn. This prevents duplicate turns across operator bots.
+    if (rootId && !botMentioned && appId) {
+      try {
+        // Find the ticket by thread root
+        const tickets = await this.bitable.searchRecords(this.cfg.ticketsTableId, {
+          conjunction: 'and',
+          conditions: [{ field_name: this.cfg.fields.ticket.rootMsgId, operator: 'is', value: [rootId] }],
+        });
+        if (tickets.length > 0) {
+          const recordId = tickets[0].record_id;
+          if (recordId) {
+            // Get last operator appId from rounds (most recent round first)
+            let lastAppId: string | undefined;
+            if (this.cfg.roundsTableId) {
+              const rounds = await this.bitable.searchRecords(this.cfg.roundsTableId, {
+                conjunction: 'and',
+                conditions: [{ field_name: this.cfg.fields.round.ticketRecordId, operator: 'is', value: [recordId] }],
+              });
+              if (rounds.length > 0) {
+                const newest = rounds[rounds.length - 1];
+                lastAppId = String(newest.fields[this.cfg.fields.round.appId] ?? '') || undefined;
+              }
+            }
+            // Fallback: most recent turn's appId
+            if (!lastAppId) {
+              const turns = await this.bitable.searchRecords(this.cfg.turnsTableId, {
+                conjunction: 'and',
+                conditions: [{ field_name: this.cfg.fields.turn.ticketRecordId, operator: 'is', value: [recordId] }],
+              });
+              if (turns.length > 0) {
+                const newest = turns[turns.length - 1];
+                lastAppId = String(newest.fields[this.cfg.fields.turn.appId] ?? '') || undefined;
+              }
+            }
+            if (lastAppId && lastAppId !== appId && this.operatorClients.has(lastAppId)) {
+              logger.info(`[channel] thread reply: ticket=${recordId.slice(0,12)} lastOp=${lastAppId} online, deferring`);
+              return;
+            }
+          }
+        }
+      } catch { /* best effort */ }
     }
 
     // --- Delegate to CoreOperator for message processing ─────────────

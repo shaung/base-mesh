@@ -180,7 +180,7 @@ export class CoreOperator {
 
   /** Handle a reply within an existing thread. */
   async handleThreadReply(event: ParsedMessageEvent): Promise<void> {
-    const { content, parts, message, sender, appId, botMentioned } = event;
+    const { content, parts, message, sender, appId, botMentioned, domain } = event;
     const messageId = message.message_id;
     const rootId = message.root_id;
     const senderId = sender.sender_id?.open_id ?? 'unknown';
@@ -241,9 +241,24 @@ export class CoreOperator {
 
     await this.bitable.createRecord(this.cfg.turnsTableId, turnFields);
 
+    // Helper: resolve domains — operator domain override takes precedence
+    const resolveDomains = (): Promise<IntentResult> => {
+      if (domain) {
+        return Promise.resolve({ domains: [domain], isComplete: true, summary: content, missingFields: [] });
+      }
+      return this.runIntent(ticket, content, recordId, appId);
+    };
+
     // Route based on ticket status
     if (status === this.cfg.statuses.draft && botMentioned) {
-      await this.processDraft(ticket, content, messageId, chatId, appId);
+      await this.processDraft(ticket, content, messageId, chatId, appId, domain);
+      // Assign newly created round's turns
+      if (this.cfg.roundsTableId && recordId) {
+        const round = await getCurrentRound(this.bitable, this.cfg,recordId);
+        if (round?.record_id) {
+          await this.assignTurnsToRound(recordId, round.record_id, appId);
+        }
+      }
       return;
     }
 
@@ -258,7 +273,7 @@ export class CoreOperator {
         if (roundStatus === this.cfg.roundStatuses.pending) {
           // Cancel pending round, create new one
           await transitionRound(this.bitable, this.cfg,currentRound.record_id, this.cfg.roundStatuses.cancelled);
-          const intent = await this.runIntent(ticket, content, recordId, appId);
+          const intent = await resolveDomains();
           const round = await this.createRound(recordId, intent.domains, appId, content);
           if (round.record_id) await this.assignTurnsToRound(recordId, round.record_id, appId);
         } else if (nonPendingActive.includes(roundStatus)) {
@@ -268,12 +283,12 @@ export class CoreOperator {
           await this.assignTurnsToRound(recordId, currentRound.record_id, appId);
         } else if (terminal.includes(roundStatus)) {
           // Terminal round — create new
-          const intent = await this.runIntent(ticket, content, recordId, appId);
+          const intent = await resolveDomains();
           const round = await this.createRound(recordId, intent.domains, appId, content);
           if (round.record_id) await this.assignTurnsToRound(recordId, round.record_id, appId);
         }
       } else {
-        const intent = await this.runIntent(ticket, content, recordId, appId);
+        const intent = await resolveDomains();
         const round = await this.createRound(recordId, intent.domains, appId, content);
         if (round.record_id) await this.assignTurnsToRound(recordId, round.record_id, appId);
       }
@@ -282,7 +297,7 @@ export class CoreOperator {
     if (status === this.cfg.statuses.closed && botMentioned) {
       // Reopen closed ticket
       await this.reopenTicket(recordId);
-      const intent = await this.runIntent(ticket, content, recordId, appId);
+      const intent = await resolveDomains();
       const round = await this.createRound(recordId, intent.domains, appId, content);
       if (round.record_id) await this.assignTurnsToRound(recordId, round.record_id, appId);
     }
@@ -565,8 +580,8 @@ export class CoreOperator {
     }
   }
 
-  /** Handle /cancel command — cancel active round. */
-  async handleCancel(senderId: string, messageId: string, appId?: string): Promise<void> {
+  /** Handle /cancel command — cancel active round. Returns cancelled round_id if any. */
+  async handleCancel(senderId: string, messageId: string, appId?: string): Promise<string | undefined> {
     try {
       const tickets = await searchTicketsBySender(this.bitable, this.cfg,senderId);
       const activeTickets = tickets.filter(t => {
@@ -575,7 +590,7 @@ export class CoreOperator {
       });
       if (activeTickets.length === 0) {
         await this.getFeishu(appId).reply(messageId, 'No active ticket found to cancel.', true);
-        return;
+        return undefined;
       }
       const ticket = activeTickets[activeTickets.length - 1];
       const round = await getCurrentRound(this.bitable, this.cfg,ticket.record_id!);
@@ -584,6 +599,7 @@ export class CoreOperator {
         if (ok) {
           await this.getFeishu(appId).reply(messageId, '✅ Processing cancelled.', true);
           this.log.info(`[core-operator] cancelled round ${round.record_id} for ticket ${ticket.record_id!}`);
+          return round.record_id;
         } else {
           await this.getFeishu(appId).reply(messageId, 'Could not cancel — round may have already completed.', true);
         }
@@ -594,6 +610,7 @@ export class CoreOperator {
       this.log.error('[core-operator] handleCancel error:', err);
       await this.getFeishu(appId).reply(messageId, 'Error processing cancel command.', true);
     }
+    return undefined;
   }
 
   // ===========================================================================
@@ -656,31 +673,50 @@ export class CoreOperator {
   // Internal helpers
   // ===========================================================================
 
-  /** Ensure a human Roster record exists. */
+  /** Ensure a human Roster record exists (matching main branch behavior). */
   async ensureHumanRoster(senderId: string, unionId?: string): Promise<void> {
     const primaryId = unionId || senderId;
-    const identity = `human_${primaryId}`;
+    const userIdType = unionId ? 'union_id' : undefined;
+
     try {
-      const existing = await searchRoster(this.bitable, this.cfg,{
+      const all = await searchRoster(this.bitable, this.cfg,{
         conjunction: 'and',
         conditions: [
-          { field_name: this.cfg.fields.roster.identity, operator: 'is', value: [identity] },
+          { field_name: this.cfg.fields.roster.kind, operator: 'is', value: ['human'] },
         ],
       });
-      if (existing.length > 0) return;
+      // Search by union_id (primary) or open_id (legacy) — Person field
+      const found = all.find((r) => {
+        const val = String(r.fields[this.cfg.fields.roster.human] ?? '');
+        return val.includes(primaryId) || val.includes(senderId);
+      });
+      if (found) return;
     } catch { /* best effort */ }
 
+    const identity = `human_${primaryId}`;
     const fields: Record<string, unknown> = {
       [this.cfg.fields.roster.identity]: identity,
       [this.cfg.fields.roster.nickname]: `user_${primaryId.slice(0, 8)}`,
       [this.cfg.fields.roster.kind]: 'human',
       [this.cfg.fields.roster.enabled]: true,
     };
+
     try {
-      await this.bitable.createRecord(this.cfg.rosterTableId, fields);
+      fields[this.cfg.fields.roster.human] = [{ id: primaryId }];
+      await this.bitable.createRecord(this.cfg.rosterTableId, fields, userIdType);
       this.log.info(`[core-operator] created human roster: ${identity}`);
-    } catch (err) {
-      this.log.info('[core-operator] ensureHumanRoster failed:', err);
+    } catch (err: any) {
+      if (String(err?.code ?? err) === '1254066' || String(err?.message ?? '').includes('UserFieldConvFail')) {
+        delete fields[this.cfg.fields.roster.human];
+        try {
+          await this.bitable.createRecord(this.cfg.rosterTableId, fields);
+          this.log.info(`[core-operator] created human roster ${identity} (without Person field)`);
+        } catch (retryErr) {
+          this.log.info('[core-operator] ensureHumanRoster failed:', retryErr);
+        }
+      } else {
+        this.log.info('[core-operator] ensureHumanRoster failed:', err);
+      }
     }
   }
 
@@ -750,7 +786,7 @@ export class CoreOperator {
     } catch { /* */ }
   }
 
-  /** Search for turns that need IM delivery. */
+  /** Search for turns that need IM delivery (matching main branch behavior). */
   private async searchNotifiableTurns(): Promise<TurnRecord[]> {
     try {
       const records = await this.bitable.searchRecords(this.cfg.turnsTableId, {
@@ -760,7 +796,12 @@ export class CoreOperator {
           { field_name: this.cfg.fields.turn.role, operator: 'is', value: ['agent'] },
         ],
       });
-      return records;
+      // Main additionally filters by status: processing, answered, error, approved
+      const allowedStatuses = ['processing', 'answered', 'error', 'approved'];
+      return records.filter(r => {
+        const status = String(r.fields[this.cfg.fields.turn.status] ?? '');
+        return allowedStatuses.includes(status);
+      });
     } catch {
       return [];
     }
