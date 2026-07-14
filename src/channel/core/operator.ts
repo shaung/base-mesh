@@ -111,8 +111,9 @@ export class CoreOperator {
         return;
       }
 
-      // Acknowledge receipt — only for new (non-duplicate) messages
-      try { await this.feishu.react(messageId, 'OneSecond'); } catch { /* best effort */ }
+      // Acknowledge receipt — only for new (non-duplicate) messages.
+      // Use the operator's own credentials so the correct bot reacts.
+      try { await this.getFeishu(appId).react(messageId, 'OneSecond'); } catch { /* best effort */ }
 
       // Create ticket
       let ticket: TicketRecord;
@@ -322,7 +323,7 @@ export class CoreOperator {
           : (this.cfg.messages?.clarifyQuestion || 'Could you please provide more details?');
         const rootMsgId = String(ticket.fields[this.cfg.fields.ticket.rootMsgId] ?? '');
         if (rootMsgId) {
-          await this.feishu.reply(rootMsgId, question, true);
+          await this.getFeishu(appId).reply(rootMsgId, question, true);
         }
         return undefined;
       }
@@ -573,7 +574,7 @@ export class CoreOperator {
         return status !== this.cfg.statuses.closed;
       });
       if (activeTickets.length === 0) {
-        await this.feishu.reply(messageId, 'No active ticket found to cancel.', true);
+        await this.getFeishu(appId).reply(messageId, 'No active ticket found to cancel.', true);
         return;
       }
       const ticket = activeTickets[activeTickets.length - 1];
@@ -581,17 +582,17 @@ export class CoreOperator {
       if (round?.record_id) {
         const ok = await transitionRound(this.bitable, this.cfg,round.record_id, this.cfg.roundStatuses.cancelled);
         if (ok) {
-          await this.feishu.reply(messageId, '✅ Processing cancelled.', true);
+          await this.getFeishu(appId).reply(messageId, '✅ Processing cancelled.', true);
           this.log.info(`[core-operator] cancelled round ${round.record_id} for ticket ${ticket.record_id!}`);
         } else {
-          await this.feishu.reply(messageId, 'Could not cancel — round may have already completed.', true);
+          await this.getFeishu(appId).reply(messageId, 'Could not cancel — round may have already completed.', true);
         }
       } else {
-        await this.feishu.reply(messageId, 'No active processing round to cancel.', true);
+        await this.getFeishu(appId).reply(messageId, 'No active processing round to cancel.', true);
       }
     } catch (err) {
       this.log.error('[core-operator] handleCancel error:', err);
-      await this.feishu.reply(messageId, 'Error processing cancel command.', true);
+      await this.getFeishu(appId).reply(messageId, 'Error processing cancel command.', true);
     }
   }
 
