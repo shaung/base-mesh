@@ -81,48 +81,6 @@ export interface ExecutorPoolInterface {
   broadcast(message: string): number;
 }
 
-// ---- Session adapter — wraps Session operations used by Coordinator --------
-
-export interface SessionAdapter {
-  getTicket(ticketId: string): Promise<TicketRecord | null>;
-  getTurns(ticketId: string): Promise<TurnRecord[]>;
-  getRound(roundId: string): Promise<RoundRecord | null>;
-  getCurrentRound(ticketId: string): Promise<RoundRecord | null>;
-
-  claimRound(round: RoundRecord, identity: string, nextStatus?: string): Promise<boolean>;
-  releaseRound(roundId: string): Promise<void>;
-  claim(ticket: TicketRecord): Promise<boolean>;
-  release(ticketId: string, newStatus: string): Promise<void>;
-
-  transitionRound(roundId: string, newStatus: string): Promise<boolean>;
-  setRoundResult(roundId: string, answer: string): Promise<void>;
-
-  appendTurn(
-    ticketId: string, role: string, content: string, dedupKey: string,
-    agentIdentity: string, status: string, rootMsgId?: string,
-    roundId?: string, parts?: unknown[], notified?: number, appId?: string,
-  ): Promise<string | undefined>;
-
-  writeResult(ticketId: string, answer: string, newSummary?: string): Promise<void>;
-
-  searchRoundsByStatus(status: string): Promise<RoundRecord[]>;
-  searchStuckRounds(stuckTimeoutMs: number): Promise<RoundRecord[]>;
-
-  /** Search roster table with arbitrary filter conditions. */
-  searchRoster(filter: {
-    conjunction: string;
-    conditions: Array<{ field_name: string; operator: string; value: unknown[] }>;
-  }): Promise<RosterRecord[]>;
-
-  /** Get a roster record by identity. */
-  getRosterByIdentity(identity: string): Promise<Record<string, unknown> | null>;
-
-  registerRoster(identity: string, fields: Record<string, unknown>): Promise<void>;
-
-  /** Search tickets by sender ID (for /cancel command). */
-  searchTicketsBySender(senderId: string): Promise<TicketRecord[]>;
-}
-
 // ---- Streaming card management -------------------------------------------
 
 export interface StreamCardState {

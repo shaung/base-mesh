@@ -16,7 +16,7 @@ import { getDomainConfig } from '../../../lib/bitable/domain.js';
 import { CoreCoordinator } from '../../core/coordinator.js';
 import { latestTurnMessageId } from '../../core/helpers.js';
 import { NodeLarkAdapter } from './adapters/lark.js';
-import { NodeSessionAdapter } from './session-adapter.js';
+import { NodeBitableAdapter } from './adapters/bitable.js';
 import type { ExecutorPoolInterface, FeishuAdapter } from '../../core/types.js';
 import type { Logger } from '../../core/types.js';
 import { routeA2ARequest, verifyA2AAuth } from '../../a2a.js';
@@ -55,7 +55,7 @@ export class NodeCoordinator {
       }
     }
     // Create CoreCoordinator for streaming card management (and round coordination)
-    const sessionAdapter = new NodeSessionAdapter(this.session);
+    const bitableAdapter = new NodeBitableAdapter(this.bitable);
     const feishuAdapter = new NodeLarkAdapter((appId?: string) => this.getClient(appId));
     const operatorFeishus = new Map<string, FeishuAdapter>();
     if (cfg.operators) {
@@ -67,7 +67,7 @@ export class NodeCoordinator {
     }
     this.nodeExecutorPool = new NodeExecutorPool(this.executors);
     this.coreCoordinator = new CoreCoordinator(
-      sessionAdapter, this.nodeExecutorPool, feishuAdapter, cfg,
+      bitableAdapter, this.nodeExecutorPool, feishuAdapter, cfg,
       { info: (m: string, ...args: any[]) => logger.info(m, ...args), error: (m: string, ...args: any[]) => logger.error(m, ...args) } as Logger,
       operatorFeishus,
     );

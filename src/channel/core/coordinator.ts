@@ -2,12 +2,12 @@
 // CoreCoordinator — pure business logic for round state machine, task routing,
 // result processing, and streaming card management.
 //
-// Deployment-agnostic — uses adapter interfaces (SessionAdapter,
+// Deployment-agnostic — uses adapter interfaces (BitableAdapter,
 // ExecutorPoolInterface, FeishuAdapter) instead of concrete transport.
 // ---------------------------------------------------------------------------
 
 import type {
-  SessionAdapter,
+  BitableAdapter,
   ExecutorPoolInterface,
   FeishuAdapter,
   ExecutorInfo,
@@ -22,6 +22,12 @@ import type {
 import type { Config } from '../../lib/types.js';
 
 import { parseDomains, latestTurnMessageId, extractAppIdFromTurn, parseExecutorIdentity } from './helpers.js';
+import {
+  getTicket, getRound, getTurns, getCurrentRound,
+  searchRoundsByStatus, searchStuckRounds, searchRoster,
+  claimRound, releaseRound, transitionRound, setRoundResult,
+  appendTurn, writeTicketResult, claimTicket, releaseTicket,
+} from './bitable-ops.js';
 
 // =============================================================================
 // CoreCoordinator
@@ -41,7 +47,7 @@ export class CoreCoordinator {
   private feishuMap = new Map<string, FeishuAdapter>();
 
   constructor(
-    private session: SessionAdapter,
+    private bitable: BitableAdapter,
     private executorPool: ExecutorPoolInterface,
     private feishu: FeishuAdapter,
     private cfg: Config,
@@ -82,7 +88,7 @@ export class CoreCoordinator {
   }
 
   private async executeProcessRound(roundId: string): Promise<void> {
-    const round = await this.session.getRound(roundId);
+    const round = await getRound(this.bitable, this.cfg,roundId);
     if (!round) return;
     const status = String(round.fields[this.cfg.fields.round.status] ?? '');
 
@@ -107,25 +113,25 @@ export class CoreCoordinator {
     try {
       // 1. Stuck round detection (executing with expired lease)
       const stuckTimeout = (this.cfg.coordinator?.heartbeatSeconds ?? 60) * 2000;
-      const stuck = await this.session.searchStuckRounds(stuckTimeout);
+      const stuck = await searchStuckRounds(this.bitable, this.cfg,stuckTimeout);
       for (const r of stuck) {
         await this.processStuckRound(r);
       }
 
       // 2. Process pending Rounds → HITL decision
-      const pending = await this.session.searchRoundsByStatus(this.cfg.roundStatuses.pending);
+      const pending = await searchRoundsByStatus(this.bitable, this.cfg,this.cfg.roundStatuses.pending);
       for (const r of pending) {
         await this.processPendingRound(r);
       }
 
       // 3. Process pending_approval Rounds → check for timeout override
-      const pendingApproval = await this.session.searchRoundsByStatus(this.cfg.roundStatuses.pendingApproval);
+      const pendingApproval = await searchRoundsByStatus(this.bitable, this.cfg,this.cfg.roundStatuses.pendingApproval);
       for (const r of pendingApproval) {
         await this.processPendingApprovalRound(r);
       }
 
       // 4. Process approved Rounds → assign executor
-      const approved = await this.session.searchRoundsByStatus(this.cfg.roundStatuses.approved);
+      const approved = await searchRoundsByStatus(this.bitable, this.cfg,this.cfg.roundStatuses.approved);
       for (const r of approved) {
         await this.processApprovedRound(r);
       }
@@ -144,7 +150,7 @@ export class CoreCoordinator {
 
     // Re-read round to confirm it's still pending — a previous cycle or
     // bitable event may have already advanced it.
-    const fresh = await this.session.getRound(roundId);
+    const fresh = await getRound(this.bitable, this.cfg,roundId);
     if (!fresh) return;
     const curStatus = String(fresh.fields[this.cfg.fields.round.status] ?? '');
     if (curStatus !== this.cfg.roundStatuses.pending) {
@@ -152,7 +158,7 @@ export class CoreCoordinator {
       return;
     }
 
-    const ticket = await this.session.getTicket(ticketId);
+    const ticket = await getTicket(this.bitable, this.cfg,ticketId);
     if (!ticket) return;
 
     const domains = parseDomains(round.fields[this.cfg.fields.round.domains]);
@@ -160,7 +166,7 @@ export class CoreCoordinator {
 
     if (needsApproval) {
       this.log.info(`[core-coordinator] round ${roundId} → pending_approval`);
-      await this.session.transitionRound(roundId, this.cfg.roundStatuses.pendingApproval);
+      await transitionRound(this.bitable, this.cfg,roundId, this.cfg.roundStatuses.pendingApproval);
     } else {
       this.log.info(`[core-coordinator] round ${roundId} → executing (direct)`);
       await this.assignRoundToExecutor(round, ticket);
@@ -176,7 +182,7 @@ export class CoreCoordinator {
     const timeoutMs = (this.cfg.executor?.approvalTimeoutMinutes ?? 30) * 60 * 1000;
     if (createdAt > 0 && Date.now() - createdAt > timeoutMs) {
       this.log.info(`[core-coordinator] round ${roundId} approval timeout, reverting to pending`);
-      await this.session.transitionRound(roundId, this.cfg.roundStatuses.pending);
+      await transitionRound(this.bitable, this.cfg,roundId, this.cfg.roundStatuses.pending);
     }
   }
 
@@ -187,7 +193,7 @@ export class CoreCoordinator {
 
     const ticketId = String(round.fields[this.cfg.fields.round.ticketRecordId] ?? '');
     if (!ticketId) return;
-    const ticket = await this.session.getTicket(ticketId);
+    const ticket = await getTicket(this.bitable, this.cfg,ticketId);
     if (!ticket) return;
 
     this.log.info(`[core-coordinator] round ${roundId} approved, assigning executor`);
@@ -197,7 +203,7 @@ export class CoreCoordinator {
   /** Check if HITL approval is needed based on executor Roster configurations. */
   private async checkHitlRequired(domains: string[]): Promise<boolean> {
     try {
-      const agents = await this.session.searchRoster({
+      const agents = await searchRoster(this.bitable, this.cfg,{
         conjunction: 'and',
         conditions: [
           { field_name: this.cfg.fields.roster.kind, operator: 'is', value: ['agent'] },
@@ -240,7 +246,7 @@ export class CoreCoordinator {
       const available = await this.executorPool.getAvailableExecutors(requiredDomains);
       const matched = available.find(e => e.identity === lastOwnerIdentity && !e.activeTicketId);
       if (matched) {
-        const won = await this.session.claimRound(round, matched.identity, this.cfg.roundStatuses.executing);
+        const won = await claimRound(this.bitable, this.cfg,round, matched.identity, this.cfg.roundStatuses.executing);
         if (won) {
           this.dispatchRoundToExecutor(matched, round, ticket);
           return;
@@ -253,7 +259,7 @@ export class CoreCoordinator {
     this.log.info(`[core-coordinator] assignRoundToExecutor: ${available.length} candidates for round ${roundId}`);
     for (const ex of available) {
       if (ex.identity === lastOwnerIdentity) continue;
-      const won = await this.session.claimRound(round, ex.identity, this.cfg.roundStatuses.executing);
+      const won = await claimRound(this.bitable, this.cfg,round, ex.identity, this.cfg.roundStatuses.executing);
       if (!won) { this.log.info(`[core-coordinator] claimRound lost for ${ex.identity}`); continue; }
       this.dispatchRoundToExecutor(ex, round, ticket);
       return;
@@ -264,7 +270,7 @@ export class CoreCoordinator {
 
   /** After a new executor connects, try assigning it to any pending round. */
   async tryAssignPendingToExecutor(identity: string, domains: string[]): Promise<void> {
-    const pending = await this.session.searchRoundsByStatus(this.cfg.roundStatuses.pending);
+    const pending = await searchRoundsByStatus(this.bitable, this.cfg,this.cfg.roundStatuses.pending);
     for (const round of pending) {
       const requiredDomains = parseDomains(round.fields[this.cfg.fields.round.domains]);
       if (requiredDomains.length > 0) {
@@ -273,11 +279,11 @@ export class CoreCoordinator {
         const matcher = new PrefixMatcher();
         if (!matcher.matches(requiredDomains, domains)) continue;
       }
-      const won = await this.session.claimRound(round, identity, this.cfg.roundStatuses.executing);
+      const won = await claimRound(this.bitable, this.cfg,round, identity, this.cfg.roundStatuses.executing);
       if (!won) continue;
       const ticketId = String(round.fields[this.cfg.fields.round.ticketRecordId] ?? '');
       if (!ticketId) continue;
-      const ticket = await this.session.getTicket(ticketId);
+      const ticket = await getTicket(this.bitable, this.cfg,ticketId);
       if (!ticket) continue;
       this.dispatchRoundToExecutor({ identity, domains, activeTicketId: undefined, connected: true, lastHeartbeat: Date.now() }, round, ticket);
       return;
@@ -295,7 +301,7 @@ export class CoreCoordinator {
 
     // Status already set to executing by claimRound, no extra transition needed.
 
-    const turns = await this.session.getTurns(recordId);
+    const turns = await getTurns(this.bitable, this.cfg,recordId);
     const supplementPrompt = String(round.fields[this.cfg.fields.round.supplementPrompt] ?? '');
 
     // Determine reaction appId from the first user turn
@@ -338,7 +344,7 @@ export class CoreCoordinator {
   /** Send cancel to an executor assigned to this Round. */
   async dispatchCancelToExecutor(roundId: string): Promise<boolean> {
     try {
-      const round = await this.session.getRound(roundId);
+      const round = await getRound(this.bitable, this.cfg,roundId);
       if (!round) return false;
       const executorField = String(round.fields[this.cfg.fields.round.executor] ?? '');
       if (!executorField) return false;
@@ -373,7 +379,7 @@ export class CoreCoordinator {
 
     this.log.info(`[core-coordinator] stuck round ${roundId}, reverting to pending`);
     try {
-      await this.session.releaseRound(roundId);
+      await releaseRound(this.bitable, this.cfg,roundId);
     } catch (err) {
       this.log.error(`[core-coordinator] processStuckRound failed ${roundId}:`, err);
     }
@@ -396,7 +402,7 @@ export class CoreCoordinator {
 
     // In Round-driven mode, nudge the existing active round
     if (this.cfg.roundsTableId) {
-      const currentRound = await this.session.getCurrentRound(recordId);
+      const currentRound = await getCurrentRound(this.bitable, this.cfg,recordId);
       if (currentRound?.record_id) {
         await this.processRound(currentRound.record_id);
       }
@@ -412,7 +418,7 @@ export class CoreCoordinator {
       const available = await this.executorPool.getAvailableExecutors();
       const matched = available.find(e => e.identity === lastOwnerIdentity && !e.activeTicketId);
       if (matched) {
-        const won = await this.session.claim(ticket);
+        const won = await claimTicket(this.bitable, this.cfg,ticket);
         if (won) {
           await this.dispatchTask(matched, ticket, recordId);
           return true;
@@ -425,7 +431,7 @@ export class CoreCoordinator {
     for (const ex of available) {
       if (ex.activeTicketId) continue;
       if (ex.identity === lastOwnerIdentity) continue;
-      const won = await this.session.claim(ticket);
+      const won = await claimTicket(this.bitable, this.cfg,ticket);
       if (!won) continue;
       await this.dispatchTask(ex, ticket, recordId);
       return true;
@@ -436,7 +442,7 @@ export class CoreCoordinator {
 
   /** Dispatch a task (non-round mode). */
   private async dispatchTask(ex: ExecutorInfo, ticket: TicketRecord, recordId: string): Promise<void> {
-    const turns = await this.session.getTurns(recordId);
+    const turns = await getTurns(this.bitable, this.cfg,recordId);
 
     const appId = (() => {
       for (const t of turns) {
@@ -481,7 +487,7 @@ export class CoreCoordinator {
     // Resolve rootMsgId from turns if executor didn't include it
     if (!rootMsgId) {
       try {
-        const turns = await this.session.getTurns(ticketId);
+        const turns = await getTurns(this.bitable, this.cfg,ticketId);
         for (const t of turns) {
           const rid = String(t.fields[this.cfg.fields.turn.rootMsgId] ?? '');
           if (rid) { rootMsgId = rid; break; }
@@ -495,7 +501,7 @@ export class CoreCoordinator {
     let resultAppId: string | undefined;
     if (roundId && this.cfg.roundsTableId) {
       try {
-        const round = await this.session.getRound(roundId);
+        const round = await getRound(this.bitable, this.cfg,roundId);
         if (round) resultAppId = String(round.fields[this.cfg.fields.round.appId] ?? '') || undefined;
       } catch { /* ignore */ }
     }
@@ -503,7 +509,7 @@ export class CoreCoordinator {
     // Write agent turn
     try {
       const agentDedupKey = `${ticketId}_${Date.now()}`;
-      const turnId = await this.session.appendTurn(
+      const turnId = await appendTurn(this.bitable, this.cfg,
         ticketId, 'agent', answer, agentDedupKey, identity,
         'answered', rootMsgId, roundId, parts, 1, resultAppId,
       );
@@ -526,18 +532,18 @@ export class CoreCoordinator {
     // updates status — the executor field on the Round serves as the affinity
     // record. Both deployments get equivalent affinity behavior.
     try {
-      await this.session.release(ticketId, this.cfg.statuses.active);
+      await releaseTicket(this.bitable, this.cfg,ticketId, this.cfg.statuses.active);
     } catch { /* best effort */ }
 
     // Update ticket status
     const needsReassign = reassignTo && reassignTo.roles && reassignTo.roles.length > 0;
     if (needsReassign) {
       this.log.info(`[core-coordinator] reassigning ticket=${ticketId} to roles=${reassignTo!.roles}`);
-      await this.session.release(ticketId, this.cfg.statuses.active);
+      await releaseTicket(this.bitable, this.cfg,ticketId, this.cfg.statuses.active);
     } else {
       this.log.info(`[core-coordinator] writeResult ticket=${ticketId}`);
       try {
-        await this.session.writeResult(ticketId, answer, newSummary || '');
+        await writeTicketResult(this.bitable, this.cfg,ticketId, answer, newSummary || '');
       } catch (err: any) {
         this.log.error(`[core-coordinator] writeResult failed: ${err.message}`, err);
       }
@@ -546,14 +552,14 @@ export class CoreCoordinator {
     // Update Round status
     if (roundId && this.cfg.roundsTableId) {
       try {
-        await this.session.setRoundResult(roundId, answer);
+        await setRoundResult(this.bitable, this.cfg,roundId, answer);
         if (needsReassign) {
-          await this.session.transitionRound(roundId, this.cfg.roundStatuses.pending);
+          await transitionRound(this.bitable, this.cfg,roundId, this.cfg.roundStatuses.pending);
         } else {
-          const currentRound = await this.session.getRound(roundId);
+          const currentRound = await getRound(this.bitable, this.cfg,roundId);
           const rStatus = String(currentRound?.fields?.[this.cfg.fields.round.status] ?? '');
           if (rStatus === this.cfg.roundStatuses.executing) {
-            await this.session.transitionRound(roundId, this.cfg.roundStatuses.done);
+            await transitionRound(this.bitable, this.cfg,roundId, this.cfg.roundStatuses.done);
           }
         }
       } catch (err: any) {
@@ -563,7 +569,7 @@ export class CoreCoordinator {
 
     // Remove OnIt emoji
     try {
-      const resultTurns = await this.session.getTurns(ticketId);
+      const resultTurns = await getTurns(this.bitable, this.cfg,ticketId);
       const latestId = latestTurnMessageId(resultTurns, this.cfg.fields.turn.role, this.cfg.fields.turn.dedupKey);
       if (latestId) {
         try { await this.feishu.removeReaction(latestId, 'OnIt'); } catch { /* */ }
@@ -586,7 +592,7 @@ export class CoreCoordinator {
     let streamAppId: string | undefined;
     if (roundId && this.cfg.roundsTableId) {
       try {
-        const r = await this.session.getRound(roundId);
+        const r = await getRound(this.bitable, this.cfg,roundId);
         if (r) streamAppId = String(r.fields[this.cfg.fields.round.appId] ?? '') || undefined;
       } catch { /* */ }
     }

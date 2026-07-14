@@ -24,7 +24,6 @@ import { CoreCoordinator } from '../../../core/coordinator.js';
 import { CoreOperator } from '../../../core/operator.js';
 import { WorkerBitableAdapter } from '../adapters/bitable.js';
 import { WorkerLarkAdapter } from '../adapters/lark.js';
-import { WorkerSessionAdapter } from '../session-adapter.js';
 import { buildWorkerConfig, enrichConfigFromTable } from '../config.js';
 import { DOExecutorPool } from './executor-pool.js';
 import { decodeFrame, FRAME_DATA, HEADER_TYPE, HEADER_MESSAGE_ID, HEADER_SUM, HEADER_SEQ } from '../lark-ws-protocol.js';
@@ -106,9 +105,8 @@ export class LarkConnection extends DurableObject<Env> {
 
   private buildCoordinator(cfg: Config): CoreCoordinator {
     const bitable = new WorkerBitableAdapter(this.env);
-    const sessionAdapter = new WorkerSessionAdapter(bitable, cfg);
     const executorPool = new DOExecutorPool(this.env);
-    this.operator = new CoreOperator(sessionAdapter, this.feishu, bitable, cfg, console);
+    this.operator = new CoreOperator(this.feishu, bitable, cfg, console);
     // Build per-operator adapters for multi-credential IM replies
     const operatorFeishus = new Map<string, WorkerLarkAdapter>();
     if (cfg.operators) {
@@ -119,7 +117,7 @@ export class LarkConnection extends DurableObject<Env> {
         }
       }
     }
-    return new CoreCoordinator(sessionAdapter, executorPool, this.feishu, cfg, console, operatorFeishus);
+    return new CoreCoordinator(bitable, executorPool, this.feishu, cfg, console, operatorFeishus);
   }
 
   // ── Config enrichment ─────────────────────────────────────────────────

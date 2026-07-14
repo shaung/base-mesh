@@ -5,12 +5,11 @@
 // processes them through the full lifecycle (ticket → draft → pending → round),
 // handles thread replies, intent recognition, turn delivery, and card actions.
 //
-// Uses SessionAdapter, FeishuAdapter, and BitableAdapter interfaces —
+// Uses FeishuAdapter and BitableAdapter interfaces —
 // no dependency on @larksuiteoapi/node-sdk or WebSocket transport.
 // ---------------------------------------------------------------------------
 
 import type {
-  SessionAdapter,
   FeishuAdapter,
   BitableAdapter,
   TicketRecord,
@@ -23,6 +22,16 @@ import type {
 } from './types.js';
 import type { Config } from '../../lib/types.js';
 import { extractAppIdFromTurn } from './helpers.js';
+import {
+  getTicket,
+  getTurns,
+  getCurrentRound,
+  searchRoundsByStatus,
+  transitionRound,
+  releaseRound,
+  searchTicketsBySender,
+  searchRoster,
+} from './bitable-ops.js';
 
 // =============================================================================
 // CoreOperator
@@ -39,7 +48,6 @@ export class CoreOperator {
   private feishuMap = new Map<string, FeishuAdapter>();
 
   constructor(
-    private session: SessionAdapter,
     private feishu: FeishuAdapter,
     private bitable: BitableAdapter,
     private cfg: Config,
@@ -148,7 +156,7 @@ export class CoreOperator {
     }
   }
 
-  /** Fallback ticket creation when SessionAdapter doesn't expose createTicket. */
+  /** Fallback ticket creation using BitableAdapter directly. */
   private async createTicketDirect(
     _summary: string,
     rootMsgId: string,
@@ -181,9 +189,15 @@ export class CoreOperator {
 
     // Find ticket by thread root
     let ticket: TicketRecord | null = null;
-    if (typeof (this.session as any).findByThreadRoot === 'function') {
-      ticket = await (this.session as any).findByThreadRoot(rootId);
-    }
+    try {
+      const tickets = await this.bitable.searchRecords(this.cfg.ticketsTableId, {
+        conjunction: 'and',
+        conditions: [
+          { field_name: this.cfg.fields.ticket.rootMsgId, operator: 'is', value: [rootId] },
+        ],
+      });
+      ticket = tickets.length > 0 ? tickets[0] : null;
+    } catch { /* fall through */ }
 
     if (!ticket || !ticket.record_id) {
       // Fallback: search by chat_id
@@ -234,7 +248,7 @@ export class CoreOperator {
 
     if (status === this.cfg.statuses.active && botMentioned && this.cfg.roundsTableId) {
       // Handle active ticket with round
-      const currentRound = await this.session.getCurrentRound(recordId);
+      const currentRound = await getCurrentRound(this.bitable, this.cfg,recordId);
       if (currentRound?.record_id) {
         const roundStatus = String(currentRound.fields[this.cfg.fields.round.status] ?? '');
         const terminal = [this.cfg.roundStatuses.done, this.cfg.roundStatuses.failed, this.cfg.roundStatuses.cancelled];
@@ -242,14 +256,14 @@ export class CoreOperator {
 
         if (roundStatus === this.cfg.roundStatuses.pending) {
           // Cancel pending round, create new one
-          await this.session.transitionRound(currentRound.record_id, this.cfg.roundStatuses.cancelled);
+          await transitionRound(this.bitable, this.cfg,currentRound.record_id, this.cfg.roundStatuses.cancelled);
           const intent = await this.runIntent(ticket, content, recordId, appId);
           const round = await this.createRound(recordId, intent.domains, appId, content);
           if (round.record_id) await this.assignTurnsToRound(recordId, round.record_id, appId);
         } else if (nonPendingActive.includes(roundStatus)) {
           // Revert active round
-          await this.session.transitionRound(currentRound.record_id, this.cfg.roundStatuses.pending);
-          await this.session.releaseRound(currentRound.record_id);
+          await transitionRound(this.bitable, this.cfg,currentRound.record_id, this.cfg.roundStatuses.pending);
+          await releaseRound(this.bitable, this.cfg,currentRound.record_id);
           await this.assignTurnsToRound(recordId, currentRound.record_id, appId);
         } else if (terminal.includes(roundStatus)) {
           // Terminal round — create new
@@ -358,7 +372,7 @@ export class CoreOperator {
     }
 
     const { processMessage } = await import('../../lib/messaging/intent.js');
-    const turns = await this.session.getTurns(recordId);
+    const turns = await getTurns(this.bitable, this.cfg,recordId);
     const conversation = turns.map(t =>
       `[${t.fields[this.cfg.fields.turn.role]}]\n${t.fields[this.cfg.fields.turn.content]}`,
     ).join('\n');
@@ -458,12 +472,12 @@ export class CoreOperator {
   async deliverApprovalCards(): Promise<void> {
     if (!this.cfg.roundsTableId) return;
     try {
-      const rounds = await this.session.searchRoundsByStatus(this.cfg.roundStatuses.pendingApproval);
+      const rounds = await searchRoundsByStatus(this.bitable, this.cfg,this.cfg.roundStatuses.pendingApproval);
       for (const round of rounds) {
         if (!round.record_id) continue;
         const ticketId = String(round.fields[this.cfg.fields.round.ticketRecordId] ?? '');
         if (!ticketId) continue;
-        const ticket = await this.session.getTicket(ticketId);
+        const ticket = await getTicket(this.bitable, this.cfg,ticketId);
         if (!ticket) continue;
 
         const rootMsgId = String(ticket.fields[this.cfg.fields.ticket.rootMsgId] ?? '');
@@ -541,9 +555,9 @@ export class CoreOperator {
     this.log.info(`[core-operator] card action: ${action} round=${roundId}`);
     try {
       if (action === 'approve') {
-        await this.session.transitionRound(roundId, this.cfg.roundStatuses.approved);
+        await transitionRound(this.bitable, this.cfg,roundId, this.cfg.roundStatuses.approved);
       } else if (action === 'reject') {
-        await this.session.transitionRound(roundId, this.cfg.roundStatuses.rejected);
+        await transitionRound(this.bitable, this.cfg,roundId, this.cfg.roundStatuses.rejected);
       }
     } catch (err) {
       this.log.error(`[core-operator] card action failed round=${roundId}:`, err);
@@ -553,7 +567,7 @@ export class CoreOperator {
   /** Handle /cancel command — cancel active round. */
   async handleCancel(senderId: string, messageId: string, appId?: string): Promise<void> {
     try {
-      const tickets = await this.session.searchTicketsBySender(senderId);
+      const tickets = await searchTicketsBySender(this.bitable, this.cfg,senderId);
       const activeTickets = tickets.filter(t => {
         const status = String(t.fields[this.cfg.fields.ticket.status] ?? '');
         return status !== this.cfg.statuses.closed;
@@ -563,9 +577,9 @@ export class CoreOperator {
         return;
       }
       const ticket = activeTickets[activeTickets.length - 1];
-      const round = await this.session.getCurrentRound(ticket.record_id!);
+      const round = await getCurrentRound(this.bitable, this.cfg,ticket.record_id!);
       if (round?.record_id) {
-        const ok = await this.session.transitionRound(round.record_id, this.cfg.roundStatuses.cancelled);
+        const ok = await transitionRound(this.bitable, this.cfg,round.record_id, this.cfg.roundStatuses.cancelled);
         if (ok) {
           await this.feishu.reply(messageId, '✅ Processing cancelled.', true);
           this.log.info(`[core-operator] cancelled round ${round.record_id} for ticket ${ticket.record_id!}`);
@@ -646,7 +660,7 @@ export class CoreOperator {
     const primaryId = unionId || senderId;
     const identity = `human_${primaryId}`;
     try {
-      const existing = await this.session.searchRoster({
+      const existing = await searchRoster(this.bitable, this.cfg,{
         conjunction: 'and',
         conditions: [
           { field_name: this.cfg.fields.roster.identity, operator: 'is', value: [identity] },

@@ -17,7 +17,6 @@ export type {
   FeishuAdapter,
   ExecutorPoolInterface,
   ExecutorInfo,
-  SessionAdapter,
   Scheduler,
   Logger,
   ChannelEnv,

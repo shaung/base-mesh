@@ -8,10 +8,10 @@ import { getDomainConfig } from '../../../lib/bitable/domain.js';
 import { NodeCoordinator as Coordinator } from './coordinator.js';
 import { CoreOperator } from '../../core/operator.js';
 import { parseMessageContent } from '../../core/message-parser.js';
+import { isTicketClaimable } from '../../core/bitable-ops.js';
 import { NodeLarkAdapter } from './adapters/lark.js';
 import type { FeishuAdapter } from '../../core/types.js';
 import { NodeBitableAdapter } from './adapters/bitable.js';
-import { NodeSessionAdapter } from './session-adapter.js';
 
 const DEFAULT_EMOJI = 'OneSecond';
 
@@ -48,6 +48,7 @@ interface OperatorClient {
 export class Channel {
   private operatorClients = new Map<string, OperatorClient>();
   private bitable: BitableClient;
+  private bitableAdapter: NodeBitableAdapter;
   private session: Session;
   private client: Client;            // primary channel-credential Client for Bitable ops
   private coordinator: Coordinator | null = null;
@@ -70,8 +71,7 @@ export class Channel {
       loggerLevel: 3,
     });
     // CoreOperator for shared message processing logic
-    const sessionAdapter = new NodeSessionAdapter(this.session);
-    const bitableAdapter = new NodeBitableAdapter(this.bitable);
+    this.bitableAdapter = new NodeBitableAdapter(this.bitable);
     this.feishuAdapter = new NodeLarkAdapter((appId?: string) => (appId ? this.operatorClients.get(appId)?.client : undefined) ?? this.client);
     // Build per-operator FeishuAdapters for multi-credential IM routing
     const operatorFeishus = new Map<string, FeishuAdapter>();
@@ -83,7 +83,7 @@ export class Channel {
         }
       }
     }
-    this.coreOperator = new CoreOperator(sessionAdapter, this.feishuAdapter, bitableAdapter, cfg, {
+    this.coreOperator = new CoreOperator(this.feishuAdapter, this.bitableAdapter, cfg, {
       info: (m: string, ...args: any[]) => logger.info(m, ...args),
       error: (m: string, ...args: any[]) => logger.error(m, ...args),
     } as any, operatorFeishus);
@@ -185,7 +185,7 @@ export class Channel {
           const ticket = await this.bitable.getRecord(this.cfg.ticketsTableId, recordId);
           if (!ticket) return;
           const ticketStatus = String(ticket.fields[this.cfg.fields.ticket.status] ?? '');
-          if (ticketStatus === this.cfg.statuses.active && this.session.isClaimable(ticket)) {
+          if (ticketStatus === this.cfg.statuses.active && await isTicketClaimable(this.bitableAdapter, this.cfg, ticket)) {
             await this.coordinator.tryRoute(ticket);
           }
         } catch { /* */ }
