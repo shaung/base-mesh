@@ -461,20 +461,7 @@ export class Channel {
 
     logger.info(`[channel] DM from ${senderId}: ${content} (op=${appId})`);
 
-    // Acknowledge receipt — only when bot is @mentioned
-    if (botMentioned) {
-      const mode = this.cfg.operator?.reactionMode ?? 'emoji';
-      const ackMsg = this.cfg.messages?.ackReceived || '✅ Received';
-      if (mode !== 'card') {
-        try { await this.react(messageId, DEFAULT_EMOJI, appId); } catch {
-          if (mode === 'both') await this.reply(messageId, ackMsg, false, appId);
-        }
-      }
-      if (mode === 'card') {
-        try { await this.reply(messageId, ackMsg, false, appId); } catch { /* best effort */ }
-      }
-    }
-
+    // Acknowledge receipt handled by CoreOperator.handleMessage (after dedup check).
     // Dedup key includes appId for multi-operator isolation
     const dedupKey = `${appId}:${messageId}`;
     try {

@@ -331,11 +331,12 @@ export class CoreCoordinator {
 
     this.executorPool.dispatchTask(ex.identity, payload);
 
-    // React to the latest user turn message
+    // React to the latest user turn message — use the turn's operator bot
     const latestMsgId = latestTurnMessageId(turns, this.cfg.fields.turn.role, this.cfg.fields.turn.dedupKey);
     if (latestMsgId) {
-      try { await this.feishu.removeReaction(latestMsgId, 'OneSecond'); } catch { /* */ }
-      try { await this.feishu.react(latestMsgId, 'OnIt'); } catch { /* */ }
+      const dispatchFeishu = this.getFeishu(turnAppId);
+      try { await dispatchFeishu.removeReaction(latestMsgId, 'OneSecond'); } catch { /* */ }
+      try { await dispatchFeishu.react(latestMsgId, 'OnIt'); } catch { /* */ }
     }
 
     this.log.info(`[core-coordinator] round ${round.record_id!} dispatched to ${ex.identity}`);
@@ -467,8 +468,9 @@ export class CoreCoordinator {
 
     const latestMsgId = latestTurnMessageId(turns, this.cfg.fields.turn.role, this.cfg.fields.turn.dedupKey);
     if (latestMsgId) {
-      try { await this.feishu.removeReaction(latestMsgId, 'OneSecond'); } catch { /* */ }
-      try { await this.feishu.react(latestMsgId, 'OnIt'); } catch { /* */ }
+      const dispatchFeishu = this.getFeishu(appId);
+      try { await dispatchFeishu.removeReaction(latestMsgId, 'OneSecond'); } catch { /* */ }
+      try { await dispatchFeishu.react(latestMsgId, 'OnIt'); } catch { /* */ }
     }
 
     this.log.info(`[core-coordinator] ticket ${recordId} assigned to ${ex.identity}`);
@@ -567,12 +569,13 @@ export class CoreCoordinator {
       }
     }
 
-    // Remove OnIt emoji
+    // Remove OnIt emoji — use the round's operator bot
     try {
       const resultTurns = await getTurns(this.bitable, this.cfg,ticketId);
       const latestId = latestTurnMessageId(resultTurns, this.cfg.fields.turn.role, this.cfg.fields.turn.dedupKey);
       if (latestId) {
-        try { await this.feishu.removeReaction(latestId, 'OnIt'); } catch { /* */ }
+        const removalFeishu = this.getFeishu(resultAppId);
+        try { await removalFeishu.removeReaction(latestId, 'OnIt'); } catch { /* */ }
       }
     } catch { /* */ }
   }
