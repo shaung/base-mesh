@@ -4,6 +4,8 @@
 
 export { CoreCoordinator } from './coordinator.js';
 export { CoreOperator } from './operator.js';
+export { LarkAdapter } from './adapters/lark.js';
+export { SdkBitableAdapter } from './adapters/bitable.js';
 export { parseMessageToText, parseMessageContent } from './message-parser.js';
 export {
   parseDomains,

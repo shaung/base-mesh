@@ -15,8 +15,8 @@ import { createSession, validateSession } from '../../../lib/sessions.js';
 import { getDomainConfig } from '../../../lib/bitable/domain.js';
 import { CoreCoordinator } from '../../core/coordinator.js';
 import { latestTurnMessageId } from '../../core/helpers.js';
-import { NodeLarkAdapter } from './adapters/lark.js';
-import { NodeBitableAdapter } from './adapters/bitable.js';
+import { LarkAdapter } from '../../core/adapters/lark.js';
+import { SdkBitableAdapter } from '../../core/adapters/bitable.js';
 import type { ExecutorPoolInterface, FeishuAdapter } from '../../core/types.js';
 import type { Logger } from '../../core/types.js';
 import { routeA2ARequest, verifyA2AAuth } from '../../a2a.js';
@@ -55,13 +55,13 @@ export class NodeCoordinator {
       }
     }
     // Create CoreCoordinator for streaming card management (and round coordination)
-    const bitableAdapter = new NodeBitableAdapter(this.bitable);
-    const feishuAdapter = new NodeLarkAdapter((appId?: string) => this.getClient(appId));
+    const bitableAdapter = new SdkBitableAdapter(this.bitable);
+    const feishuAdapter = new LarkAdapter((appId?: string) => this.getClient(appId));
     const operatorFeishus = new Map<string, FeishuAdapter>();
     if (cfg.operators) {
       for (const op of cfg.operators) {
         if (op.appId && op.appSecret && op.appId !== cfg.appId && !operatorFeishus.has(op.appId)) {
-          operatorFeishus.set(op.appId, new NodeLarkAdapter((_appId?: string) => this.getClient(op.appId)));
+          operatorFeishus.set(op.appId, new LarkAdapter((_appId?: string) => this.getClient(op.appId)));
         }
       }
     }

@@ -33,23 +33,28 @@ export class BitableClient {
   constructor(
     private cfg: Pick<Config, 'appId' | 'appSecret' | 'appToken' | 'openApiDomain'>,
     tokenProvider?: TokenProvider,
+    client?: Client,  // injected SDK Client (e.g. with fetch adapter for Workers)
   ) {
     this.tokenProvider = tokenProvider;
-    const dc = getDomainConfig(cfg.openApiDomain);
-    // In PKCE mode the SDK needs a truthy appSecret placeholder. It's never
-    // used because every request passes an override via withUserAccessToken.
-    // No-op logger to suppress the SDK's internal defaultLogger, which prints
-    // Axios error response bodies as unreadable character-indexed objects
-    // (Buffer → Object.assign({}, buffer) → {'0': '<', '1': '!', ...}).
-    // The SDK re-throws errors after logging them, so our own error handling
-    // (logger.error in callers, withRetry) still produces meaningful output.
-    const silentLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {}, trace: () => {} };
-    this.client = new Client({
-      appId: cfg.appId,
-      appSecret: cfg.appSecret || 'unused',
-      domain: dc.sdkBaseUrl,
-      logger: silentLogger,
-    });
+    if (client) {
+      this.client = client;
+    } else {
+      const dc = getDomainConfig(cfg.openApiDomain);
+      // In PKCE mode the SDK needs a truthy appSecret placeholder. It's never
+      // used because every request passes an override via withUserAccessToken.
+      // No-op logger to suppress the SDK's internal defaultLogger, which prints
+      // Axios error response bodies as unreadable character-indexed objects
+      // (Buffer → Object.assign({}, buffer) → {'0': '<', '1': '!', ...}).
+      // The SDK re-throws errors after logging them, so our own error handling
+      // (logger.error in callers, withRetry) still produces meaningful output.
+      const silentLogger = { error: () => {}, warn: () => {}, info: () => {}, debug: () => {}, trace: () => {} };
+      this.client = new Client({
+        appId: cfg.appId,
+        appSecret: cfg.appSecret || 'unused',
+        domain: dc.sdkBaseUrl,
+        logger: silentLogger,
+      });
+    }
   }
 
   /** Returns the request options modifier needed for PKCE mode */

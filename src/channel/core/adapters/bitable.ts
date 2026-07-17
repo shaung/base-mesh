@@ -1,11 +1,14 @@
 // ---------------------------------------------------------------------------
-// NodeBitableAdapter — wraps BitableClient to implement BitableAdapter
+// SdkBitableAdapter — wraps BitableClient to implement BitableAdapter
+//
+// Shared by both Node.js and Worker deployments. Worker injects a SDK
+// Client configured with @haverstack/axios-fetch-adapter into BitableClient.
 // ---------------------------------------------------------------------------
 
-import { BitableClient } from '../../../../lib/bitable/client.js';
-import type { BitableAdapter, TicketRecord } from '../../../core/types.js';
+import { BitableClient } from '../../../lib/bitable/client.js';
+import type { BitableAdapter, TicketRecord } from '../types.js';
 
-export class NodeBitableAdapter implements BitableAdapter {
+export class SdkBitableAdapter implements BitableAdapter {
   constructor(private client: BitableClient) {}
 
   async getRecord(tableId: string, recordId: string): Promise<TicketRecord | null> {

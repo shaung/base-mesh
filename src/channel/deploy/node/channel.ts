@@ -9,9 +9,9 @@ import { NodeCoordinator as Coordinator } from './coordinator.js';
 import { CoreOperator } from '../../core/operator.js';
 import { parseMessageContent } from '../../core/message-parser.js';
 import { isTicketClaimable } from '../../core/bitable-ops.js';
-import { NodeLarkAdapter } from './adapters/lark.js';
+import { LarkAdapter } from '../../core/adapters/lark.js';
+import { SdkBitableAdapter } from '../../core/adapters/bitable.js';
 import type { FeishuAdapter } from '../../core/types.js';
-import { NodeBitableAdapter } from './adapters/bitable.js';
 
 const DEFAULT_EMOJI = 'OneSecond';
 
@@ -48,12 +48,12 @@ interface OperatorClient {
 export class Channel {
   private operatorClients = new Map<string, OperatorClient>();
   private bitable: BitableClient;
-  private bitableAdapter: NodeBitableAdapter;
+  private bitableAdapter: SdkBitableAdapter;
   private session: Session;
   private client: Client;            // primary channel-credential Client for Bitable ops
   private coordinator: Coordinator | null = null;
   private coreOperator: CoreOperator;
-  private feishuAdapter: NodeLarkAdapter;
+  private feishuAdapter: LarkAdapter;
   private running = true;
   private draftCleanupTimer: ReturnType<typeof setInterval> | null = null;
   private lite: boolean;
@@ -71,15 +71,15 @@ export class Channel {
       loggerLevel: 3,
     });
     // CoreOperator for shared message processing logic
-    this.bitableAdapter = new NodeBitableAdapter(this.bitable);
-    this.feishuAdapter = new NodeLarkAdapter((appId?: string) => (appId ? this.operatorClients.get(appId)?.client : undefined) ?? this.client);
+    this.bitableAdapter = new SdkBitableAdapter(this.bitable);
+    this.feishuAdapter = new LarkAdapter((appId?: string) => (appId ? this.operatorClients.get(appId)?.client : undefined) ?? this.client);
     // Build per-operator FeishuAdapters for multi-credential IM routing
     const operatorFeishus = new Map<string, FeishuAdapter>();
     if (cfg.operators) {
       for (const op of cfg.operators) {
         if (op.appId && op.appSecret && op.appId !== cfg.appId && !operatorFeishus.has(op.appId)) {
           const fixedAppId = op.appId;
-          operatorFeishus.set(fixedAppId, new NodeLarkAdapter(() => this.getClient(fixedAppId)));
+          operatorFeishus.set(fixedAppId, new LarkAdapter(() => this.getClient(fixedAppId)));
         }
       }
     }

@@ -1,12 +1,14 @@
 // ---------------------------------------------------------------------------
-// NodeLarkAdapter — wraps @larksuiteoapi/node-sdk Client as FeishuAdapter
+// LarkAdapter — wraps @larksuiteoapi/node-sdk Client as FeishuAdapter
 //
-// Implements FeishuAdapter (including CardKit methods) using the Lark Node.js
-// SDK, for use with CoreCoordinator in the Node.js deployment path.
+// Shared by both Node.js and Worker deployments. Worker injects a Client
+// configured with @haverstack/axios-fetch-adapter for HTTP.
+//
+// Implements FeishuAdapter (including CardKit methods) using the Lark SDK.
 // ---------------------------------------------------------------------------
 
 import type { Client } from '@larksuiteoapi/node-sdk';
-import type { FeishuAdapter } from '../../../core/types.js';
+import type { FeishuAdapter } from '../types.js';
 
 /** Build MessageKit card JSON for a text reply. */
 function textCard(text: string): string {
@@ -18,7 +20,7 @@ function textCard(text: string): string {
   });
 }
 
-export class NodeLarkAdapter implements FeishuAdapter {
+export class LarkAdapter implements FeishuAdapter {
   constructor(
     private getClient: (appId?: string) => Client,
   ) {}
